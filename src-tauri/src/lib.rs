@@ -18,6 +18,7 @@ use tauri::{Manager, State};
 mod assets;
 mod db;
 mod gateway;
+mod security;
 
 struct AppState {
     db_path: Mutex<PathBuf>,

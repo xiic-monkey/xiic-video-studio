@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
+hmac = "0.12"
 keyring = { version = "3", features = ["apple-native"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }

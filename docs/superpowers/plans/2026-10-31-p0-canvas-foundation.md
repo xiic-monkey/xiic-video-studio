@@ -3558,7 +3558,7 @@ fn s3_put(host: &AssetHostConfig, bytes: &[u8], mime: &str, id: &str) -> Result<
     let bucket = host.bucket.as_deref().unwrap_or_default();
     let region = host.region.as_deref().unwrap_or("auto");
     let prefix = host.prefix.as_deref().unwrap_or("").trim_matches('/');
-    let extension = assets::extension_for(mime, "image");
+    let extension = assets::extension_for(mime, kind_for_mime(mime));
     let key = if prefix.is_empty() { format!("{id}.{extension}") } else { format!("{prefix}/{id}.{extension}") };
     let canonical_uri = format!("/{bucket}/{key}");
     let host_name = match endpoint.port() {
@@ -3609,6 +3609,11 @@ fn s3_put(host: &AssetHostConfig, bytes: &[u8], mime: &str, id: &str) -> Result<
     }
     let public = format!("{}/{}", host.public_base_url.as_deref().unwrap_or_default().trim_end_matches('/'), key);
     Ok(TransportRef { kind: "url".to_string(), value: public, expires_at: None })
+}
+
+/// mime 前缀即资产类别，未知 mime（如 application/octet-stream）落到 "bin"。
+fn kind_for_mime(mime: &str) -> &str {
+    mime.split('/').next().unwrap_or("bin")
 }
 
 fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
