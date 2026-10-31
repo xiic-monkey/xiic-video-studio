@@ -4,6 +4,7 @@ import { ProjectLibrary } from './ProjectLibrary';
 import { CanvasView } from '../canvas/CanvasView';
 import { Inspector } from '../inspector/Inspector';
 import { SettingsDialog } from '../settings/SettingsDialog';
+import { LegacyImportDialog } from '../import/LegacyImportDialog';
 import { attachRunEvents } from '../run/events';
 import { RunConfirmDialog } from '../run/RunConfirmDialog';
 import { useStudioStore } from '../stores/studioStore';
@@ -21,6 +22,8 @@ export function StudioApp() {
   const selectProject = useStudioStore((state) => state.selectProject);
   const selectBoard = useStudioStore((state) => state.selectBoard);
   const createBoard = useStudioStore((state) => state.createBoard);
+  const legacyImportOpen = useStudioStore((state) => state.legacyImportOpen);
+  const closeLegacyImport = useStudioStore((state) => state.closeLegacyImport);
   const board = useBoardStore((state) => state.board);
   const dirty = useBoardStore((state) => state.dirty);
   const saving = useBoardStore((state) => state.saving);
@@ -157,6 +160,9 @@ export function StudioApp() {
       <SettingsDialog />
 
       <RunConfirmDialog />
+
+      {/* 导入对话框挂在应用壳上：导入完成后画布会替换项目库，对话框留在壳里才能继续展示告警。 */}
+      <LegacyImportDialog open={legacyImportOpen} onClose={closeLegacyImport} />
 
       <footer className="studio-dock">
         <span>{board ? `board ${board.id.slice(-8)}` : 'no-board'}</span>

@@ -8,7 +8,7 @@ vi.mock('@tauri-apps/api/core', () => ({
   convertFileSrc: (path: string) => `file://${path}`,
 }));
 
-import { assetUrl, listBoards, listRuns, saveAssetHost, startRun } from './tauri';
+import { assetUrl, importLegacyProject, listBoards, listRuns, saveAssetHost, startRun } from './tauri';
 
 function enableTauri() {
   (globalThis as unknown as { window?: unknown }).window = { __TAURI_INTERNALS__: {} };
@@ -87,5 +87,26 @@ describe('tauri bridge', () => {
     expect(invoke).toHaveBeenCalledWith('save_asset_host', {
       config: expect.objectContaining({ schemaVersion: 1, strategy: 's3', endpoint: 'https://s3.example.com' }),
     });
+  });
+
+  it('imports a legacy project through the Rust command with camelCase counts', async () => {
+    invoke.mockResolvedValue({
+      project: { id: 'project_1' },
+      board: { id: 'board_1' },
+      assetCount: 12,
+      runCount: 9,
+      warnings: ['素材读不到'],
+    });
+    const result = await importLegacyProject('/tmp/legacy.json');
+    expect(invoke).toHaveBeenCalledWith('import_legacy_project', { path: '/tmp/legacy.json' });
+    expect(result.assetCount).toBe(12);
+    expect(result.runCount).toBe(9);
+    expect(result.warnings).toEqual(['素材读不到']);
+  });
+
+  it('refuses the legacy import outside the desktop app', async () => {
+    delete (globalThis as unknown as { window?: unknown }).window;
+    await expect(importLegacyProject('/tmp/legacy.json')).rejects.toThrow('旧项目导入只能在桌面应用中运行');
+    expect(invoke).not.toHaveBeenCalled();
   });
 });

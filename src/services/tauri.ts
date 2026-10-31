@@ -152,4 +152,18 @@ export async function readAssetText(assetId: string): Promise<string> {
   return invoke<string>('read_asset_text', { assetId });
 }
 
+/** 旧项目导入结果：字段名与 Rust 侧 `#[serde(rename_all = "camelCase")]` 一致。 */
+export interface LegacyImportResult {
+  project: { id?: string; name?: string };
+  board: { id?: string; name?: string };
+  assetCount: number;
+  runCount: number;
+  warnings: string[];
+}
+
+export async function importLegacyProject(path: string): Promise<LegacyImportResult> {
+  if (!isTauri()) throw new Error('旧项目导入只能在桌面应用中运行');
+  return invoke<LegacyImportResult>('import_legacy_project', { path });
+}
+
 export type { AssetRef };

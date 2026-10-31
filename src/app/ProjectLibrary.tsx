@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { FolderKanban, LayoutGrid, Plus } from 'lucide-react';
+import { FileInput, FolderKanban, LayoutGrid, Plus } from 'lucide-react';
 import type { StudioProject } from '../domain/types';
 import { useStudioStore } from '../stores/studioStore';
 
@@ -13,6 +13,7 @@ export function ProjectLibrary({ onOpenBoard }: Props) {
   const currentProjectId = useStudioStore((state) => state.currentProjectId);
   const createProject = useStudioStore((state) => state.createProject);
   const createBoard = useStudioStore((state) => state.createBoard);
+  const openLegacyImport = useStudioStore((state) => state.openLegacyImport);
   const [name, setName] = useState('');
   const [ratio, setRatio] = useState<StudioProject['aspectRatio']>('9:16');
   const [boardName, setBoardName] = useState('');
@@ -67,6 +68,9 @@ export function ProjectLibrary({ onOpenBoard }: Props) {
           <button className="studio-button" type="submit" disabled={busy}>
             <Plus size={14} /> {busy ? '创建中…' : '创建项目'}
           </button>
+          <button type="button" className="studio-button secondary" onClick={() => openLegacyImport()}>
+            <FileInput size={13} /> 导入旧项目
+          </button>
         </form>
       </div>
     );
@@ -104,6 +108,11 @@ export function ProjectLibrary({ onOpenBoard }: Props) {
           <Plus size={14} /> 新建画布
         </button>
       </form>
+      <div className="studio-library-actions">
+        <button type="button" className="studio-button secondary" onClick={() => openLegacyImport()}>
+          <FileInput size={13} /> 导入旧项目
+        </button>
+      </div>
     </div>
   );
 }

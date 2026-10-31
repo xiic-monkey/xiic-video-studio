@@ -22,12 +22,15 @@ interface StudioState {
   currentProjectId?: string;
   currentBoardId?: string;
   error?: string;
-  boot(): Promise<void>;
+  legacyImportOpen: boolean;
+  boot(force?: boolean): Promise<void>;
   createProject(name: string, aspectRatio: StudioProject['aspectRatio']): Promise<StudioProject>;
   selectProject(projectId: string): Promise<void>;
   createBoard(name: string): Promise<BoardDoc | undefined>;
   selectBoard(boardId: string): Promise<BoardDoc | undefined>;
   removeBoard(boardId: string): Promise<void>;
+  openLegacyImport(): void;
+  closeLegacyImport(): void;
   setError(message?: string): void;
 }
 
@@ -36,9 +39,10 @@ export const useStudioStore = create<StudioState>((set, get) => ({
   loading: false,
   projects: [],
   boards: [],
+  legacyImportOpen: false,
 
-  async boot() {
-    if (get().booted || get().loading) return;
+  async boot(force) {
+    if (!force && (get().booted || get().loading)) return;
     set({ loading: true, error: undefined });
     try {
       const projects = await listStudioProjects();
@@ -123,6 +127,14 @@ export const useStudioStore = create<StudioState>((set, get) => ({
       currentBoardId: state.currentBoardId === boardId ? boards[0]?.id : state.currentBoardId,
       error: undefined,
     });
+  },
+
+  openLegacyImport() {
+    set({ legacyImportOpen: true });
+  },
+
+  closeLegacyImport() {
+    set({ legacyImportOpen: false });
   },
 
   setError(message) {
