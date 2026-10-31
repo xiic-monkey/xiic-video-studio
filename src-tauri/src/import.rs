@@ -1,7 +1,8 @@
 //! 旧项目导入：把旧版 Frameforge 项目 JSON 映射成新画布文档。
 //!
-//! 本模块只做「纯映射」：输入一个旧项目 JSON，输出新画布文档 + 运行记录 + 中文警告。
-//! 素材下载、落库与命令注册属于下一段（22b），这里不碰文件、不发网络请求。
+//! 输入一个旧项目 JSON，输出新画布文档 + 运行记录 + 中文警告，并把素材复制进 CAS。
+//! 所有文件读写与网络请求都在 Rust 侧完成：本地路径必须落在允许的目录内，
+//! 远端地址必须是通过 `security::validate_remote_url` 校验的公网 https。
 //!
 //! P0 边界（写死在这里，避免越界）：
 //! - 只映射到 P0 原语节点：characters → 文本 + 图片节点，scenes → 文本节点，
@@ -13,11 +14,13 @@
 //!   两者都无 → `t2v`。这样导入出来的画布不会一进 `validateBoard` 就报
 //!   `GRAPH_PORT_HIDDEN` / `VIDEO_MODE_CONFLICT`。
 
-// 22b 注册 import_legacy_project 命令后可以去掉这一行。
-#![allow(dead_code)]
-
+use crate::assets;
+use crate::db;
 use crate::gateway::AppError;
-use crate::runs::RunRecord;
+use crate::runs::{self, RunRecord};
+use crate::security;
+use crate::AppState;
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -41,6 +44,17 @@ const MEDIA_STEP: f64 = 200.0;
 pub struct LegacySource {
     pub url: String,
     pub kind: &'static str,
+}
+
+/// 导入结果：前端据此刷新项目库，并把警告原样展示给用户。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyImportResult {
+    pub project: Value,
+    pub board: Value,
+    pub asset_count: usize,
+    pub run_count: usize,
+    pub warnings: Vec<String>,
 }
 
 fn str_field(value: &Value, key: &str) -> String {
@@ -704,7 +718,7 @@ pub fn read_legacy_document(path: &Path, allowed_roots: &[PathBuf]) -> Result<Va
             false,
         ));
     }
-    let value: Value = serde_json::from_slice(&bytes)
+    let mut value: Value = serde_json::from_slice(&bytes)
         .map_err(|error| AppError::new("IMPORT_JSON_INVALID", format!("旧项目文件不是合法 JSON：{error}"), false))?;
     if !value.is_object() {
         return Err(AppError::new("IMPORT_TYPE_INVALID", "旧项目文件的顶层必须是对象", false));
@@ -725,11 +739,27 @@ pub fn read_legacy_document(path: &Path, allowed_roots: &[PathBuf]) -> Result<Va
             false,
         ));
     }
+    // 旧项目里可能混着 API Key 之类的字段：进内存之前先剥掉，
+    // 免得它们随项目包、画布文档一起落库。
+    crate::strip_sensitive_fields(&mut value);
     Ok(value)
 }
 
 /// 读取白名单目录内的本地文件：目录之外的路径一律拒绝（防 `..` 穿越与绝对路径逃逸）。
 pub fn resolve_local_bytes(path: &Path, allowed_roots: &[PathBuf]) -> Result<Vec<u8>, AppError> {
+    let meta = std::fs::symlink_metadata(path).map_err(|error| {
+        AppError::new("IMPORT_FILE_MISSING", format!("无法读取旧项目文件：{error}"), false)
+    })?;
+    if meta.is_symlink() || !meta.is_file() {
+        return Err(AppError::new("IMPORT_TYPE_INVALID", "素材必须是普通文件", false));
+    }
+    if meta.len() > MAX_ASSET_BYTES {
+        return Err(AppError::new(
+            "IMPORT_TOO_LARGE",
+            "单个素材超过 256 MB",
+            false,
+        ));
+    }
     let canonical = path.canonicalize().map_err(|error| {
         AppError::new("IMPORT_FILE_MISSING", format!("无法读取旧项目文件：{error}"), false)
     })?;
@@ -746,6 +776,230 @@ pub fn resolve_local_bytes(path: &Path, allowed_roots: &[PathBuf]) -> Result<Vec
     }
     std::fs::read(&canonical).map_err(|error| {
         AppError::new("IMPORT_FILE_MISSING", format!("无法读取旧项目文件：{error}"), false)
+    })
+}
+
+/// 落盘失败统一走一个错误码，方便前端区分「导入整体失败」与「单个素材失败」。
+fn storage_error(message: impl Into<String>) -> AppError {
+    AppError::new("STORAGE_IO", message, false)
+}
+
+/// 素材类型：优先看 MIME，MIME 不认识时退回 URL 后缀。
+fn guess_kind(mime: &str, url: &str) -> &'static str {
+    if mime.starts_with("video/") {
+        "video"
+    } else if mime.starts_with("audio/") {
+        "audio"
+    } else if mime.starts_with("image/") {
+        "image"
+    } else if mime.starts_with("text/") || mime.ends_with("/json") {
+        "text"
+    } else {
+        match kind_for_url(url) {
+            "video" => "video",
+            "audio" => "audio",
+            _ => "image",
+        }
+    }
+}
+
+/// 下载远端素材：只允许公网 https，重定向后再校验一次目标地址（防 SSRF）。
+async fn fetch_remote(client: &reqwest::Client, raw: &str) -> Result<(Vec<u8>, String), AppError> {
+    let url = security::validate_remote_url(raw)?;
+    let response = client
+        .get(url.clone())
+        .send()
+        .await
+        .map_err(|error| AppError::new("PROVIDER_NETWORK", error.to_string(), true))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(AppError::new(
+            "PROVIDER_HTTP_STATUS",
+            format!("素材下载失败：{status}"),
+            status.is_server_error(),
+        ));
+    }
+    // 重定向后必须再校验一次，避免 https 公网地址把请求带到私网。
+    security::validate_remote_url(response.url().as_str())?;
+    let mime = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .split(';')
+        .next()
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    // 服务器声明了体积就先拒绝，别把超大响应整个读进内存。
+    if response.content_length().unwrap_or(0) > MAX_ASSET_BYTES {
+        return Err(AppError::new("IMPORT_TOO_LARGE", "远端素材超过 256 MB", false));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| AppError::new("PROVIDER_NETWORK", error.to_string(), true))?;
+    if bytes.len() as u64 > MAX_ASSET_BYTES {
+        return Err(AppError::new("IMPORT_TOO_LARGE", "远端素材超过 256 MB", false));
+    }
+    Ok((bytes.to_vec(), mime))
+}
+
+/// 把旧项目里的本地路径写法识别出来：`file://` 与绝对路径。
+/// 相对路径不认：它取决于进程工作目录，含义不确定。
+fn local_source(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if let Some(stripped) = trimmed.strip_prefix("file://") {
+        return Some(PathBuf::from(percent_decode(stripped)));
+    }
+    if trimmed.starts_with('/') || (trimmed.len() > 2 && trimmed.as_bytes()[1] == b':') {
+        return Some(PathBuf::from(trimmed));
+    }
+    None
+}
+
+/// 极简 percent 解码：只处理 `%XX`。
+/// 旧项目里的本地路径来自应用自身写入的 `app_data`，不含查询串，够用。
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(value) = u8::from_str_radix(&input[index + 1..index + 3], 16) {
+                out.push(value);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// 本地素材的 MIME 猜测：只按扩展名，认不出来就用 octet-stream。
+fn mime_guess(path: &Path) -> String {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "mp4" | "mov" => "video/mp4",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "m4a" => "audio/mp4",
+        "txt" => "text/plain",
+        "json" => "application/json",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+/// 导入主体：素材复制进 CAS，项目 / 画布 / 运行记录落库。
+///
+/// 单个素材失败不会中断整个导入：失败原因写进 `warnings`，画布对应的节点保持为空。
+pub async fn import_document(
+    state: &AppState,
+    document: &Value,
+    roots: &[PathBuf],
+) -> Result<LegacyImportResult, AppError> {
+    let project_id = format!("project_{}", uuid::Uuid::new_v4());
+    let board_id = format!("board_{}", uuid::Uuid::new_v4());
+    let data_dir = state.data_dir.clone();
+    let client =
+        crate::http_client().map_err(|message| AppError::new("UNAVAILABLE_HTTP", message, false))?;
+
+    let mut asset_ids: HashMap<String, String> = HashMap::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut asset_count = 0usize;
+
+    for source in collect_asset_sources(document) {
+        let raw = source.url.as_str();
+        let stored: Result<(Vec<u8>, String), AppError> = if let Some((mime, bytes)) =
+            assets::decode_data_url(raw)
+        {
+            Ok((bytes, mime))
+        } else if raw.starts_with("https://") {
+            fetch_remote(&client, raw).await
+        } else if let Some(path) = local_source(raw) {
+            let mime = mime_guess(&path);
+            resolve_local_bytes(&path, roots).map(|bytes| (bytes, mime))
+        } else {
+            Err(AppError::new(
+                "IMPORT_TYPE_INVALID",
+                format!("不支持的素材地址：{raw}"),
+                false,
+            ))
+        };
+        match stored {
+            Ok((bytes, mime)) => {
+                let provenance = json!({
+                    "projectId": project_id,
+                    "legacy": { "source": raw }
+                });
+                let kind = guess_kind(&mime, raw);
+                let mut asset = assets::store_bytes(&data_dir, &bytes, kind, &mime, provenance)
+                    .map_err(|message| AppError::new("STORAGE_ASSET_FAILED", message, false))?;
+                asset.provenance["legacy"]["sourceKind"] = json!(source.kind);
+                runs::save_asset(state, &asset)?;
+                asset_ids.insert(raw.to_string(), asset.id.clone());
+                asset_count += 1;
+            }
+            Err(error) => warnings.push(format!("素材 {} 未能导入：{}", raw, error.message)),
+        }
+    }
+
+    let project = build_legacy_project(document, &project_id);
+    let (board, imported_runs, mut board_warnings) =
+        build_legacy_board(document, &project_id, &board_id, &asset_ids);
+    warnings.append(&mut board_warnings);
+
+    let path =
+        runs::db_path(state).map_err(|message| AppError::new("STORAGE_DB_FAILED", message, false))?;
+    let connection =
+        db::open(&path).map_err(|message| AppError::new("STORAGE_DB_FAILED", message, false))?;
+    let now = chrono::Utc::now().to_rfc3339();
+    connection
+        .execute(
+            "INSERT INTO studio_projects (id, name, payload, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name, payload=excluded.payload, updated_at=excluded.updated_at",
+            rusqlite::params![
+                project_id,
+                project.get("name").and_then(Value::as_str).unwrap_or("导入的旧项目"),
+                serde_json::to_string(&project).map_err(|error| storage_error(error.to_string()))?,
+                now
+            ],
+        )
+        .map_err(|error| storage_error(error.to_string()))?;
+    connection
+        .execute(
+            "INSERT INTO boards (id, project_id, name, payload, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name, payload=excluded.payload, updated_at=excluded.updated_at",
+            rusqlite::params![
+                board_id,
+                project_id,
+                board.get("name").and_then(Value::as_str).unwrap_or("导入画布"),
+                serde_json::to_string(&board).map_err(|error| storage_error(error.to_string()))?,
+                now
+            ],
+        )
+        .map_err(|error| storage_error(error.to_string()))?;
+    for run in &imported_runs {
+        runs::save_run(state, run).map_err(|message| storage_error(message))?;
+    }
+
+    Ok(LegacyImportResult {
+        project,
+        board,
+        asset_count,
+        run_count: imported_runs.len(),
+        warnings,
     })
 }
 
@@ -969,5 +1223,155 @@ mod tests {
         std::fs::write(&ok, legacy().to_string()).expect("write");
         assert!(read_legacy_document(&ok, &[dir.clone()]).is_ok());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sensitive_fields_are_stripped_before_the_document_is_used() {
+        let dir = std::env::temp_dir().join(format!("ff_import_secret_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("project.json");
+        let mut document = legacy();
+        document["apiKey"] = json!("plain-key");
+        document["styleGuide"]["apiKey"] = json!("nested-key");
+        std::fs::write(&path, document.to_string()).expect("write");
+        let read = read_legacy_document(&path, &[dir.clone()]).expect("read");
+        assert!(read.get("apiKey").is_none(), "顶层密钥必须被剥掉");
+        assert!(read["styleGuide"].get("apiKey").is_none(), "嵌套密钥必须被剥掉");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn local_sources_are_recognized_but_relative_paths_are_not() {
+        assert_eq!(
+            local_source("/Users/xiic/frameforge/sb1.png"),
+            Some(PathBuf::from("/Users/xiic/frameforge/sb1.png"))
+        );
+        assert_eq!(
+            local_source("file:///Users/xiic/frameforge/sb%201.png"),
+            Some(PathBuf::from("/Users/xiic/frameforge/sb 1.png"))
+        );
+        assert_eq!(local_source("sb1.png"), None, "相对路径必须被拒绝");
+        assert_eq!(local_source("https://cdn.example/a.png"), None);
+        assert_eq!(local_source("http://cdn.example/a.png"), None);
+    }
+
+    #[test]
+    fn mime_and_kind_guessing_falls_back_to_the_url_suffix() {
+        assert_eq!(mime_guess(Path::new("/tmp/a.png")), "image/png");
+        assert_eq!(mime_guess(Path::new("/tmp/a.MP4")), "video/mp4");
+        assert_eq!(mime_guess(Path::new("/tmp/a.unknown")), "application/octet-stream");
+        assert_eq!(guess_kind("image/png", ""), "image");
+        assert_eq!(guess_kind("video/mp4", ""), "video");
+        assert_eq!(guess_kind("audio/mpeg", ""), "audio");
+        assert_eq!(guess_kind("text/plain", ""), "text");
+        // MIME 认不出来时看 URL 后缀
+        assert_eq!(guess_kind("application/octet-stream", "https://cdn.example/a.mp4"), "video");
+        assert_eq!(guess_kind("application/octet-stream", "https://cdn.example/a.png"), "image");
+    }
+
+    #[tokio::test]
+    async fn remote_assets_must_be_public_https() {
+        let client = crate::http_client().expect("client");
+        for (target, code) in [
+            ("https://127.0.0.1/a.png", "PARAM_URL_PRIVATE"),
+            ("https://localhost/a.png", "PARAM_URL_PRIVATE"),
+            ("https://192.168.1.2/a.png", "PARAM_URL_PRIVATE"),
+            ("http://cdn.example/a.png", "PARAM_URL_INSECURE"),
+            ("file:///etc/passwd", "PARAM_URL_INSECURE"),
+            ("not-a-url", "PARAM_URL_INVALID"),
+        ] {
+            let error = fetch_remote(&client, target).await.expect_err("必须拒绝");
+            assert_eq!(error.code, code, "{target} 的错误码不对");
+        }
+    }
+
+    /// 导入一条只带本地素材的旧项目：素材复制进 CAS，项目 / 画布 / 运行记录落库。
+    #[tokio::test]
+    async fn import_document_copies_assets_into_cas_and_writes_the_board() {
+        let root = tempfile::tempdir().expect("root");
+        let data = tempfile::tempdir().expect("data");
+        let state = crate::AppState {
+            db_path: std::sync::Mutex::new(data.path().join("frameforge.sqlite3")),
+            data_dir: data.path().to_path_buf(),
+        };
+
+        let storyboard = root.path().join("sb1.png");
+        std::fs::write(&storyboard, b"fake-png-bytes").expect("write");
+        let mut document = legacy();
+        document["referenceBindings"] = json!([]);
+        document["candidates"] = json!([]);
+        document["shots"] = json!([document["shots"][0].clone()]);
+        document["shots"][0]["duration"] = json!(6);
+        document["characters"][0]["portraitUrl"] = json!("data:image/png;base64,aGVsbG8=");
+        document["storyboards"] = json!([{
+            "id": "sb1", "shotId": "sh1", "role": "storyboard",
+            "url": storyboard.to_string_lossy().to_string(), "selected": true
+        }]);
+
+        let roots = vec![root.path().to_path_buf()];
+        let result = import_document(&state, &document, &roots).await.expect("import");
+        assert_eq!(result.asset_count, 2, "两个素材都该进 CAS：{:?}", result.warnings);
+        assert!(result.warnings.is_empty(), "不该有警告：{:?}", result.warnings);
+        assert!(result.run_count >= 2, "导入的素材要各留一条运行记录");
+        assert_eq!(result.project["schemaVersion"], json!(1));
+        assert_eq!(result.board["schemaVersion"], json!(1));
+
+        // 素材落进 CAS，而且不再引用原路径
+        let connection = db::open(&state.db_path.lock().expect("lock").clone()).expect("db");
+        let mut statement = connection
+            .prepare("SELECT payload FROM assets")
+            .expect("prepare");
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query")
+            .collect::<Result<Vec<String>, _>>()
+            .expect("rows");
+        assert_eq!(rows.len(), 2);
+        for payload in rows {
+            let asset: assets::AssetRef = serde_json::from_str(&payload).expect("asset");
+            assert!(asset.path.starts_with("assets/"), "素材必须复制进 CAS");
+            assert!(data.path().join(&asset.path).exists(), "CAS 里要有文件");
+            assert!(asset.provenance["legacy"]["source"].is_string());
+            assert!(asset.provenance["legacy"]["sourceKind"].is_string());
+        }
+        // 项目、画布、运行记录都落库
+        let projects: i64 = connection
+            .query_row("SELECT COUNT(*) FROM studio_projects", [], |row| row.get(0))
+            .expect("projects");
+        let boards: i64 = connection
+            .query_row("SELECT COUNT(*) FROM boards", [], |row| row.get(0))
+            .expect("boards");
+        let runs: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+            .expect("runs");
+        assert_eq!(projects, 1);
+        assert_eq!(boards, 1);
+        assert_eq!(runs as usize, result.run_count);
+    }
+
+    /// 素材读不到（越界路径）时不该中断整个导入，只写一条警告。
+    #[tokio::test]
+    async fn import_document_reports_unreadable_assets_as_warnings() {
+        let root = tempfile::tempdir().expect("root");
+        let data = tempfile::tempdir().expect("data");
+        let state = crate::AppState {
+            db_path: std::sync::Mutex::new(data.path().join("frameforge.sqlite3")),
+            data_dir: data.path().to_path_buf(),
+        };
+        let mut document = legacy();
+        document["referenceBindings"] = json!([]);
+        document["candidates"] = json!([]);
+        document["characters"] = json!([{
+            "id": "c1", "name": "林淮", "role": "男主", "bio": "",
+            "portraitUrl": "/etc/hosts"
+        }]);
+
+        let result = import_document(&state, &document, &[root.path().to_path_buf()])
+            .await
+            .expect("import");
+        assert_eq!(result.asset_count, 0);
+        assert!(result.warnings.iter().any(|item| item.contains("未能导入")), "{:?}", result.warnings);
+        // 画布照样建出来，节点保持为空
+        assert!(result.board["nodes"]["node_portrait_1"]["data"]["selectedAssetId"].is_null());
     }
 }

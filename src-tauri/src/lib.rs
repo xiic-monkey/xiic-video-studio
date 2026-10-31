@@ -9,7 +9,7 @@ use tauri::{AppHandle, Manager, State};
 mod assets;
 mod db;
 mod gateway;
-// 旧项目导入（纯映射）；命令注册与素材下载在下一段接入。
+// 旧项目导入：素材下载、落 CAS 与落库都在这个模块里。
 mod import;
 mod jobs;
 mod runs;
@@ -569,6 +569,42 @@ fn read_asset_text(asset_id: String, state: State<'_, AppState>) -> Result<Strin
         .map_err(|error| error.to_string())
 }
 
+/// 导入旧项目时允许读取的目录：应用数据目录 + 用户选中的那个 JSON 所在的目录。
+///
+/// 文件系统根目录不进白名单，否则「文件所在目录」等于放开整块磁盘。
+fn import_allowed_roots(data_dir: &PathBuf, target: &std::path::Path) -> Vec<PathBuf> {
+    vec![
+        data_dir.clone(),
+        target
+            .parent()
+            .filter(|parent| parent.parent().is_some())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_dir.clone()),
+    ]
+}
+
+/// 导入旧版 Frameforge 项目：素材复制进 CAS，项目 / 画布 / 运行记录落库。
+///
+/// 允许读取的目录只有两处：应用数据目录，以及用户选中的那个 JSON 所在的目录。
+#[tauri::command]
+async fn import_legacy_project(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<import::LegacyImportResult, String> {
+    let data_dir = state.data_dir.clone();
+    let db_path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
+    let owned = AppState {
+        db_path: std::sync::Mutex::new(db_path),
+        data_dir: data_dir.clone(),
+    };
+    let target = std::path::PathBuf::from(&path);
+    let roots = import_allowed_roots(&data_dir, &target);
+    let document = import::read_legacy_document(&target, &roots).map_err(|error| error.message)?;
+    import::import_document(&owned, &document, &roots)
+        .await
+        .map_err(|error| error.message)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -619,7 +655,8 @@ pub fn run() {
             select_run_candidate,
             resume_jobs,
             asset_file_path,
-            read_asset_text
+            read_asset_text,
+            import_legacy_project
         ])
         .run(tauri::generate_context!())
         .expect("error while running Frameforge");
@@ -717,5 +754,27 @@ mod tests {
         assert_eq!(response["hasCredentials"], json!(true));
         assert!(response.get("accessKey").is_none());
         assert!(response.get("secretKey").is_none());
+    }
+
+    #[test]
+    fn import_roots_cover_the_data_dir_and_the_selected_file_folder() {
+        let data_dir = PathBuf::from("/Users/xiic/Library/Application Support/com.frameforge.studio");
+        let roots = import_allowed_roots(&data_dir, std::path::Path::new("/Users/xiic/frameforge/project.json"));
+        assert_eq!(roots[0], data_dir);
+        assert_eq!(roots[1], PathBuf::from("/Users/xiic/frameforge"));
+    }
+
+    #[test]
+    fn import_roots_never_include_the_filesystem_root() {
+        let data_dir = PathBuf::from("/Users/xiic/Library/Application Support/com.frameforge.studio");
+        // 用户选了根目录下的文件：那个目录不能当白名单，否则等于放开整块磁盘。
+        let roots = import_allowed_roots(&data_dir, std::path::Path::new("/project.json"));
+        assert!(
+            roots.iter().all(|root| root.parent().is_some()),
+            "白名单里不能出现文件系统根目录：{roots:?}"
+        );
+        // 相对路径同样拿不到「所在目录」白名单。
+        let roots = import_allowed_roots(&data_dir, std::path::Path::new("project.json"));
+        assert_eq!(roots[1], data_dir);
     }
 }

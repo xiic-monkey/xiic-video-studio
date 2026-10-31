@@ -423,7 +423,7 @@ pub(crate) async fn store_outputs_for_poll(
     store_outputs(app, &state, run, outputs).await
 }
 
-fn save_asset(state: &AppState, asset: &AssetRef) -> Result<(), AppError> {
+pub(crate) fn save_asset(state: &AppState, asset: &AssetRef) -> Result<(), AppError> {
     let path =
         db_path(state).map_err(|message| AppError::new("STORAGE_DB_FAILED", message, false))?;
     let connection =
