@@ -26,12 +26,15 @@ export function isSimpleCapability(value: string): value is SimpleCapability {
 
 export function draftFromModel(model: ModelConfig): ModelDraft {
   const price = uniformPrice(model);
+  // token 计价草稿表达不了，价格字段留空：否则保存时会被当成「用户改过价」，
+  // 把 token 计价改写成 request 计价，属于数据损坏。
+  const unit: SimplePriceUnit | undefined = price && price.unit !== 'token' ? price.unit : undefined;
   return {
     id: model.id,
     displayName: model.displayName,
     capabilities: model.capabilities.map((item) => item.capability).filter(isSimpleCapability),
-    priceAmount: price?.amount,
-    priceUnit: price && price.unit !== 'token' ? price.unit : 'request',
+    priceAmount: unit === undefined ? undefined : price?.amount,
+    priceUnit: unit ?? 'request',
   };
 }
 
@@ -52,7 +55,8 @@ function uniformPrice(model: ModelConfig): PriceRule | undefined {
 
 export function modelFromDraft(draft: ModelDraft): ModelConfig {
   const id = draft.id.trim();
-  const price: PriceRule | undefined = draft.priceAmount && draft.priceAmount > 0
+  // amount 为 0 也是真实价格，不能当成「没有价格」。
+  const price: PriceRule | undefined = draft.priceAmount !== undefined
     ? { unit: draft.priceUnit, amount: draft.priceAmount, currency: 'USD' }
     : undefined;
   const capabilities: ModelCapability[] = draft.capabilities.map((item) => ({
@@ -77,7 +81,7 @@ export function validDrafts(drafts: ModelDraft[]): ModelConfig[] {
 /**
  * 草稿保存时与原模型合并。草稿是原模型的全量视图，因此：
  * - 基线里有、当前草稿里没有的 id = 用户删除或改名，这些模型不再保留；
- * - 草稿勾选的简单能力按草稿合并，价格逐能力计算：已有能力保留自己的价，草稿价只给新增能力；
+ * - 草稿勾选的简单能力按草稿合并，价格逐能力计算：用户改过价就用草稿价，没改过就沿用原能力自己的价；
  * - 草稿表达不了的非简单能力（video.generate 等）原样保留，字段一个不丢。
  */
 export function mergeModelDrafts(original: ModelConfig[], drafts: ModelDraft[]): ModelConfig[] {
@@ -99,12 +103,17 @@ export function mergeModelDrafts(original: ModelConfig[], drafts: ModelDraft[]):
 
 function mergeDraft(draft: ModelDraft, original: ModelConfig): ModelConfig {
   const id = draft.id.trim();
+  const baseline = uniformPrice(original);
+  const changed = priceChanged(draft, baseline);
+  const draftPrice: PriceRule | undefined = draft.priceAmount !== undefined
+    ? { unit: draft.priceUnit, amount: draft.priceAmount, currency: 'USD' }
+    : undefined;
   const simple: ModelCapability[] = draft.capabilities.map((capability) => {
     const previous = original.capabilities.find((item) => item.capability === capability);
     const transport: ModelCapability['inputTransport'] = previous && previous.inputTransport.length
       ? [...previous.inputTransport]
       : ['dataUrl'];
-    const price = mergePrice(draft, previous);
+    const price = mergePrice(draftPrice, previous, changed);
     return {
       capability,
       inputTransport: transport,
@@ -123,16 +132,36 @@ function mergeDraft(draft: ModelDraft, original: ModelConfig): ModelConfig {
 }
 
 /**
- * 价格逐能力计算，不再把草稿价广播给所有简单能力：
- * - 原模型里已有的同名能力沿用它自己的价（原来没价就还是没价），草稿价不覆盖它；
+ * 判断草稿里的价格是不是用户改过的。草稿只有一个价格字段，合并时又拿不到编辑前的草稿，
+ * 只能跟基线比对：
+ * - 草稿没填价 → 没改；
+ * - 基线有统一价且草稿价与它完全一致 → 草稿只是回显原值，没改；
+ * - 其余情况（基线没有统一价而草稿填了价，或草稿价与基线不同） → 用户改过。
+ */
+function priceChanged(draft: ModelDraft, baseline: PriceRule | undefined): boolean {
+  if (draft.priceAmount === undefined) return false;
+  if (baseline && baseline.amount === draft.priceAmount && baseline.unit === draft.priceUnit) return false;
+  return true;
+}
+
+/**
+ * 价格逐能力计算：
+ * - 原模型里已有的同名能力：用户改过价就换成草稿价（保留原币种），没改过就沿用它自己的价
+ *   （原来没价就还是没价）；
  * - 原模型里没有的能力（用户新加的）没有原价可沿用，才用草稿价。
  */
-function mergePrice(draft: ModelDraft, previous: ModelCapability | undefined): PriceRule | undefined {
-  if (previous) return previous.price;
-  if (draft.priceAmount !== undefined && draft.priceAmount > 0) {
-    return { unit: draft.priceUnit, amount: draft.priceAmount, currency: 'USD' };
-  }
-  return undefined;
+function mergePrice(
+  draftPrice: PriceRule | undefined,
+  previous: ModelCapability | undefined,
+  changed: boolean,
+): PriceRule | undefined {
+  if (!previous) return draftPrice;
+  if (!changed || !draftPrice) return previous.price;
+  return {
+    unit: draftPrice.unit,
+    amount: draftPrice.amount,
+    currency: previous.price?.currency ?? 'USD',
+  };
 }
 
 export function capabilitySummary(item: ModelCapability): string {
