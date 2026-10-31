@@ -2968,7 +2968,9 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn runtime(base_url: &str) -> ProviderRuntime {
-        ProviderRuntime { profile: test_profile("minimax-h3", base_url), api_key: "h3-key".to_string() }
+        let mut profile = test_profile("minimax-h3", base_url);
+        profile.models = vec![model()];
+        ProviderRuntime { profile, api_key: "h3-key".to_string() }
     }
 
     fn model() -> crate::gateway::ModelConfig {

@@ -1,3 +1,4 @@
+pub mod minimax;
 pub mod openai;
 
 use serde::{Deserialize, Serialize};
@@ -210,6 +211,7 @@ pub async fn execute(
 ) -> Result<AdapterResult, AppError> {
     match runtime.profile.adapter.as_str() {
         "openai-compatible" => openai::execute(client, runtime, request).await,
+        "minimax-h3" => minimax::execute(client, runtime, request).await,
         other => Err(AppError::new(
             "CAP_UNSUPPORTED_ADAPTER",
             format!("P0 未实现适配器 {other}"),
