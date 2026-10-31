@@ -3,6 +3,7 @@ import type { BoardDoc, BoardNode, EdgeRole } from '../domain/types';
 
 export interface StudioNodeData extends Record<string, unknown> {
   domain: BoardNode;
+  stale: boolean;
 }
 
 const ROLE_LABEL: Record<EdgeRole, string> = {
@@ -22,7 +23,7 @@ const ROLE_COLOR: Record<EdgeRole, string> = {
   timeline: '#e4ecea',
 };
 
-export function toFlowNodes(doc: BoardDoc, selectedIds: string[] = []): Node<StudioNodeData>[] {
+export function toFlowNodes(doc: BoardDoc, selectedIds: string[] = [], stale?: Set<string>): Node<StudioNodeData>[] {
   const selected = new Set(selectedIds);
   return Object.values(doc.nodes)
     .slice()
@@ -31,7 +32,7 @@ export function toFlowNodes(doc: BoardDoc, selectedIds: string[] = []): Node<Stu
       id: node.id,
       type: node.type,
       position: node.position,
-      data: { domain: node },
+      data: { domain: node, stale: stale?.has(node.id) ?? false },
       parentId: node.parentId,
       zIndex: node.z,
       style: node.size ? { width: node.size.width, height: node.size.height } : undefined,

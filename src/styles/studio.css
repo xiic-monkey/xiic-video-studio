@@ -211,3 +211,21 @@
 .settings-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .settings-ok { margin: 0; color: var(--mint); font-size: 10px; }
 .settings-error { margin: 0; color: var(--danger); font-size: 10px; }
+
+.flow-node.is-stale { border-style: dashed; border-color: var(--warning); }
+.flow-node-stale { color: var(--warning); font-size: 9px; white-space: nowrap; }
+.flow-node-run { display: grid; place-items: center; width: 22px; height: 22px; color: var(--mint); background: var(--panel-3); border: 1px solid var(--line-strong); border-radius: 4px; }
+.flow-node-run:hover { border-color: var(--mint); background: #26302f; }
+.flow-node-run:disabled { opacity: .45; cursor: not-allowed; }
+.inspector-run { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px; }
+.confirm-backdrop { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 24px; background: rgba(6, 10, 10, .74); backdrop-filter: blur(3px); }
+.confirm-dialog { display: grid; gap: 14px; width: min(560px, 100%); max-height: min(680px, calc(100vh - 48px)); overflow: auto; padding: 18px; background: var(--panel); border: 1px solid var(--line-strong); border-radius: 8px; box-shadow: 0 24px 64px rgba(0, 0, 0, .55); }
+.confirm-dialog header h2 { margin: 0; font-size: 15px; }
+.confirm-sub { margin: 4px 0 0; color: var(--text-muted); font-size: 11px; }
+.confirm-body { display: grid; gap: 7px; margin: 0; }
+.confirm-body > div { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 10px; align-items: baseline; }
+.confirm-body dt { color: var(--text-dim); font-size: 10px; }
+.confirm-body dd { margin: 0; color: var(--text); font-size: 11px; overflow-wrap: anywhere; }
+.confirm-prompt { max-height: 132px; overflow: auto; padding: 8px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; font-family: var(--font-mono); font-size: 10px; line-height: 1.55; }
+.confirm-warnings { display: grid; gap: 4px; margin: 0; padding-left: 16px; color: #f0d58d; font-size: 10px; }
+.confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }

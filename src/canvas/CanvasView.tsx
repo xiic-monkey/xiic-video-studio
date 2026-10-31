@@ -10,6 +10,7 @@ import { makeEdge } from '../domain/graph/commands';
 import { validateConnection } from '../domain/graph/validate';
 import { useBoardStore } from '../stores/boardStore';
 import { useRunStore } from '../stores/runStore';
+import { useStaleNodeIds } from '../run/useStaleNodeIds';
 import { nodeTypes } from '../nodes/registry';
 import { danglingEdgeCount, nodeColor, toFlowEdges, toFlowNodes } from './mapping';
 
@@ -26,7 +27,11 @@ function CanvasInner() {
   const { screenToFlowPosition, getZoom } = useReactFlow();
   const wrapper = useRef<HTMLDivElement>(null);
 
-  const nodes = useMemo(() => (board ? toFlowNodes(board, selectedNodeIds) : []), [board, selectedNodeIds]);
+  const staleNodeIds = useStaleNodeIds();
+  const nodes = useMemo(
+    () => (board ? toFlowNodes(board, selectedNodeIds, staleNodeIds) : []),
+    [board, selectedNodeIds, staleNodeIds],
+  );
   const edges = useMemo(() => (board ? toFlowEdges(board) : []), [board]);
   const dangling = board ? danglingEdgeCount(board) : 0;
 

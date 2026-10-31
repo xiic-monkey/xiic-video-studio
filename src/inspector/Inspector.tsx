@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Copy, Lock, Trash2, Unlock } from 'lucide-react';
+import { CircleSlash, Copy, Lock, Pin, Play, Trash2, Unlock } from 'lucide-react';
 import { createNode, getNodeDefinition } from '../domain/nodes/definitions';
 import type { FieldDef } from '../domain/nodes/types';
 import { nodeIssues } from '../domain/graph/validate';
@@ -8,6 +8,8 @@ import { useBoardStore } from '../stores/boardStore';
 import { useProviderStore } from '../stores/providerStore';
 import { useRunStore } from '../stores/runStore';
 import { useStudioStore } from '../stores/studioStore';
+import { useRunController } from '../run/controller';
+import { useStaleNodeIds } from '../run/useStaleNodeIds';
 import { statusOf } from '../nodes/summary';
 import { CandidateList } from './CandidateList';
 import { FieldEditor, type FieldChangeOptions } from './FieldEditor';
@@ -28,6 +30,11 @@ export function Inspector() {
   const project = useStudioStore((state) => state.projects.find((item) => item.id === state.currentProjectId));
   const runs = useRunStore((state) => state.runs);
   const [busy, setBusy] = useState(false);
+  const requestRun = useRunController((state) => state.requestRun);
+  const cancelActiveRun = useRunController((state) => state.cancelRun);
+  const runBusy = useRunController((state) => Boolean(nodeId && state.busy[nodeId]));
+  const staleNodeIds = useStaleNodeIds();
+  const isStale = Boolean(nodeId && staleNodeIds.has(nodeId));
 
   const def = node ? getNodeDefinition(node.type) : undefined;
   const nodeRuns = useMemo(
@@ -37,6 +44,7 @@ export function Inspector() {
     [runs, nodeId],
   );
   const latestRun = nodeRuns[0];
+  const activeRun = latestRun && (latestRun.status === 'queued' || latestRun.status === 'running');
   const issues = useMemo(
     () => (board && node ? nodeIssues(board, node.id, { providers: [], styleGuide: project?.styleGuide }) : []),
     [board, node, project],
@@ -213,6 +221,37 @@ export function Inspector() {
         <div className="inspector-section-head">
           <h3>运行</h3>
           <span className="studio-badge">{latestRun ? statusOf(latestRun).label : '未运行'}</span>
+        </div>
+        {isStale && <p className="inspector-warning">上游已更新，当前结果已过期；确认后再运行，不会自动重跑。</p>}
+        <div className="inspector-run">
+          <button
+            type="button"
+            className="studio-button"
+            disabled={!def.actions.length || runBusy || Boolean(activeRun)}
+            onClick={() => nodeId && void requestRun(nodeId)}
+          >
+            <Play size={12} /> {runBusy ? '准备中…' : '运行'}
+          </button>
+          <button
+            type="button"
+            className="studio-button secondary"
+            disabled={!activeRun}
+            onClick={() => nodeId && void cancelActiveRun(nodeId)}
+          >
+            <CircleSlash size={12} /> 取消
+          </button>
+          <button
+            type="button"
+            className="inspector-link"
+            title="锁定后不再被标记为过期"
+            onClick={() => useBoardStore.getState().apply({
+              type: 'setNodeUi',
+              nodeId: node.id,
+              patch: { pinned: !node.ui?.pinned },
+            })}
+          >
+            <Pin size={11} /> {node.ui?.pinned ? '解除锁定' : '锁定结果'}
+          </button>
         </div>
         <RunHistory runs={nodeRuns} />
         {latestRun && (

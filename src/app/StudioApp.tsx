@@ -4,6 +4,8 @@ import { ProjectLibrary } from './ProjectLibrary';
 import { CanvasView } from '../canvas/CanvasView';
 import { Inspector } from '../inspector/Inspector';
 import { SettingsDialog } from '../settings/SettingsDialog';
+import { attachRunEvents } from '../run/events';
+import { RunConfirmDialog } from '../run/RunConfirmDialog';
 import { useStudioStore } from '../stores/studioStore';
 import { useBoardStore } from '../stores/boardStore';
 import { useProviderStore } from '../stores/providerStore';
@@ -35,6 +37,19 @@ export function StudioApp() {
   useEffect(() => {
     void bootProviders();
   }, [bootProviders]);
+
+  useEffect(() => {
+    let alive = true;
+    let dispose: (() => void) | undefined;
+    void attachRunEvents().then((fn) => {
+      if (alive) dispose = fn;
+      else fn();
+    });
+    return () => {
+      alive = false;
+      dispose?.();
+    };
+  }, []);
 
   useEffect(() => {
     if (!booted || !currentBoardId) return;
@@ -140,6 +155,8 @@ export function StudioApp() {
       </div>
 
       <SettingsDialog />
+
+      <RunConfirmDialog />
 
       <footer className="studio-dock">
         <span>{board ? `board ${board.id.slice(-8)}` : 'no-board'}</span>

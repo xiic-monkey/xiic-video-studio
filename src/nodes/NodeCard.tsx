@@ -1,7 +1,9 @@
 import { Handle, Position, type Node, type NodeProps } from '@xyflow/react';
+import { Play, Square } from 'lucide-react';
 import { getNodeDefinition, visibleInputPorts } from '../domain/nodes/definitions';
 import { nodeColor, type StudioNodeData } from '../canvas/mapping';
 import { useRunStore } from '../stores/runStore';
+import { useRunController } from '../run/controller';
 import { BODIES } from './bodies';
 import { durationLabel, statusOf, summarizeNode } from './summary';
 
@@ -12,6 +14,10 @@ export function NodeCard({ data, selected }: NodeProps<Node<StudioNodeData>>) {
     const runId = state.latestByNode[node.id];
     return runId ? state.runs[runId] : undefined;
   });
+  const busy = useRunController((state) => Boolean(state.busy[node.id]));
+  const requestRun = useRunController((state) => state.requestRun);
+  const cancelActiveRun = useRunController((state) => state.cancelRun);
+  const active = run?.status === 'queued' || run?.status === 'running';
 
   if (!def) {
     return <div className="flow-node flow-node-unknown">{node.type}</div>;
@@ -25,14 +31,29 @@ export function NodeCard({ data, selected }: NodeProps<Node<StudioNodeData>>) {
 
   return (
     <div
-      className={`flow-node type-${node.type}${selected ? ' is-selected' : ''}${node.type === 'group' ? ' is-group' : ''}`}
-      style={{ borderColor: selected ? 'var(--mint)' : accent }}
+      className={`flow-node type-${node.type}${selected ? ' is-selected' : ''}${data.stale ? ' is-stale' : ''}${node.type === 'group' ? ' is-group' : ''}`}
+      style={{ borderColor: selected ? 'var(--mint)' : data.stale ? 'var(--warning)' : accent }}
     >
       <header>
         <span className="flow-node-type" style={{ background: accent }} />
         <b>{def.title}</b>
         {node.ui?.pinned && <span className="flow-node-lock">锁定</span>}
+        {data.stale && <span className="flow-node-stale">结果已过期</span>}
         <span className={`flow-status tone-${badge.tone}`}>{badge.label}</span>
+        {!!def.actions.length && (
+          <button
+            type="button"
+            className="nodrag flow-node-run"
+            title={active ? '取消运行' : '运行'}
+            disabled={busy}
+            onClick={(event) => {
+              event.stopPropagation();
+              void (active ? cancelActiveRun(node.id) : requestRun(node.id));
+            }}
+          >
+            {active ? <Square size={11} /> : <Play size={11} />}
+          </button>
+        )}
       </header>
       {Body ? <Body node={node} run={run} /> : <p className="flow-quote">{summarizeNode(node)}</p>}
       {node.type !== 'group' && (

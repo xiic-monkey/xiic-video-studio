@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import type { AssetRef, RunRecord } from '../domain/types';
+import { mergeRunRecord } from '../domain/run/runtime';
 import { listRuns } from '../services/tauri';
 import { indexLatest } from '../nodes/summary';
 
@@ -44,7 +45,8 @@ export const useRunStore = create<RunState>((set, get) => ({
 
   upsertRun(run) {
     set((state) => {
-      const runs = { ...state.runs, [run.id]: run };
+      const runs = mergeRunRecord(state.runs, run);
+      if (!runs) return state;
       return { runs, latestByNode: indexLatest(Object.values(runs)) };
     });
   },
