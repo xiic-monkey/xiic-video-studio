@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
-import { FolderKanban, Plus, Save } from 'lucide-react';
+import { FolderKanban, Plus, Save, Settings } from 'lucide-react';
 import { ProjectLibrary } from './ProjectLibrary';
 import { CanvasView } from '../canvas/CanvasView';
 import { Inspector } from '../inspector/Inspector';
+import { SettingsDialog } from '../settings/SettingsDialog';
 import { useStudioStore } from '../stores/studioStore';
 import { useBoardStore } from '../stores/boardStore';
+import { useProviderStore } from '../stores/providerStore';
 
 export function StudioApp() {
   const boot = useStudioStore((state) => state.boot);
@@ -22,11 +24,17 @@ export function StudioApp() {
   const saving = useBoardStore((state) => state.saving);
   const saveError = useBoardStore((state) => state.saveError);
   const lastSavedAt = useBoardStore((state) => state.lastSavedAt);
+  const bootProviders = useProviderStore((state) => state.boot);
+  const openSettings = useProviderStore((state) => state.openSettings);
   const [newBoardName, setNewBoardName] = useState('');
 
   useEffect(() => {
     void boot();
   }, [boot]);
+
+  useEffect(() => {
+    void bootProviders();
+  }, [bootProviders]);
 
   useEffect(() => {
     if (!booted || !currentBoardId) return;
@@ -69,6 +77,9 @@ export function StudioApp() {
           <b>{board?.name ?? '未选择画布'}</b>
         </div>
         <div className="studio-topbar-spacer" />
+        <button type="button" className="studio-icon-button" title="设置" onClick={openSettings}>
+          <Settings size={15} />
+        </button>
         <span className={`studio-save-state ${saving ? 'saving' : dirty ? 'dirty' : ''}`}>
           <span className="dot" /> {saveError ? `保存失败：${saveError}` : saveLabel}
         </span>
@@ -127,6 +138,8 @@ export function StudioApp() {
 
         <Inspector />
       </div>
+
+      <SettingsDialog />
 
       <footer className="studio-dock">
         <span>{board ? `board ${board.id.slice(-8)}` : 'no-board'}</span>

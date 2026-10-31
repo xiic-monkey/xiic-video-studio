@@ -1,6 +1,6 @@
 import type { GraphCommand } from '../domain/graph/commands';
 import { compilePrompt } from '../domain/prompts/compile';
-import type { BoardDoc, BoardNode, PromptSnapshot, StyleGuide } from '../domain/types';
+import type { BoardDoc, BoardNode, PromptSnapshot, ProviderProfile, StyleGuide } from '../domain/types';
 
 export type CandidateKind = 'image' | 'video' | 'audio' | 'text';
 export type VideoMode = 't2v' | 'firstLast' | 'reference';
@@ -31,4 +31,52 @@ export function candidateKind(nodeType: string): CandidateKind {
   if (nodeType === 'audio') return 'audio';
   if (nodeType === 'text') return 'text';
   return 'image';
+}
+
+const CAPABILITY_LABEL: Record<string, string> = {
+  'text.chat': '文本生成',
+  'image.generate': '图片生成',
+  'image.edit': '图片编辑',
+  'video.generate': '视频生成',
+  'audio.tts': '语音合成',
+};
+
+export function capabilityLabel(capability: string): string {
+  return CAPABILITY_LABEL[capability] ?? capability;
+}
+
+export function capabilityForNode(board: BoardDoc, node: BoardNode): string | undefined {
+  if (node.type === 'text') return 'text.chat';
+  if (node.type === 'image') {
+    const hasReference = Object.values(board.edges).some((edge) =>
+      edge.target === node.id && (edge.targetPort === 'references' || edge.targetPort === 'style'));
+    return hasReference ? 'image.edit' : 'image.generate';
+  }
+  if (node.type === 'video') return 'video.generate';
+  if (node.type === 'audio') return 'audio.tts';
+  return undefined;
+}
+
+export interface ModelOption {
+  providerId: string;
+  providerName: string;
+  modelId: string;
+  modelName: string;
+}
+
+export function modelOptions(profiles: ProviderProfile[], capability: string): ModelOption[] {
+  const options: ModelOption[] = [];
+  for (const profile of profiles) {
+    if (!profile.enabled) continue;
+    for (const model of profile.models) {
+      if (!model.capabilities.some((item) => item.capability === capability)) continue;
+      options.push({
+        providerId: profile.id,
+        providerName: profile.name,
+        modelId: model.id,
+        modelName: model.displayName,
+      });
+    }
+  }
+  return options;
 }

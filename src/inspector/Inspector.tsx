@@ -5,13 +5,21 @@ import type { FieldDef } from '../domain/nodes/types';
 import { nodeIssues } from '../domain/graph/validate';
 import { selectRunCandidate } from '../services/tauri';
 import { useBoardStore } from '../stores/boardStore';
+import { useProviderStore } from '../stores/providerStore';
 import { useRunStore } from '../stores/runStore';
 import { useStudioStore } from '../stores/studioStore';
 import { statusOf } from '../nodes/summary';
 import { CandidateList } from './CandidateList';
 import { FieldEditor, type FieldChangeOptions } from './FieldEditor';
 import { RunHistory } from './RunHistory';
-import { candidateKind, promptPreview, pruneCommandsForMode } from './model';
+import {
+  candidateKind,
+  capabilityForNode,
+  capabilityLabel,
+  modelOptions,
+  promptPreview,
+  pruneCommandsForMode,
+} from './model';
 
 export function Inspector() {
   const board = useBoardStore((state) => state.board);
@@ -37,6 +45,14 @@ export function Inspector() {
   const preview = useMemo(
     () => (node && promptable ? promptPreview(node, project?.styleGuide) : undefined),
     [node, promptable, project],
+  );
+  const profiles = useProviderStore((state) => state.profiles);
+  const hasKeys = useProviderStore((state) => state.hasKeys);
+  const openSettings = useProviderStore((state) => state.openSettings);
+  const capability = board && node ? capabilityForNode(board, node) : undefined;
+  const options = useMemo(
+    () => (capability ? modelOptions(profiles, capability) : []),
+    [profiles, capability],
   );
 
   useEffect(() => {
@@ -128,6 +144,47 @@ export function Inspector() {
         ))}
         {!def.fields.length && <p className="inspector-note">该节点没有可编辑字段。</p>}
       </section>
+
+      {capability && (
+        <section className="inspector-section">
+          <h3>模型</h3>
+          <div className="inspector-field">
+            <span>运行模型</span>
+            <select
+              value={(() => {
+                const providerId = String(node.data.providerId ?? '');
+                const modelId = String(node.data.model ?? '');
+                return options.some((option) => option.providerId === providerId && option.modelId === modelId)
+                  ? `${providerId}|${modelId}`
+                  : '';
+              })()}
+              onChange={(event) => {
+                const [providerId, modelId] = event.target.value.split('|');
+                useBoardStore.getState().apply({
+                  type: 'setNodeData',
+                  nodeId: node.id,
+                  patch: { providerId: providerId ?? '', model: modelId ?? '' },
+                });
+              }}
+            >
+              <option value="">自动选择</option>
+              {options.map((option) => (
+                <option key={`${option.providerId}|${option.modelId}`} value={`${option.providerId}|${option.modelId}`}>
+                  {option.providerName} · {option.modelName}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="inspector-section-head">
+            <span className="inspector-note">能力：{capabilityLabel(capability)}</span>
+            <button type="button" className="inspector-link" onClick={openSettings}>打开设置</button>
+          </div>
+          {!options.length && <p className="inspector-warning">没有可用模型，请先在设置中添加模型并保存 Key。</p>}
+          {String(node.data.providerId ?? '') && hasKeys[String(node.data.providerId)] === false && (
+            <p className="inspector-warning">所选 Provider 尚未保存 API Key。</p>
+          )}
+        </section>
+      )}
 
       {preview && (
         <section className="inspector-section">
