@@ -229,8 +229,8 @@ async fn prepare_inputs(
                 .await?;
         prepared.push(gateway::PreparedInput {
             role: input.role.clone(),
-            kind: input.kind.clone(),
-            mime: input.mime.clone(),
+            kind: asset.kind.clone(),
+            mime: asset.mime.clone(),
             value: transport.value,
         });
     }
