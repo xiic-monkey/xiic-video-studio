@@ -59,61 +59,64 @@ export function validDrafts(drafts: ModelDraft[]): ModelConfig[] {
     .filter((model) => model.id.length > 0 && model.capabilities.length > 0);
 }
 
-function modelPrice(model: ModelConfig): PriceRule | undefined {
-  return model.capabilities.find((item) => item.price)?.price;
-}
-
 /**
- * 草稿保存时与原模型合并：草稿表达不了的能力（video.generate 等非简单能力）原样保留，
- * 草稿里没有的模型也不删除，避免点一次「保存」就静默丢掉模型。
+ * 草稿保存时与原模型合并。草稿是原模型的全量视图，因此：
+ * - 基线里有、当前草稿里没有的 id = 用户删除或改名，这些模型不再保留；
+ * - 草稿勾选的简单能力按草稿合并，价格逐能力计算；
+ * - 草稿表达不了的非简单能力（video.generate 等）原样保留，字段一个不丢。
  */
 export function mergeModelDrafts(original: ModelConfig[], drafts: ModelDraft[]): ModelConfig[] {
+  const baseline = new Map(original.map((model) => [model.id, model]));
   const merged: ModelConfig[] = [];
-  const consumed = new Set<string>();
-
-  for (const model of original) {
-    const draft = drafts.find((item) => item.id.trim() === model.id);
-    if (!draft) {
-      merged.push(model);
-      continue;
-    }
-    consumed.add(model.id);
-    const result = mergeDraft(draft, model);
-    if (result) merged.push(result);
-  }
+  const used = new Set<string>();
 
   for (const draft of drafts) {
     const id = draft.id.trim();
-    if (!id || consumed.has(id)) continue;
-    consumed.add(id);
-    const built = modelFromDraft(draft);
-    if (built.capabilities.length > 0) merged.push(built);
+    if (!id || used.has(id)) continue;
+    used.add(id);
+    const base = baseline.get(id);
+    const model = base ? mergeDraft(draft, base) : modelFromDraft(draft);
+    if (model.capabilities.length > 0) merged.push(model);
   }
 
   return merged;
 }
 
-function mergeDraft(draft: ModelDraft, original: ModelConfig): ModelConfig | undefined {
+function mergeDraft(draft: ModelDraft, original: ModelConfig): ModelConfig {
   const id = draft.id.trim();
-  const originalPrice = modelPrice(original);
-  const price = draft.priceAmount && draft.priceAmount > 0
-    ? { unit: draft.priceUnit, amount: draft.priceAmount, currency: originalPrice?.currency ?? 'USD' }
-    : originalPrice;
-  const simple: ModelCapability[] = draft.capabilities.map((item) => ({
-    capability: item,
-    inputTransport: ['dataUrl'],
-    async: false,
-    ...(price ? { price } : {}),
-  }));
+  const simple: ModelCapability[] = draft.capabilities.map((capability) => {
+    const previous = original.capabilities.find((item) => item.capability === capability);
+    const transport: ModelCapability['inputTransport'] = previous && previous.inputTransport.length
+      ? [...previous.inputTransport]
+      : ['dataUrl'];
+    const price = mergePrice(draft, previous);
+    return {
+      capability,
+      inputTransport: transport,
+      async: previous?.async ?? false,
+      ...(price ? { price } : {}),
+    };
+  });
   const preserved = original.capabilities.filter((item) => !isSimpleCapability(item.capability));
   const capabilities = [...simple, ...preserved];
-  if (!capabilities.length) return undefined;
   return {
     id,
     displayName: draft.displayName.trim() || id,
     capabilities,
     ...(original.defaults ? { defaults: original.defaults } : {}),
   };
+}
+
+/** 价格逐能力计算：草稿填了价就用草稿的，没填就沿用原同名能力自己的价。 */
+function mergePrice(draft: ModelDraft, previous: ModelCapability | undefined): PriceRule | undefined {
+  if (draft.priceAmount !== undefined && draft.priceAmount > 0) {
+    return {
+      unit: draft.priceUnit,
+      amount: draft.priceAmount,
+      currency: previous?.price?.currency ?? 'USD',
+    };
+  }
+  return previous?.price;
 }
 
 export function capabilitySummary(item: ModelCapability): string {
