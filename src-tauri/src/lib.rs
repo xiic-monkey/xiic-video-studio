@@ -13,7 +13,7 @@ use std::{
     sync::Mutex,
     time::Duration,
 };
-use tauri::{Manager, State};
+use tauri::{AppHandle, Manager, State};
 
 mod assets;
 mod db;
@@ -21,6 +21,47 @@ mod gateway;
 mod jobs;
 mod runs;
 mod security;
+
+const CREDENTIAL_ACCOUNT_PREFIX: &str = "provider/";
+const KEYCHAIN_SERVICE: &str = "com.frameforge.studio";
+
+// 精确匹配而非子串：RunRecord.cacheKey 必须保留，否则导入/重启后缓存命中与 stale 判定全部失效。
+// 不含裸 "key"——画布节点数据里 key/value 是常见结构，按名字剥会吞掉用户内容。
+const SENSITIVE_KEYS: [&str; 16] = [
+    "apikey",
+    "api_key",
+    "secretkey",
+    "secret_key",
+    "accesskey",
+    "access_key",
+    "accesskeyid",
+    "secretaccesskey",
+    "authorization",
+    "bearer",
+    "token",
+    "accesstoken",
+    "password",
+    "credential",
+    "credentials",
+    "secret",
+];
+
+pub(crate) fn strip_sensitive_fields(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.retain(|field, _| !SENSITIVE_KEYS.contains(&field.to_ascii_lowercase().as_str()));
+            for nested in map.values_mut() {
+                strip_sensitive_fields(nested);
+            }
+        }
+        Value::Array(items) => {
+            for nested in items.iter_mut() {
+                strip_sensitive_fields(nested);
+            }
+        }
+        _ => {}
+    }
+}
 
 pub(crate) struct AppState {
     pub(crate) db_path: Mutex<PathBuf>,
@@ -467,28 +508,6 @@ fn valid_job_status(status: &str) -> bool {
             | "cancelled"
             | "unknown"
     )
-}
-
-fn strip_sensitive_fields(value: &mut Value) {
-    match value {
-        Value::Object(fields) => {
-            fields.retain(|key, _| {
-                !matches!(
-                    key.to_ascii_lowercase().as_str(),
-                    "apikey" | "api_key" | "authorization" | "token" | "secret"
-                )
-            });
-            for nested in fields.values_mut() {
-                strip_sensitive_fields(nested);
-            }
-        }
-        Value::Array(values) => {
-            for nested in values {
-                strip_sensitive_fields(nested);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn project_package(mut project: Value) -> Result<ProjectPackage, String> {
@@ -1773,16 +1792,24 @@ fn save_provider_credential(provider_id: String, api_key: String) -> Result<(), 
     if api_key.trim().is_empty() {
         return Err("API key cannot be empty".to_string());
     }
-    let entry = Entry::new("com.frameforge.studio", &format!("provider/{provider_id}"))
+    if provider_id.trim().is_empty() {
+        return Err("Provider id cannot be empty".to_string());
+    }
+    let entry = Entry::new(KEYCHAIN_SERVICE, &format!("{CREDENTIAL_ACCOUNT_PREFIX}{provider_id}"))
         .map_err(|error| error.to_string())?;
     entry
-        .set_password(&api_key)
+        .set_password(api_key.trim())
         .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 fn load_provider_credential(provider_id: String) -> Result<Option<String>, String> {
-    let entry = Entry::new("com.frameforge.studio", &format!("provider/{provider_id}"))
+    provider_credential(&provider_id)
+}
+
+/// 内部读取凭据。API Key 只存在系统钥匙串，前端拿不到明文。
+pub(crate) fn provider_credential(provider_id: &str) -> Result<Option<String>, String> {
+    let entry = Entry::new(KEYCHAIN_SERVICE, &format!("{CREDENTIAL_ACCOUNT_PREFIX}{provider_id}"))
         .map_err(|error| error.to_string())?;
     match entry.get_password() {
         Ok(api_key) => Ok(Some(api_key)),
@@ -2579,6 +2606,391 @@ fn store_audio_asset(
     Ok(target.to_string_lossy().to_string())
 }
 
+#[tauri::command]
+fn list_studio_projects(state: State<'_, AppState>) -> Result<Vec<Value>, String> {
+    let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
+    let connection = db::open(&path)?;
+    let mut statement = connection
+        .prepare("SELECT payload FROM studio_projects ORDER BY updated_at DESC")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    rows.map(|row| {
+        serde_json::from_str(&row.map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())
+    })
+    .collect()
+}
+
+#[tauri::command]
+fn save_studio_project(mut project: Value, state: State<'_, AppState>) -> Result<(), String> {
+    let id = project
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or("项目缺少 id")?
+        .to_string();
+    let name = project
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or("项目缺少名称")?
+        .to_string();
+    strip_sensitive_fields(&mut project);
+    let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
+    let connection = db::open(&path)?;
+    let now = Utc::now().to_rfc3339();
+    connection
+        .execute(
+            "INSERT INTO studio_projects (id, name, payload, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name, payload=excluded.payload, updated_at=excluded.updated_at",
+            params![id, name, serde_json::to_string(&project).map_err(|error| error.to_string())?, now],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn list_boards(project_id: String, state: State<'_, AppState>) -> Result<Vec<Value>, String> {
+    let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
+    let connection = db::open(&path)?;
+    let mut statement = connection
+        .prepare("SELECT payload FROM boards WHERE project_id=?1 ORDER BY updated_at DESC")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([project_id], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    rows.map(|row| {
+        serde_json::from_str(&row.map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())
+    })
+    .collect()
+}
+
+#[tauri::command]
+fn load_board(board_id: String, state: State<'_, AppState>) -> Result<Option<Value>, String> {
+    let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
+    let connection = db::open(&path)?;
+    let mut statement = connection
+        .prepare("SELECT payload FROM boards WHERE id=?1")
+        .map_err(|error| error.to_string())?;
+    let mut rows = statement.query([board_id]).map_err(|error| error.to_string())?;
+    match rows.next().map_err(|error| error.to_string())? {
+        Some(row) => Ok(Some(
+            serde_json::from_str(&row.get::<_, String>(0).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?,
+        )),
+        None => Ok(None),
+    }
+}
+
+#[tauri::command]
+fn save_board(mut board: Value, state: State<'_, AppState>) -> Result<(), String> {
+    let id = board
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or("画布缺少 id")?
+        .to_string();
+    let project_id = board
+        .get("projectId")
+        .and_then(Value::as_str)
+        .ok_or("画布缺少 projectId")?
+        .to_string();
+    let name = board
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("未命名画布")
+        .to_string();
+    strip_sensitive_fields(&mut board);
+    let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
+    let connection = db::open(&path)?;
+    let now = Utc::now().to_rfc3339();
+    connection
+        .execute(
+            "INSERT INTO boards (id, project_id, name, payload, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name, payload=excluded.payload, updated_at=excluded.updated_at",
+            params![id, project_id, name, serde_json::to_string(&board).map_err(|error| error.to_string())?, now],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_board(board_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
+    db::open(&path)?
+        .execute("DELETE FROM boards WHERE id=?1", [board_id])
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn list_provider_profiles(state: State<'_, AppState>) -> Result<Vec<Value>, String> {
+    let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
+    let connection = db::open(&path)?;
+    let mut statement = connection
+        .prepare("SELECT payload FROM provider_profiles ORDER BY id")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    rows.map(|row| {
+        serde_json::from_str(&row.map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())
+    })
+    .collect()
+}
+
+#[tauri::command]
+fn save_provider_profile(mut profile: Value, state: State<'_, AppState>) -> Result<(), String> {
+    strip_sensitive_fields(&mut profile);
+    let id = profile
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or("Provider 缺少 id")?
+        .to_string();
+    let adapter = profile
+        .get("adapter")
+        .and_then(Value::as_str)
+        .unwrap_or("openai-compatible")
+        .to_string();
+    let base_url = profile
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let enabled = profile
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
+    let connection = db::open(&path)?;
+    connection
+        .execute(
+            "INSERT INTO provider_profiles (id, adapter, base_url, enabled, payload, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET adapter=excluded.adapter, base_url=excluded.base_url, enabled=excluded.enabled, payload=excluded.payload, updated_at=excluded.updated_at",
+            params![id, adapter, base_url, enabled, serde_json::to_string(&profile).map_err(|error| error.to_string())?, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn provider_has_key(provider_id: String) -> Result<bool, String> {
+    Ok(provider_credential(&provider_id)?.is_some())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderTestResult {
+    ok: bool,
+    message: String,
+    model_count: Option<usize>,
+}
+
+#[tauri::command]
+async fn test_provider_profile(
+    provider_id: String,
+    state: State<'_, AppState>,
+) -> Result<ProviderTestResult, String> {
+    let profile = runs::load_provider_profile(&state, &provider_id)?
+        .ok_or_else(|| "Provider 未配置".to_string())?;
+    let key = provider_credential(&provider_id)?
+        .ok_or_else(|| "尚未保存 API Key".to_string())?;
+    let client = http_client()?;
+    if profile.adapter == "openai-compatible" {
+        let url = if profile.base_url.trim_end_matches('/').ends_with("/v1") {
+            format!("{}/models", profile.base_url.trim_end_matches('/'))
+        } else {
+            format!("{}/v1/models", profile.base_url.trim_end_matches('/'))
+        };
+        let response = client
+            .get(url)
+            .bearer_auth(&key)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+        let value: Value = response.json().await.unwrap_or(Value::Null);
+        if status.is_success() {
+            let count = value.get("data").and_then(Value::as_array).map(Vec::len);
+            return Ok(ProviderTestResult {
+                ok: true,
+                message: "连接成功".to_string(),
+                model_count: count,
+            });
+        }
+        return Ok(ProviderTestResult {
+            ok: false,
+            message: format!("连接失败：HTTP {}", status.as_u16()),
+            model_count: None,
+        });
+    }
+    Ok(ProviderTestResult {
+        ok: true,
+        message: "配置已保存，视频接口将在首次生成时验证".to_string(),
+        model_count: None,
+    })
+}
+
+#[tauri::command]
+fn save_asset_host(config: Value, state: State<'_, AppState>) -> Result<(), String> {
+    let access_key = config
+        .get("accessKey")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let secret_key = config
+        .get("secretKey")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if !access_key.is_empty() {
+        Entry::new(KEYCHAIN_SERVICE, "asset-host/access-key")
+            .map_err(|error| error.to_string())?
+            .set_password(&access_key)
+            .map_err(|error| error.to_string())?;
+    }
+    if !secret_key.is_empty() {
+        Entry::new(KEYCHAIN_SERVICE, "asset-host/secret-key")
+            .map_err(|error| error.to_string())?
+            .set_password(&secret_key)
+            .map_err(|error| error.to_string())?;
+    }
+    let mut public = config.clone();
+    if let Some(object) = public.as_object_mut() {
+        object.remove("accessKey");
+        object.remove("secretKey");
+    }
+    let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
+    db::open(&path)?
+        .execute(
+            "INSERT INTO app_settings (key, value) VALUES ('asset_host', ?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [serde_json::to_string(&public).map_err(|error| error.to_string())?],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn load_asset_host(state: State<'_, AppState>) -> Result<Value, String> {
+    let config = asset_host_internal(&state)?;
+    Ok(json!({
+        "strategy": config.strategy,
+        "endpoint": config.endpoint,
+        "bucket": config.bucket,
+        "region": config.region,
+        "prefix": config.prefix,
+        "publicBaseUrl": config.public_base_url,
+        "hasCredentials": config.access_key.is_some() && config.secret_key.is_some()
+    }))
+}
+
+#[tauri::command]
+async fn start_run(
+    request: runs::StartRunRequest,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<runs::RunRecord, String> {
+    let profile = runs::load_provider_profile(&state, &request.provider_id)?
+        .ok_or_else(|| "Provider 未配置".to_string())?;
+    if !profile.enabled {
+        return Err("Provider 已禁用".to_string());
+    }
+    if let Some(asset_id) = request.cached_asset_id.clone() {
+        return runs::finish_cached(&state, &request, &asset_id);
+    }
+    let key = provider_credential(&request.provider_id)?
+        .ok_or_else(|| "尚未保存该 Provider 的 API Key".to_string())?;
+    let runtime = gateway::ProviderRuntime {
+        profile: profile.clone(),
+        api_key: key,
+    };
+    let run = runs::create_run(&state, &request)?;
+    let job_id = format!("job_{}", uuid::Uuid::new_v4());
+    // 同步能力不建 job 行：否则下次启动的恢复扫描会把它当成「提交阶段被中断」。
+    let is_async = profile
+        .models
+        .iter()
+        .find(|model| model.id == request.model)
+        .and_then(|model| model.capability(&request.capability))
+        .map(|capability| capability.async_job)
+        .unwrap_or(false);
+    let db_path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
+    if is_async {
+        db::open(&db_path)?
+            .execute(
+                "INSERT INTO jobs (id, run_id, provider_id, capability, status, attempts, payload, updated_at) VALUES (?1, ?2, ?3, ?4, 'queued', 0, ?5, ?6)",
+                params![job_id, run.id, request.provider_id, request.capability, serde_json::to_string(&request).map_err(|error| error.to_string())?, Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    let state_owned = AppState {
+        db_path: Mutex::new(db_path),
+        data_dir: state.data_dir.clone(),
+    };
+    let app_clone = app.clone();
+    let run_clone = run.clone();
+    tauri::async_runtime::spawn(async move {
+        runs::execute_run(app_clone, state_owned, run_clone, job_id, request, runtime).await;
+    });
+    Ok(run)
+}
+
+#[tauri::command]
+fn cancel_run(run_id: String, app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    jobs::cancel(&app, &state, &run_id);
+    Ok(())
+}
+
+#[tauri::command]
+fn list_runs(board_id: String, state: State<'_, AppState>) -> Result<Vec<runs::RunRecord>, String> {
+    runs::list_runs(&state, &board_id)
+}
+
+#[tauri::command]
+fn select_run_candidate(
+    run_id: String,
+    asset_id: String,
+    state: State<'_, AppState>,
+) -> Result<runs::RunRecord, String> {
+    runs::select_candidate(&state, &run_id, &asset_id)
+}
+
+#[tauri::command]
+fn resume_jobs(app: AppHandle, state: State<'_, AppState>) -> Result<usize, String> {
+    Ok(jobs::resume_pending_on_start(app, &state))
+}
+
+#[tauri::command]
+fn asset_file_path(asset_id: String, state: State<'_, AppState>) -> Result<String, String> {
+    let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
+    let connection = db::open(&path)?;
+    let payload: String = connection
+        .query_row("SELECT payload FROM assets WHERE id=?1", [asset_id], |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    let asset: assets::AssetRef =
+        serde_json::from_str(&payload).map_err(|error| error.to_string())?;
+    Ok(assets::absolute_path(&state.data_dir, &asset.path)?.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn read_asset_text(asset_id: String, state: State<'_, AppState>) -> Result<String, String> {
+    let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
+    let connection = db::open(&path)?;
+    let payload: String = connection
+        .query_row("SELECT payload FROM assets WHERE id=?1", [asset_id], |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    let asset: assets::AssetRef =
+        serde_json::from_str(&payload).map_err(|error| error.to_string())?;
+    std::fs::read_to_string(assets::absolute_path(&state.data_dir, &asset.path)?)
+        .map_err(|error| error.to_string())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -2634,7 +3046,26 @@ pub fn run() {
             generate_speech,
             run_media_qc,
             store_audio_asset,
-            store_media_asset
+            store_media_asset,
+            list_studio_projects,
+            save_studio_project,
+            list_boards,
+            load_board,
+            save_board,
+            delete_board,
+            list_provider_profiles,
+            save_provider_profile,
+            provider_has_key,
+            test_provider_profile,
+            save_asset_host,
+            load_asset_host,
+            start_run,
+            cancel_run,
+            list_runs,
+            select_run_candidate,
+            resume_jobs,
+            asset_file_path,
+            read_asset_text
         ])
         .run(tauri::generate_context!())
         .expect("error while running Frameforge");

@@ -228,20 +228,21 @@ pub fn cancel(app: &AppHandle, state: &AppState, run_id: &str) {
 }
 
 /// 启动时恢复未完成的远端任务：已有远端 task_id 的续轮询，没拿到 task_id 的判定为提交中断。
-pub fn resume_pending_on_start(app: AppHandle, state: &AppState) {
+/// 返回实际恢复轮询的任务数。
+pub fn resume_pending_on_start(app: AppHandle, state: &AppState) -> usize {
     let path = match runs::db_path(state) {
         Ok(path) => path,
-        Err(_) => return,
+        Err(_) => return 0,
     };
     let connection = match db::open(&path) {
         Ok(connection) => connection,
-        Err(_) => return,
+        Err(_) => return 0,
     };
     let mut statement = match connection.prepare(
         "SELECT id, run_id, provider_id, status, remote_task_id, payload FROM jobs WHERE status IN ('queued','submitted','polling')",
     ) {
         Ok(statement) => statement,
-        Err(_) => return,
+        Err(_) => return 0,
     };
     let rows: Vec<(String, String, String, String, Option<String>, String)> = match statement
         .query_map([], |row| {
@@ -250,8 +251,9 @@ pub fn resume_pending_on_start(app: AppHandle, state: &AppState) {
         .and_then(|mapped| mapped.collect::<Result<Vec<_>, _>>())
     {
         Ok(rows) => rows,
-        Err(_) => return,
+        Err(_) => return 0,
     };
+    let mut resumed = 0usize;
     for (job_id, run_id, provider_id, status, remote_task_id, payload) in rows {
         let request: StartRunRequest = match serde_json::from_str(&payload) {
             Ok(request) => request,
@@ -277,7 +279,7 @@ pub fn resume_pending_on_start(app: AppHandle, state: &AppState) {
             Some(task_id) => task_id,
             None => continue,
         };
-        let key = match crate::load_provider_credential(provider_id.clone()) {
+        let key = match crate::provider_credential(&provider_id) {
             Ok(Some(key)) => key,
             _ => continue,
         };
@@ -300,7 +302,9 @@ pub fn resume_pending_on_start(app: AppHandle, state: &AppState) {
         tauri::async_runtime::spawn(async move {
             poll_loop(handle, db_path, data_dir, run, job_id, task_id, runtime, model).await;
         });
+        resumed += 1;
     }
+    resumed
 }
 
 #[cfg(test)]

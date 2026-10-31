@@ -10,8 +10,6 @@ const RATIOS: [&str; 7] = ["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:1
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct H3Options {
-    #[serde(default = "default_protocol")]
-    protocol: String,
     #[serde(default = "default_submit_path")]
     submit_path: String,
     #[serde(default = "default_poll_path")]
@@ -25,7 +23,6 @@ struct H3Options {
 impl Default for H3Options {
     fn default() -> Self {
         Self {
-            protocol: default_protocol(),
             submit_path: default_submit_path(),
             poll_path: default_poll_path(),
             cancel_path: String::new(),
@@ -34,7 +31,6 @@ impl Default for H3Options {
     }
 }
 
-fn default_protocol() -> String { "official".to_string() }
 fn default_submit_path() -> String { "/v1/video_generation".to_string() }
 fn default_poll_path() -> String { "/v1/query/video_generation?task_id={task_id}".to_string() }
 

@@ -3105,8 +3105,6 @@ const RATIOS: [&str; 7] = ["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:1
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct H3Options {
-    #[serde(default = "default_protocol")]
-    protocol: String,
     #[serde(default = "default_submit_path")]
     submit_path: String,
     #[serde(default = "default_poll_path")]
@@ -3120,7 +3118,6 @@ struct H3Options {
 impl Default for H3Options {
     fn default() -> Self {
         Self {
-            protocol: default_protocol(),
             submit_path: default_submit_path(),
             poll_path: default_poll_path(),
             cancel_path: String::new(),
@@ -3129,7 +3126,6 @@ impl Default for H3Options {
     }
 }
 
-fn default_protocol() -> String { "official".to_string() }
 fn default_submit_path() -> String { "/v1/video_generation".to_string() }
 fn default_poll_path() -> String { "/v1/query/video_generation?task_id={task_id}".to_string() }
 
@@ -4172,7 +4168,7 @@ git commit -m "feat(p0): 运行记录、缓存命中与同步结果落盘"
   - `jobs::attach_task(app, state, run, job_id, task_id, request, runtime, model)`
   - `jobs::poll_delay(attempt: u32) -> Duration`
   - `jobs::should_resume(status: &str, remote_task_id: Option<&str>) -> bool`
-  - `jobs::resume_pending_on_start(app, state)`
+  - `jobs::resume_pending_on_start(app, state) -> usize`（返回实际恢复轮询的任务数）
   - `jobs::cancel(app, state, run_id)`
 
 - [ ] **Step 1: 写失败测试**
@@ -4440,20 +4436,21 @@ pub fn cancel(app: &AppHandle, state: &AppState, run_id: &str) {
 }
 
 /// 启动时恢复未完成的远端任务：已有远端 task_id 的续轮询，没拿到 task_id 的判定为提交中断。
-pub fn resume_pending_on_start(app: AppHandle, state: &AppState) {
+/// 返回实际恢复轮询的任务数。
+pub fn resume_pending_on_start(app: AppHandle, state: &AppState) -> usize {
     let path = match runs::db_path(state) {
         Ok(path) => path,
-        Err(_) => return,
+        Err(_) => return 0,
     };
     let connection = match db::open(&path) {
         Ok(connection) => connection,
-        Err(_) => return,
+        Err(_) => return 0,
     };
     let mut statement = match connection.prepare(
         "SELECT id, run_id, provider_id, status, remote_task_id, payload FROM jobs WHERE status IN ('queued','submitted','polling')",
     ) {
         Ok(statement) => statement,
-        Err(_) => return,
+        Err(_) => return 0,
     };
     let rows: Vec<(String, String, String, String, Option<String>, String)> = match statement
         .query_map([], |row| {
@@ -4462,8 +4459,9 @@ pub fn resume_pending_on_start(app: AppHandle, state: &AppState) {
         .and_then(|mapped| mapped.collect::<Result<Vec<_>, _>>())
     {
         Ok(rows) => rows,
-        Err(_) => return,
+        Err(_) => return 0,
     };
+    let mut resumed = 0usize;
     for (job_id, run_id, provider_id, status, remote_task_id, payload) in rows {
         let request: StartRunRequest = match serde_json::from_str(&payload) {
             Ok(request) => request,
@@ -4489,7 +4487,7 @@ pub fn resume_pending_on_start(app: AppHandle, state: &AppState) {
             Some(task_id) => task_id,
             None => continue,
         };
-        let key = match crate::load_provider_credential(provider_id.clone()) {
+        let key = match crate::provider_credential(&provider_id) {
             Ok(Some(key)) => key,
             _ => continue,
         };
@@ -4512,7 +4510,9 @@ pub fn resume_pending_on_start(app: AppHandle, state: &AppState) {
         tauri::async_runtime::spawn(async move {
             poll_loop(handle, db_path, data_dir, run, job_id, task_id, runtime, model).await;
         });
+        resumed += 1;
     }
+    resumed
 }
 
 #[cfg(test)]
@@ -4578,11 +4578,8 @@ pub(crate) async fn store_outputs_for_poll(
 ```
 
 `app.state::<AppState>()` 在 setup 闭包内是同步借用的，`resume_pending_on_start` 又是同步函数（内部只做「扫表 + spawn」），但 `State<'_, AppState>` 带生命周期，不能直接传进需要 `&AppState` 的函数——所以按上面的兜底写法把两个字段拷出来组装一个临时 owned `AppState`。setup 返回 `Result` 时 `?` 可用；不要用 `unwrap` 让启动崩掉。
-    jobs::resume_pending_on_start(handle, &owned);
-}
-```
 
-注意这段只作为编译兜底：`setup` 返回 `Result` 时才能用 `?`，若当前 setup 是 `Ok(())` 结尾就把它包进 `if let Ok(...)`，不要用 `unwrap` 让启动崩掉。
+`resume_pending_on_start` 现在返回 `usize`（恢复的任务数），setup 里作为语句丢弃即可；`resume_jobs` 命令则把它原样返回给前端。
 
 - [ ] **Step 5: 运行测试**
 
@@ -4603,11 +4600,12 @@ git commit -m "feat(p0): 异步视频轮询、取消与启动恢复"
 ### Task 15: Tauri 命令注册与前端桥
 
 **Files:**
-- Modify: `src-tauri/src/lib.rs`（新增命令、注册、`app_settings` 读写）
-- Modify: `src-tauri/src/runs.rs`（`store_outputs_for_poll` 导出）
+- Modify: `src-tauri/src/lib.rs`（新增命令、注册、`app_settings` 读写、凭据读取拆分）
+- Modify: `src-tauri/src/jobs.rs`（`resume_pending_on_start` 返回恢复任务数）
+- Modify: `src-tauri/src/gateway/minimax.rs`（删掉未被读取的 `protocol` 字段）
 - Create: `src/services/tauri.ts`
 - Create: `src/services/events.ts`
-- Test: `src/services/tauri.test.ts`（仅测类型映射辅助函数）
+- Test: `src/services/tauri.test.ts`（命令名 + camelCase 参数契约）
 
 **Interfaces:**
 - Consumes: 所有 Rust 模块。
@@ -4648,10 +4646,12 @@ const CREDENTIAL_ACCOUNT_PREFIX: &str = "provider/";
 const KEYCHAIN_SERVICE: &str = "com.frameforge.studio";
 
 // 精确匹配而非子串：RunRecord.cacheKey 必须保留，否则导入/重启后缓存命中与 stale 判定全部失效。
+// 注意不要包含裸 "key"：画布节点数据用 key/value 承载业务字段，误删会丢数据；
+// 但 "secret" 必须包含，旧版项目导出只过滤了 secret 这一类。
 const SENSITIVE_KEYS: [&str; 16] = [
     "apikey", "api_key", "secretkey", "secret_key", "accesskey", "access_key",
     "accesskeyid", "secretaccesskey", "authorization", "bearer", "token", "accesstoken",
-    "password", "credential", "credentials", "key",
+    "password", "credential", "credentials", "secret",
 ];
 
 pub(crate) fn strip_sensitive_fields(value: &mut Value) {
@@ -4671,14 +4671,24 @@ pub(crate) fn strip_sensitive_fields(value: &mut Value) {
     }
 }
 
-pub(crate) fn load_provider_credential(provider_id: String) -> Result<Option<String>, String> {
-    let entry = Entry::new(KEYCHAIN_SERVICE, &format!("{}{}", CREDENTIAL_ACCOUNT_PREFIX, provider_id))
+/// 内部读取凭据。API Key 只存在系统钥匙串，前端拿不到明文。
+///
+/// 不能把 `#[tauri::command]` 直接加在 `pub(crate)` 函数上：Tauri 2 对受限可见性会加
+/// `#[macro_export]`，而命令函数位于 crate 根，会与生成的 `__cmd__*` 宏重名（E0255）。
+/// 因此命令保持私有，内部调用走这个普通函数。
+pub(crate) fn provider_credential(provider_id: &str) -> Result<Option<String>, String> {
+    let entry = Entry::new(KEYCHAIN_SERVICE, &format!("{CREDENTIAL_ACCOUNT_PREFIX}{provider_id}"))
         .map_err(|error| error.to_string())?;
     match entry.get_password() {
         Ok(secret) => Ok(Some(secret)),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(error) => Err(error.to_string()),
     }
+}
+
+#[tauri::command]
+fn load_provider_credential(provider_id: String) -> Result<Option<String>, String> {
+    provider_credential(&provider_id)
 }
 
 #[tauri::command]
@@ -4690,7 +4700,7 @@ fn save_provider_credential(provider_id: String, api_key: String) -> Result<(), 
     if provider_id.trim().is_empty() {
         return Err("Provider 缺少 id".to_string());
     }
-    Entry::new(KEYCHAIN_SERVICE, &format!("{}{}", CREDENTIAL_ACCOUNT_PREFIX, provider_id))
+    Entry::new(KEYCHAIN_SERVICE, &format!("{CREDENTIAL_ACCOUNT_PREFIX}{provider_id}"))
         .map_err(|error| error.to_string())?
         .set_password(trimmed)
         .map_err(|error| error.to_string())?;
@@ -4750,10 +4760,11 @@ fn load_board(board_id: String, state: State<'_, AppState>) -> Result<Option<Val
 }
 
 #[tauri::command]
-fn save_board(board: Value, state: State<'_, AppState>) -> Result<(), String> {
+fn save_board(mut board: Value, state: State<'_, AppState>) -> Result<(), String> {
     let id = board.get("id").and_then(Value::as_str).filter(|value| !value.is_empty()).ok_or("画布缺少 id")?;
     let project_id = board.get("projectId").and_then(Value::as_str).ok_or("画布缺少 projectId")?;
     let name = board.get("name").and_then(Value::as_str).unwrap_or("未命名画布");
+    strip_sensitive_fields(&mut board);
     let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
     let connection = db::open(&path)?;
     let now = Utc::now().to_rfc3339();
@@ -4837,13 +4848,15 @@ async fn test_provider_profile(provider_id: String, state: State<'_, AppState>) 
 
 #[tauri::command]
 fn save_asset_host(config: Value, state: State<'_, AppState>) -> Result<(), String> {
-    let access_key = config.get("accessKey").and_then(Value::as_str).unwrap_or("");
-    let secret_key = config.get("secretKey").and_then(Value::as_str).unwrap_or("");
+    let access_key = config.get("accessKey").and_then(Value::as_str).unwrap_or("").to_string();
+    let secret_key = config.get("secretKey").and_then(Value::as_str).unwrap_or("").to_string();
     if !access_key.is_empty() {
-        Entry::new("com.frameforge.studio", "asset-host/access-key").map_err(|error| error.to_string())?.set_password(access_key).map_err(|error| error.to_string())?;
+        Entry::new(KEYCHAIN_SERVICE, "asset-host/access-key").map_err(|error| error.to_string())?
+            .set_password(&access_key).map_err(|error| error.to_string())?;
     }
     if !secret_key.is_empty() {
-        Entry::new("com.frameforge.studio", "asset-host/secret-key").map_err(|error| error.to_string())?.set_password(secret_key).map_err(|error| error.to_string())?;
+        Entry::new(KEYCHAIN_SERVICE, "asset-host/secret-key").map_err(|error| error.to_string())?
+            .set_password(&secret_key).map_err(|error| error.to_string())?;
     }
     let mut public = config.clone();
     if let Some(object) = public.as_object_mut() {
@@ -4859,7 +4872,7 @@ fn save_asset_host(config: Value, state: State<'_, AppState>) -> Result<(), Stri
     Ok(())
 }
 
-fn asset_host_internal(state: &AppState) -> Result<gateway::transport::AssetHostConfig, String> {
+pub(crate) fn asset_host_internal(state: &AppState) -> Result<gateway::transport::AssetHostConfig, String> {
     let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
     let connection = db::open(&path)?;
     let value: Option<String> = connection.query_row("SELECT value FROM app_settings WHERE key='asset_host'", [], |row| row.get(0)).ok();
@@ -4897,16 +4910,24 @@ async fn start_run(request: runs::StartRunRequest, app: AppHandle, state: State<
     if let Some(asset_id) = request.cached_asset_id.clone() {
         return runs::finish_cached(&state, &request, &asset_id);
     }
-    let key = load_provider_credential(request.provider_id.clone())?
+    let key = provider_credential(&request.provider_id)?
         .ok_or_else(|| "尚未保存该 Provider 的 API Key".to_string())?;
     let runtime = gateway::ProviderRuntime { profile, api_key: key };
     let run = runs::create_run(&state, &request)?;
     let job_id = format!("job_{}", uuid::Uuid::new_v4());
+    // 同步能力不建 job 行：否则下次启动的恢复扫描会把它当成「提交阶段被中断」。
+    let is_async = profile.models.iter()
+        .find(|model| model.id == request.model)
+        .and_then(|model| model.capability(&request.capability))
+        .map(|capability| capability.async_job)
+        .unwrap_or(false);
     let db_path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
-    db::open(&db_path)?.execute(
-        "INSERT INTO jobs (id, run_id, provider_id, capability, status, attempts, payload, updated_at) VALUES (?1, ?2, ?3, ?4, 'queued', 0, ?5, ?6)",
-        params![job_id, run.id, request.provider_id, request.capability, serde_json::to_string(&request).map_err(|error| error.to_string())?, Utc::now().to_rfc3339()],
-    ).map_err(|error| error.to_string())?;
+    if is_async {
+        db::open(&db_path)?.execute(
+            "INSERT INTO jobs (id, run_id, provider_id, capability, status, attempts, payload, updated_at) VALUES (?1, ?2, ?3, ?4, 'queued', 0, ?5, ?6)",
+            params![job_id, run.id, request.provider_id, request.capability, serde_json::to_string(&request).map_err(|error| error.to_string())?, Utc::now().to_rfc3339()],
+        ).map_err(|error| error.to_string())?;
+    }
     let state_clone = AppState {
         db_path: Mutex::new(db_path),
         data_dir: state.data_dir.clone(),
@@ -4937,7 +4958,7 @@ fn select_run_candidate(run_id: String, asset_id: String, state: State<'_, AppSt
 
 #[tauri::command]
 fn resume_jobs(app: AppHandle, state: State<'_, AppState>) -> Result<usize, String> {
-    runs::resume_pending(app, &state)
+    Ok(jobs::resume_pending_on_start(app, &state))
 }
 
 #[tauri::command]
@@ -4974,7 +4995,6 @@ save_board,
 delete_board,
 list_provider_profiles,
 save_provider_profile,
-save_provider_credential,
 provider_has_key,
 test_provider_profile,
 save_asset_host,
@@ -4987,6 +5007,8 @@ resume_jobs,
 asset_file_path,
 read_asset_text
 ```
+
+`save_provider_credential` / `load_provider_credential` 已在旧命令列表里，不要重复追加。
 
 - [ ] **Step 3: 写前端桥**
 
@@ -5076,6 +5098,13 @@ export async function loadAssetHost(): Promise<AssetHostConfig & { hasCredential
   return invoke<AssetHostConfig & { hasCredentials?: boolean }>('load_asset_host');
 }
 
+export interface RunInput {
+  role: string;
+  assetId: string;
+  kind: string;
+  mime: string;
+}
+
 export interface StartRunInput {
   schemaVersion: 1;
   projectId: string;
@@ -5086,7 +5115,7 @@ export interface StartRunInput {
   model: string;
   promptSnapshot: RunRecord['promptSnapshot'];
   params: Record<string, unknown>;
-  inputs: Array<{ role: string; assetId: string; kind: string; mime: string }>;
+  inputs: RunInput[];
   inputAssetIds: string[];
   cacheKey: string;
   cachedAssetId?: string;
@@ -5128,7 +5157,7 @@ export async function readAssetText(assetId: string): Promise<string> {
   return invoke<string>('read_asset_text', { assetId });
 }
 
-export type { AssetRef, JobRecord };
+export type { AssetRef };
 ```
 
 `src/services/events.ts`：
@@ -5164,42 +5193,105 @@ export async function onAssetCreated(handler: (asset: AssetRef) => void): Promis
 }
 ```
 
-- [ ] **Step 4: 写一个纯映射测试（保证桥模块可加载）**
+- [ ] **Step 4: 写桥接契约测试**
 
 `src/services/tauri.test.ts`：
 
 ```ts
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { RunRecord } from '../domain/types';
 
-describe('run payload contract', () => {
-  it('keeps camelCase keys used by the Rust command', () => {
+const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
+
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke,
+  convertFileSrc: (path: string) => `file://${path}`,
+}));
+
+import { assetUrl, listBoards, listRuns, startRun } from './tauri';
+
+function enableTauri() {
+  (globalThis as unknown as { window?: unknown }).window = { __TAURI_INTERNALS__: {} };
+}
+
+describe('tauri bridge', () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    enableTauri();
+  });
+
+  it('passes camelCase arguments that the Rust command expects', async () => {
+    invoke.mockResolvedValue([]);
+    await listBoards('project_1');
+    expect(invoke).toHaveBeenCalledWith('list_boards', { projectId: 'project_1' });
+
+    await listRuns('board_1');
+    expect(invoke).toHaveBeenCalledWith('list_runs', { boardId: 'board_1' });
+  });
+
+  it('keeps the run payload contract camelCase', async () => {
+    invoke.mockResolvedValue({ id: 'run_1' });
     const run: RunRecord = {
-      id: 'run_1', projectId: 'p1', boardId: 'b1', nodeId: 'n1', action: 'generate',
-      cacheKey: 'k', status: 'queued',
+      id: 'run_1', projectId: 'project_1', boardId: 'board_1', nodeId: 'node_1',
+      action: 'generate', cacheKey: 'k', status: 'queued',
       promptSnapshot: { text: 'hi', segments: [], hash: 'h', locked: false },
       params: {}, inputAssetIds: [], outputAssetIds: [],
       startedAt: '2026-10-31T00:00:00.000Z',
     };
     expect(Object.keys(run)).toContain('cacheKey');
     expect(run.promptSnapshot.hash).toBe('h');
+
+    await startRun({
+      schemaVersion: 1,
+      projectId: run.projectId,
+      boardId: run.boardId,
+      nodeId: run.nodeId,
+      capability: 'image.generate',
+      providerId: 'provider_1',
+      model: 'gpt-image-1',
+      promptSnapshot: run.promptSnapshot,
+      params: {},
+      inputs: [],
+      inputAssetIds: [],
+      cacheKey: run.cacheKey,
+    });
+
+    expect(invoke).toHaveBeenCalledWith('start_run', expect.objectContaining({ request: expect.anything() }));
+    const request = invoke.mock.calls[0][1].request as Record<string, unknown>;
+    expect(Object.keys(request)).toEqual(
+      expect.arrayContaining(['schemaVersion', 'projectId', 'boardId', 'nodeId', 'cacheKey']),
+    );
+  });
+
+  it('builds an asset url from the resolved file path', async () => {
+    invoke.mockResolvedValue('/tmp/assets/a.png');
+    await expect(assetUrl('asset_1')).resolves.toBe('file:///tmp/assets/a.png');
+    expect(invoke).toHaveBeenCalledWith('asset_file_path', { assetId: 'asset_1' });
   });
 });
 ```
+
+`@tauri-apps/api/core` 在 Node 环境可以正常 import（只用到 `invoke` / `convertFileSrc`），因此这里用 `vi.mock` 替身断言「命令名 + camelCase 参数」这条真正的契约；`isTauri()` 依赖 `window.__TAURI_INTERNALS__`，测试里要手动补上。
 
 - [ ] **Step 5: 编译并运行测试**
 
 Run:
 ```bash
 pnpm test:unit
+npx tsc -b
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 Expected: TS 测试通过；Rust 现有 + 新增测试全部通过。若 `start_run` 命令的 `AppHandle` 注入顺序报错，Tauri 2 要求 `AppHandle` 参数放在 `State` 之前或之后均可，但 `async` 命令返回类型必须 `Result`。
 
+两个已知的坑：
+
+- `#[tauri::command]` 不能直接加在 `pub(crate)` 函数上。Tauri 2 对受限可见性会加 `#[macro_export]`，命令函数在 crate 根时会和生成的 `__cmd__*` 宏重名（E0255）。命令保持私有，内部读取凭据走 `pub(crate) fn provider_credential(&str)`。
+- `keyring::Entry::set_password` 收 `&str`，不是 `String`。
+
 - [ ] **Step 6: 提交**
 
 ```bash
-git add src-tauri/src/lib.rs src-tauri/src/runs.rs src/services
+git add src-tauri/src/lib.rs src-tauri/src/jobs.rs src-tauri/src/gateway/minimax.rs src/services docs/superpowers/plans/2026-10-31-p0-canvas-foundation.md
 git commit -m "feat(p0): 画布/Provider/运行命令与前端桥"
 ```
 
