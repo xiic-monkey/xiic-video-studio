@@ -8,7 +8,7 @@ vi.mock('@tauri-apps/api/core', () => ({
   convertFileSrc: (path: string) => `file://${path}`,
 }));
 
-import { assetUrl, listBoards, listRuns, startRun } from './tauri';
+import { assetUrl, listBoards, listRuns, saveAssetHost, startRun } from './tauri';
 
 function enableTauri() {
   (globalThis as unknown as { window?: unknown }).window = { __TAURI_INTERNALS__: {} };
@@ -74,5 +74,18 @@ describe('tauri bridge', () => {
     invoke.mockResolvedValue('/tmp/assets/a.png');
     await expect(assetUrl('asset_1')).resolves.toBe('file:///tmp/assets/a.png');
     expect(invoke).toHaveBeenCalledWith('asset_file_path', { assetId: 'asset_1' });
+  });
+
+  it('keeps the asset host payload contract', async () => {
+    invoke.mockResolvedValue(undefined);
+    await saveAssetHost({
+      schemaVersion: 1,
+      strategy: 's3',
+      endpoint: 'https://s3.example.com',
+      bucket: 'frameforge',
+    });
+    expect(invoke).toHaveBeenCalledWith('save_asset_host', {
+      config: expect.objectContaining({ schemaVersion: 1, strategy: 's3', endpoint: 'https://s3.example.com' }),
+    });
   });
 });

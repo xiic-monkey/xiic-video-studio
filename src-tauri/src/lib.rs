@@ -1802,11 +1802,6 @@ fn save_provider_credential(provider_id: String, api_key: String) -> Result<(), 
         .map_err(|error| error.to_string())
 }
 
-#[tauri::command]
-fn load_provider_credential(provider_id: String) -> Result<Option<String>, String> {
-    provider_credential(&provider_id)
-}
-
 /// 内部读取凭据。API Key 只存在系统钥匙串，前端拿不到明文。
 pub(crate) fn provider_credential(provider_id: &str) -> Result<Option<String>, String> {
     let entry = Entry::new(KEYCHAIN_SERVICE, &format!("{CREDENTIAL_ACCOUNT_PREFIX}{provider_id}"))
@@ -2743,6 +2738,67 @@ fn list_provider_profiles(state: State<'_, AppState>) -> Result<Vec<Value>, Stri
     .collect()
 }
 
+/// 远端地址校验失败时保留错误码，方便前端提示与日志排查区分具体原因。
+fn remote_url_error(error: gateway::AppError) -> String {
+    format!("{}（{}）", error.message, error.code)
+}
+
+/// Provider 的 Base URL：留空表示未配置，放行；否则必须是公网 https。
+fn validate_provider_base_url(base_url: &str) -> Result<(), String> {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    security::validate_remote_url(trimmed)
+        .map(|_| ())
+        .map_err(remote_url_error)
+}
+
+/// 素材外链：S3 策略下的 endpoint 与公网前缀都必须是公网 https。
+fn validate_asset_host_urls(config: &Value) -> Result<(), String> {
+    let strategy = config.get("strategy").and_then(Value::as_str).unwrap_or("");
+    let endpoint = config
+        .get("endpoint")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let public_base_url = config
+        .get("publicBaseUrl")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if strategy == "s3" && !endpoint.is_empty() {
+        security::validate_remote_url(endpoint).map_err(remote_url_error)?;
+    }
+    if !public_base_url.is_empty() {
+        security::validate_remote_url(public_base_url).map_err(remote_url_error)?;
+    }
+    Ok(())
+}
+
+/// 落库的素材外链配置：去掉密钥，固定 schemaVersion。
+fn asset_host_payload(config: &Value) -> Value {
+    let mut object = config.as_object().cloned().unwrap_or_default();
+    object.remove("accessKey");
+    object.remove("secretKey");
+    object.insert("schemaVersion".to_string(), json!(1));
+    Value::Object(object)
+}
+
+/// 回读给前端的素材外链配置：带 schemaVersion（存量数据默认 1），且不含任何明文密钥。
+fn asset_host_response(config: &gateway::transport::AssetHostConfig) -> Value {
+    json!({
+        "schemaVersion": config.schema_version,
+        "strategy": config.strategy,
+        "endpoint": config.endpoint,
+        "bucket": config.bucket,
+        "region": config.region,
+        "prefix": config.prefix,
+        "publicBaseUrl": config.public_base_url,
+        "hasCredentials": config.access_key.is_some() && config.secret_key.is_some()
+    })
+}
+
 #[tauri::command]
 fn save_provider_profile(mut profile: Value, state: State<'_, AppState>) -> Result<(), String> {
     strip_sensitive_fields(&mut profile);
@@ -2761,7 +2817,13 @@ fn save_provider_profile(mut profile: Value, state: State<'_, AppState>) -> Resu
         .get("baseUrl")
         .and_then(Value::as_str)
         .unwrap_or("")
+        .trim()
         .to_string();
+    validate_provider_base_url(&base_url)?;
+    // 落库的值与校验过的值保持一致，避免前后空格绕过校验。
+    if let Some(object) = profile.as_object_mut() {
+        object.insert("baseUrl".to_string(), json!(base_url.clone()));
+    }
     let enabled = profile
         .get("enabled")
         .and_then(Value::as_bool)
@@ -2838,6 +2900,7 @@ async fn test_provider_profile(
 
 #[tauri::command]
 fn save_asset_host(config: Value, state: State<'_, AppState>) -> Result<(), String> {
+    validate_asset_host_urls(&config)?;
     let access_key = config
         .get("accessKey")
         .and_then(Value::as_str)
@@ -2860,11 +2923,7 @@ fn save_asset_host(config: Value, state: State<'_, AppState>) -> Result<(), Stri
             .set_password(&secret_key)
             .map_err(|error| error.to_string())?;
     }
-    let mut public = config.clone();
-    if let Some(object) = public.as_object_mut() {
-        object.remove("accessKey");
-        object.remove("secretKey");
-    }
+    let public = asset_host_payload(&config);
     let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
     db::open(&path)?
         .execute(
@@ -2879,15 +2938,7 @@ fn save_asset_host(config: Value, state: State<'_, AppState>) -> Result<(), Stri
 #[tauri::command]
 fn load_asset_host(state: State<'_, AppState>) -> Result<Value, String> {
     let config = asset_host_internal(&state)?;
-    Ok(json!({
-        "strategy": config.strategy,
-        "endpoint": config.endpoint,
-        "bucket": config.bucket,
-        "region": config.region,
-        "prefix": config.prefix,
-        "publicBaseUrl": config.public_base_url,
-        "hasCredentials": config.access_key.is_some() && config.secret_key.is_some()
-    }))
+    Ok(asset_host_response(&config))
 }
 
 #[tauri::command]
@@ -3035,7 +3086,6 @@ pub fn run() {
             append_generation_task_id,
             update_job_status,
             save_provider_credential,
-            load_provider_credential,
             save_provider_settings,
             list_provider_settings,
             generate_gpt_image,
@@ -3368,5 +3418,95 @@ mod tests {
         assert!(media_extension("document", "file.txt").is_err());
         assert_eq!(media_stem("../shot with spaces?.png"), "shotwithspaces");
         assert_eq!(media_stem("!!!.png"), "asset");
+    }
+
+    #[test]
+    fn provider_base_url_accepts_public_https_and_empty_value() {
+        assert!(validate_provider_base_url("").is_ok());
+        assert!(validate_provider_base_url("   ").is_ok());
+        assert!(validate_provider_base_url("https://api.example.com/v1").is_ok());
+    }
+
+    #[test]
+    fn provider_base_url_rejects_insecure_and_private_targets() {
+        let insecure = validate_provider_base_url("http://api.example.com").expect_err("http 拒绝");
+        assert!(insecure.contains("PARAM_URL_INSECURE"), "{insecure}");
+        for target in [
+            "https://127.0.0.1:8080",
+            "https://localhost",
+            "https://192.168.1.10",
+        ] {
+            let error = validate_provider_base_url(target).expect_err("私网拒绝");
+            assert!(error.contains("PARAM_URL_PRIVATE"), "{target} -> {error}");
+        }
+        let invalid = validate_provider_base_url("not-a-url").expect_err("非法 URL");
+        assert!(invalid.contains("PARAM_URL_INVALID"), "{invalid}");
+    }
+
+    #[test]
+    fn asset_host_rejects_insecure_endpoint_and_public_base_url() {
+        let insecure = validate_asset_host_urls(&json!({
+            "strategy": "s3",
+            "endpoint": "http://s3.example.com"
+        }))
+        .expect_err("http endpoint 拒绝");
+        assert!(insecure.contains("PARAM_URL_INSECURE"), "{insecure}");
+        let private = validate_asset_host_urls(&json!({
+            "strategy": "s3",
+            "endpoint": "https://127.0.0.1:9000"
+        }))
+        .expect_err("私网 endpoint 拒绝");
+        assert!(private.contains("PARAM_URL_PRIVATE"), "{private}");
+        let public_base = validate_asset_host_urls(&json!({
+            "strategy": "s3",
+            "endpoint": "https://s3.example.com",
+            "publicBaseUrl": "http://cdn.example.com"
+        }))
+        .expect_err("公网前缀拒绝 http");
+        assert!(public_base.contains("PARAM_URL_INSECURE"), "{public_base}");
+    }
+
+    #[test]
+    fn asset_host_ignores_endpoint_when_strategy_is_not_s3() {
+        assert!(validate_asset_host_urls(&json!({
+            "strategy": "dataUrl",
+            "endpoint": "http://s3.example.com"
+        }))
+        .is_ok());
+        assert!(validate_asset_host_urls(&json!({
+            "strategy": "s3",
+            "endpoint": "https://s3.example.com",
+            "publicBaseUrl": "https://cdn.example.com"
+        }))
+        .is_ok());
+    }
+
+    #[test]
+    fn asset_host_payload_drops_keys_and_keeps_schema_version() {
+        let payload = asset_host_payload(&json!({
+            "strategy": "s3",
+            "endpoint": "https://s3.example.com",
+            "accessKey": "access-plain",
+            "secretKey": "secret-plain"
+        }));
+        assert_eq!(payload["schemaVersion"], json!(1));
+        assert_eq!(payload["endpoint"], json!("https://s3.example.com"));
+        assert!(payload.get("accessKey").is_none());
+        assert!(payload.get("secretKey").is_none());
+    }
+
+    #[test]
+    fn asset_host_response_carries_schema_version_without_plain_keys() {
+        let mut config = gateway::transport::AssetHostConfig::default();
+        config.strategy = "s3".to_string();
+        config.endpoint = Some("https://s3.example.com".to_string());
+        config.access_key = Some("access-plain".to_string());
+        config.secret_key = Some("secret-plain".to_string());
+        let response = asset_host_response(&config);
+        assert_eq!(response["schemaVersion"], json!(1));
+        assert_eq!(response["strategy"], json!("s3"));
+        assert_eq!(response["hasCredentials"], json!(true));
+        assert!(response.get("accessKey").is_none());
+        assert!(response.get("secretKey").is_none());
     }
 }

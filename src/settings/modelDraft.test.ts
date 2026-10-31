@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import type { ModelConfig } from '../domain/types';
-import { draftFromModel, emptyModelDraft, modelFromDraft, validDrafts } from './modelDraft';
+import {
+  draftFromModel,
+  emptyModelDraft,
+  mergeModelDrafts,
+  modelFromDraft,
+  validDrafts,
+} from './modelDraft';
 
 const model: ModelConfig = {
   id: 'gpt-4o-mini',
@@ -11,6 +17,34 @@ const model: ModelConfig = {
       price: { unit: 'request', amount: 0.01, currency: 'USD' },
     },
     { capability: 'video.generate', inputTransport: ['publicUrl'], async: true },
+  ],
+};
+
+const videoModel: ModelConfig = {
+  id: 'h3-video',
+  displayName: 'H3 视频',
+  capabilities: [
+    {
+      capability: 'video.generate',
+      modes: ['t2v', 'firstLast'],
+      durations: { min: 5, max: 15, step: 1 },
+      resolutions: ['768P', '2K'],
+      inputTransport: ['publicUrl'],
+      async: true,
+      price: { unit: 'second', amount: 0.1, currency: 'USD' },
+    },
+  ],
+  defaults: { protocol: 'official' },
+};
+
+const chatModel: ModelConfig = {
+  id: 'gpt-4o-mini',
+  displayName: 'GPT-4o mini',
+  capabilities: [
+    {
+      capability: 'text.chat', inputTransport: ['dataUrl'], async: false,
+      price: { unit: 'request', amount: 0.01, currency: 'USD' },
+    },
   ],
 };
 
@@ -34,5 +68,78 @@ describe('model drafts', () => {
 
   it('drops drafts without an id', () => {
     expect(validDrafts([emptyModelDraft(), { ...emptyModelDraft(), id: 'x' }])).toHaveLength(1);
+  });
+});
+
+describe('model draft merge', () => {
+  it('keeps models the draft cannot express', () => {
+    const merged = mergeModelDrafts(
+      [videoModel, chatModel],
+      [draftFromModel(videoModel), draftFromModel(chatModel)],
+    );
+    expect(merged.map((item) => item.id)).toEqual(['h3-video', 'gpt-4o-mini']);
+
+    const video = merged.find((item) => item.id === 'h3-video');
+    expect(video).toBeDefined();
+    expect(video?.capabilities).toHaveLength(1);
+    expect(video?.capabilities[0].capability).toBe('video.generate');
+    expect(video?.capabilities[0].modes).toEqual(['t2v', 'firstLast']);
+    expect(video?.capabilities[0].durations).toEqual({ min: 5, max: 15, step: 1 });
+    expect(video?.capabilities[0].resolutions).toEqual(['768P', '2K']);
+    expect(video?.capabilities[0].inputTransport).toEqual(['publicUrl']);
+    expect(video?.capabilities[0].async).toBe(true);
+    expect(video?.capabilities[0].price).toEqual({ unit: 'second', amount: 0.1, currency: 'USD' });
+    expect(video?.defaults).toEqual({ protocol: 'official' });
+  });
+
+  it('keeps models missing from the draft list', () => {
+    const merged = mergeModelDrafts([videoModel, chatModel], [draftFromModel(chatModel)]);
+    expect(merged.map((item) => item.id)).toEqual(['h3-video', 'gpt-4o-mini']);
+    expect(merged[0]).toBe(videoModel);
+  });
+
+  it('applies draft edits on top of the original model', () => {
+    const merged = mergeModelDrafts([chatModel], [{
+      id: '  gpt-4o-mini ', displayName: '  ', capabilities: ['text.chat', 'image.generate'],
+      priceAmount: 0.04, priceUnit: 'image',
+    }]);
+    expect(merged).toHaveLength(1);
+    expect(merged[0].id).toBe('gpt-4o-mini');
+    expect(merged[0].displayName).toBe('gpt-4o-mini');
+    expect(merged[0].capabilities.map((item) => item.capability)).toEqual(['text.chat', 'image.generate']);
+    expect(merged[0].capabilities[0].price).toEqual({ unit: 'image', amount: 0.04, currency: 'USD' });
+  });
+
+  it('keeps the original currency and falls back to the original price', () => {
+    const cnyModel: ModelConfig = {
+      id: 'cny-chat',
+      displayName: 'CNY 模型',
+      capabilities: [
+        {
+          capability: 'text.chat', inputTransport: ['dataUrl'], async: false,
+          price: { unit: 'request', amount: 0.02, currency: 'CNY' },
+        },
+      ],
+    };
+    const priced = mergeModelDrafts([cnyModel], [{
+      id: 'cny-chat', displayName: 'CNY 模型', capabilities: ['text.chat'],
+      priceAmount: 0.05, priceUnit: 'request',
+    }]);
+    expect(priced[0].capabilities[0].price).toEqual({ unit: 'request', amount: 0.05, currency: 'CNY' });
+
+    const unpriced = mergeModelDrafts([cnyModel], [{
+      id: 'cny-chat', displayName: 'CNY 模型', capabilities: ['text.chat'], priceUnit: 'request',
+    }]);
+    expect(unpriced[0].capabilities[0].price).toEqual({ unit: 'request', amount: 0.02, currency: 'CNY' });
+  });
+
+  it('appends models the draft added', () => {
+    const merged = mergeModelDrafts([chatModel], [
+      draftFromModel(chatModel),
+      { id: 'new-image', displayName: '', capabilities: ['image.generate'], priceAmount: 0.04, priceUnit: 'image' },
+    ]);
+    expect(merged.map((item) => item.id)).toEqual(['gpt-4o-mini', 'new-image']);
+    expect(merged[1].displayName).toBe('new-image');
+    expect(merged[1].capabilities[0].price).toEqual({ unit: 'image', amount: 0.04, currency: 'USD' });
   });
 });

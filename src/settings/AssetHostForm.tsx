@@ -34,6 +34,7 @@ export function AssetHostForm() {
     setStatus(undefined);
     try {
       await saveHost({
+        schemaVersion: 1,
         strategy,
         endpoint: endpoint.trim(),
         bucket: bucket.trim(),

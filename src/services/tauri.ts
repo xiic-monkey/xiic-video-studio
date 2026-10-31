@@ -72,6 +72,7 @@ export async function testProviderProfile(providerId: string): Promise<ProviderT
 }
 
 export interface AssetHostConfig {
+  schemaVersion: 1;
   strategy: 'dataUrl' | 's3';
   endpoint?: string;
   bucket?: string;
@@ -88,7 +89,7 @@ export async function saveAssetHost(config: AssetHostConfig): Promise<void> {
 }
 
 export async function loadAssetHost(): Promise<AssetHostConfig & { hasCredentials?: boolean }> {
-  if (!isTauri()) return { strategy: 'dataUrl' };
+  if (!isTauri()) return { schemaVersion: 1, strategy: 'dataUrl' };
   return invoke<AssetHostConfig & { hasCredentials?: boolean }>('load_asset_host');
 }
 

@@ -10,9 +10,16 @@ use std::path::Path;
 
 type HmacSha256 = Hmac<Sha256>;
 
-#[derive(Debug, Clone, Default, Deserialize)]
+/// 素材外链配置的 IPC 载荷版本。存量库里没有该字段时按 1 读取。
+fn default_schema_version() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssetHostConfig {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     #[serde(default)]
     pub strategy: String,
     pub endpoint: Option<String>,
@@ -22,6 +29,22 @@ pub struct AssetHostConfig {
     pub public_base_url: Option<String>,
     pub access_key: Option<String>,
     pub secret_key: Option<String>,
+}
+
+impl Default for AssetHostConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: default_schema_version(),
+            strategy: String::new(),
+            endpoint: None,
+            bucket: None,
+            region: None,
+            prefix: None,
+            public_base_url: None,
+            access_key: None,
+            secret_key: None,
+        }
+    }
 }
 
 impl AssetHostConfig {
@@ -245,5 +268,19 @@ mod tests {
             .await
             .expect_err("needs s3");
         assert_eq!(error.code, "CAP_PUBLIC_URL_REQUIRED");
+    }
+
+    #[test]
+    fn asset_host_config_defaults_to_schema_version_one() {
+        assert_eq!(AssetHostConfig::default().schema_version, 1);
+    }
+
+    #[test]
+    fn asset_host_config_reads_legacy_payload_without_schema_version() {
+        let legacy = r#"{"strategy":"s3","endpoint":"https://s3.example.com","publicBaseUrl":"https://cdn.example.com"}"#;
+        let config: AssetHostConfig = serde_json::from_str(legacy).expect("legacy payload");
+        assert_eq!(config.schema_version, 1);
+        assert_eq!(config.strategy, "s3");
+        assert_eq!(config.endpoint.as_deref(), Some("https://s3.example.com"));
     }
 }

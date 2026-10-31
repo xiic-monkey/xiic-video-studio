@@ -7,7 +7,7 @@ import {
   capabilitySummary,
   draftFromModel,
   emptyModelDraft,
-  validDrafts,
+  mergeModelDrafts,
   type ModelDraft,
   type SimpleCapability,
   type SimplePriceUnit,
@@ -57,7 +57,9 @@ export function ProviderForm({ profile }: { profile: ProviderProfile }) {
     setBusy(true);
     setStatus(undefined);
     try {
-      const models = profile.adapter === 'openai-compatible' ? validDrafts(drafts) : profile.models;
+      const models = profile.adapter === 'openai-compatible'
+        ? mergeModelDrafts(profile.models, drafts)
+        : profile.models;
       await saveProfile({ ...profile, baseUrl: baseUrl.trim(), enabled, models });
       if (apiKey.trim()) {
         await saveKey(profile.id, apiKey.trim());
