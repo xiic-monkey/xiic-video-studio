@@ -72,11 +72,8 @@ export function resolveModel(
   }
   const usable = candidates.find((item) => hasKeys[item.profile.id]);
   if (usable) return { ok: true, resolved: wrap(usable.profile, usable.config) };
-  // 明确标记为「没有 Key」（hasKeys[id] === false）的 Provider 不再算候选：
-  // 此时用户已经确认过它不可用，提示「请在设置中添加模型」比提示「去保存 Key」更贴近事实。
-  const pending = candidates.find((item) => hasKeys[item.profile.id] !== false);
-  if (pending) {
-    return { ok: false, issue: error('PROVIDER_KEY_MISSING', `${pending.profile.name} 尚未保存 API Key`) };
+  if (candidates.length) {
+    return { ok: false, issue: error('PROVIDER_KEY_MISSING', `${candidates[0].profile.name} 尚未保存 API Key`) };
   }
   return { ok: false, issue: error('CAP_NO_MODEL', '没有支持该能力的模型，请先在设置中添加') };
 }

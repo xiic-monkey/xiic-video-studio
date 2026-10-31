@@ -40,9 +40,19 @@ describe('resolveModel', () => {
 
   it('reports CAP_NO_MODEL when no model supports the capability', () => {
     const doc = makeDoc([node('a', 'audio', { text: '台词' })], []);
-    const result = resolveModel(TEST_PROFILES, { ...TEST_KEYS, 'minimax-h3': false }, doc.nodes.a, 'video.generate');
+    const result = resolveModel(TEST_PROFILES, TEST_KEYS, doc.nodes.a, 'video.edit');
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.issue.code).toBe('CAP_NO_MODEL');
+  });
+
+  it('reports PROVIDER_KEY_MISSING when a supporting provider has no key saved', () => {
+    const doc = makeDoc([videoNode('v')], []);
+    const result = resolveModel(TEST_PROFILES, { 'openai-compatible': true, 'minimax-h3': false }, doc.nodes.v, 'video.generate');
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.issue.code).toBe('PROVIDER_KEY_MISSING');
+      expect(result.issue.message).toContain('MiniMax H3');
+    }
   });
 });
 

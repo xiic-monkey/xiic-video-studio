@@ -179,6 +179,18 @@ describe('prepareRun', () => {
     if (!outcome.ok) expect(outcome.issues.map((issue) => issue.code)).toContain('PARAM_DURATION_RANGE');
   });
 
+  it('asks the user to save the API key when the supporting provider has none', () => {
+    const doc = makeDoc([videoNode('v')], []);
+    const outcome = prepareRun(doc, 'v', deps({
+      hasKeys: { 'openai-compatible': true, 'minimax-h3': false },
+    }));
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.issues.map((issue) => issue.code)).toContain('PROVIDER_KEY_MISSING');
+      expect(outcome.issues[0].message).toContain('MiniMax H3');
+    }
+  });
+
   it('refuses nodes that cannot run', () => {
     const doc = makeDoc([node('n', 'note', { text: '备忘' })], []);
     const outcome = prepareRun(doc, 'n', deps());
