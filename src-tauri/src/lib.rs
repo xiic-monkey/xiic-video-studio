@@ -15,6 +15,8 @@ use std::{
 };
 use tauri::{Manager, State};
 
+mod db;
+
 struct AppState {
     db_path: Mutex<PathBuf>,
 }
@@ -401,43 +403,7 @@ fn chat_content(value: &Value) -> Option<String> {
 }
 
 fn open_db(path: &PathBuf) -> Result<Connection, String> {
-    let connection = Connection::open(path).map_err(|error| error.to_string())?;
-    connection
-        .execute_batch(
-            "
-            PRAGMA journal_mode = WAL;
-            CREATE TABLE IF NOT EXISTS projects (
-              id TEXT PRIMARY KEY,
-              name TEXT NOT NULL,
-              payload TEXT NOT NULL,
-              updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS generation_jobs (
-              id TEXT PRIMARY KEY,
-              project_id TEXT NOT NULL,
-              kind TEXT NOT NULL,
-              status TEXT NOT NULL,
-              payload TEXT NOT NULL,
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS jobs_by_project ON generation_jobs(project_id, updated_at DESC);
-            CREATE TABLE IF NOT EXISTS provider_settings (
-              provider_id TEXT PRIMARY KEY,
-              base_url TEXT NOT NULL,
-              model TEXT NOT NULL,
-              text_model TEXT,
-              voice TEXT
-            );
-            CREATE TABLE IF NOT EXISTS app_settings (
-              key TEXT PRIMARY KEY,
-              value TEXT NOT NULL
-            );
-            ",
-        )
-        .map_err(|error| error.to_string())?;
-    let _ = connection.execute("ALTER TABLE provider_settings ADD COLUMN voice TEXT", []);
-    Ok(connection)
+    db::open(path)
 }
 
 fn project_identity(project: &Value) -> Result<(String, String), String> {
