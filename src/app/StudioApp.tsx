@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { FolderKanban, Plus, Save } from 'lucide-react';
 import { ProjectLibrary } from './ProjectLibrary';
 import { CanvasView } from '../canvas/CanvasView';
+import { Inspector } from '../inspector/Inspector';
 import { useStudioStore } from '../stores/studioStore';
 import { useBoardStore } from '../stores/boardStore';
 
@@ -124,14 +125,7 @@ export function StudioApp() {
           )}
         </main>
 
-        <aside className="studio-inspector">
-          <h2>Inspector</h2>
-          {board ? (
-            <p>选中画布节点后，在这里编辑提示词、模型参数与候选。当前画布已保存到本地 SQLite。</p>
-          ) : (
-            <p>先创建或打开一张画布。P0 只支持单节点运行，运行前会显示成本预估并等待确认。</p>
-          )}
-        </aside>
+        <Inspector />
       </div>
 
       <footer className="studio-dock">
