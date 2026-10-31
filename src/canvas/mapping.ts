@@ -22,7 +22,8 @@ const ROLE_COLOR: Record<EdgeRole, string> = {
   timeline: '#e4ecea',
 };
 
-export function toFlowNodes(doc: BoardDoc): Node<StudioNodeData>[] {
+export function toFlowNodes(doc: BoardDoc, selectedIds: string[] = []): Node<StudioNodeData>[] {
+  const selected = new Set(selectedIds);
   return Object.values(doc.nodes)
     .slice()
     .sort((a, b) => a.z - b.z)
@@ -32,11 +33,11 @@ export function toFlowNodes(doc: BoardDoc): Node<StudioNodeData>[] {
       position: node.position,
       data: { domain: node },
       parentId: node.parentId,
-      extent: node.parentId ? 'parent' as const : undefined,
       zIndex: node.z,
       style: node.size ? { width: node.size.width, height: node.size.height } : undefined,
       draggable: true,
       selectable: true,
+      selected: selected.has(node.id),
     }));
 }
 

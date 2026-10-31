@@ -13,7 +13,7 @@ export type GraphCommand =
   | { type: 'connectMany'; edges: BoardEdge[] }
   | { type: 'disconnect'; edgeId: string }
   | { type: 'setViewport'; viewport: BoardDoc['viewport'] }
-  | { type: 'group'; groupId: string; childIds: string[]; label: string }
+  | { type: 'group'; groupId: string; childIds: string[]; label: string; sizes?: Record<string, { width: number; height: number }> }
   | { type: 'ungroup'; groupId: string };
 
 function stamp(doc: BoardDoc): BoardDoc {
@@ -82,10 +82,11 @@ export function applyGraphCommand(doc: BoardDoc, command: GraphCommand): BoardDo
     case 'group': {
       const children = command.childIds.map((id) => doc.nodes[id]).filter(Boolean);
       if (!children.length) return doc;
+      const sizeOf = (child: BoardNode) => command.sizes?.[child.id] ?? { width: 300, height: 220 };
       const minX = Math.min(...children.map((child) => child.position.x)) - 24;
       const minY = Math.min(...children.map((child) => child.position.y)) - 64;
-      const maxX = Math.max(...children.map((child) => child.position.x + (child.size?.width ?? 300)));
-      const maxY = Math.max(...children.map((child) => child.position.y + (child.size?.height ?? 220)));
+      const maxX = Math.max(...children.map((child) => child.position.x + sizeOf(child).width));
+      const maxY = Math.max(...children.map((child) => child.position.y + sizeOf(child).height));
       const group: BoardNode = {
         id: command.groupId, type: 'group', typeVersion: 1,
         position: { x: minX, y: minY },

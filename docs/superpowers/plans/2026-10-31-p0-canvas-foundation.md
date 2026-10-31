@@ -6226,7 +6226,8 @@ const ROLE_COLOR: Record<EdgeRole, string> = {
   timeline: '#e4ecea',
 };
 
-export function toFlowNodes(doc: BoardDoc): Node<StudioNodeData>[] {
+export function toFlowNodes(doc: BoardDoc, selectedIds: string[] = []): Node<StudioNodeData>[] {
+  const selected = new Set(selectedIds);
   return Object.values(doc.nodes)
     .slice()
     .sort((a, b) => a.z - b.z)
@@ -6236,11 +6237,11 @@ export function toFlowNodes(doc: BoardDoc): Node<StudioNodeData>[] {
       position: node.position,
       data: { domain: node },
       parentId: node.parentId,
-      extent: node.parentId ? 'parent' as const : undefined,
       zIndex: node.z,
       style: node.size ? { width: node.size.width, height: node.size.height } : undefined,
       draggable: true,
       selectable: true,
+      selected: selected.has(node.id),
     }));
 }
 
@@ -6829,6 +6830,8 @@ git commit -m "feat(p0): React Flow 画布、连接预检与撤销自动保存"
 - Create: `src/stores/runStore.ts`
 - Replace: `src/canvas/CanvasView.tsx`
 - Delete: `src/canvas/DefaultNode.tsx`
+- Modify: `src/canvas/mapping.ts`（`toFlowNodes` 接收选中集）
+- Modify: `src/domain/graph/commands.ts`（`group` 命令接收实测尺寸）
 - Modify: `src/styles/studio.css`
 
 **Interfaces:**
@@ -7233,11 +7236,11 @@ export function NodeCard({ data, selected }: NodeProps<Node<StudioNodeData>>) {
     return <div className="flow-node flow-node-unknown">{node.type}</div>;
   }
 
-  const inputs = visibleInputPorts(def, node);
+  const activeInputs = visibleInputPorts(def, node);
   const Body = BODIES[node.type];
   const badge = statusOf(run);
   const accent = nodeColor(node.type);
-  const hasPorts = inputs.length > 0 || def.outputs.length > 0;
+  const hasPorts = def.inputs.length > 0 || def.outputs.length > 0;
 
   return (
     <div
@@ -7261,8 +7264,11 @@ export function NodeCard({ data, selected }: NodeProps<Node<StudioNodeData>>) {
       {hasPorts && (
         <div className="flow-ports">
           <div className="flow-ports-in">
-            {inputs.map((port) => (
-              <div className="flow-port flow-port-in" key={port.key}>
+            {def.inputs.map((port) => (
+              <div
+                className={`flow-port flow-port-in${activeInputs.some((item) => item.key === port.key) ? '' : ' is-inactive'}`}
+                key={port.key}
+              >
                 <Handle type="target" position={Position.Left} id={port.key} className="flow-handle" />
                 <span>{port.label}{port.required ? ' *' : ''}</span>
               </div>
@@ -7282,6 +7288,10 @@ export function NodeCard({ data, selected }: NodeProps<Node<StudioNodeData>>) {
   );
 }
 ```
+
+端口渲染说明：**所有**输入端口都渲染，当前模式不接受的端口标成 `is-inactive`（变暗），不能只渲染 `visibleInputPorts`——否则「拖到视频首帧端口」没有落点，用户看不到任何解释。Task 17 已经在纯画布版本上验证过这条路径，Task 18 换成正式卡片时必须保留。
+
+端口行的手柄用 `position: relative` 的 `.flow-port` 作为定位基准：输入手柄 `left: 0; transform: translate(-50%, -50%)` 落在卡片左边缘，输出手柄 `right: 0; transform: translate(50%, -50%)` 落在卡片右边缘。
 
 `src/nodes/registry.tsx`：
 
@@ -7330,10 +7340,10 @@ function CanvasInner() {
   });
   const canUndo = useBoardStore((state) => state.past.length > 0);
   const canRedo = useBoardStore((state) => state.future.length > 0);
-  const { screenToFlowPosition } = useReactFlow();
+  const { screenToFlowPosition, getZoom } = useReactFlow();
   const wrapper = useRef<HTMLDivElement>(null);
 
-  const nodes = useMemo(() => (board ? toFlowNodes(board) : []), [board]);
+  const nodes = useMemo(() => (board ? toFlowNodes(board, selectedNodeIds) : []), [board, selectedNodeIds]);
   const edges = useMemo(() => (board ? toFlowEdges(board) : []), [board]);
   const dangling = board ? danglingEdgeCount(board) : 0;
 
@@ -7344,14 +7354,23 @@ function CanvasInner() {
   const groupSelection = useCallback(() => {
     const store = useBoardStore.getState();
     if (!store.board || store.selectedNodeIds.length < 2) return;
+    const zoom = getZoom() || 1;
+    const sizes: Record<string, { width: number; height: number }> = {};
+    for (const nodeId of store.selectedNodeIds) {
+      const element = wrapper.current?.querySelector(`.react-flow__node[data-id="${nodeId}"]`);
+      if (!element) continue;
+      const rect = element.getBoundingClientRect();
+      sizes[nodeId] = { width: rect.width / zoom, height: rect.height / zoom };
+    }
     store.apply({
       type: 'group',
       groupId: newId('node'),
       childIds: store.selectedNodeIds,
       label: '新分组',
+      sizes,
     });
     store.selectMany([]);
-  }, []);
+  }, [getZoom]);
 
   const ungroupSelection = useCallback(() => {
     const store = useBoardStore.getState();
@@ -7371,8 +7390,12 @@ function CanvasInner() {
     }
     const selects = changes.filter((change) => change.type === 'select');
     if (selects.length) {
-      const ids = selects.filter((change) => change.type === 'select' && change.selected).map((change) => change.id);
-      useBoardStore.getState().selectMany(ids);
+      const next = new Set(useBoardStore.getState().selectedNodeIds);
+      for (const change of selects) {
+        if (change.type !== 'select') continue;
+        if (change.selected) next.add(change.id); else next.delete(change.id);
+      }
+      useBoardStore.getState().selectMany([...next]);
     }
   }, []);
 
@@ -7498,7 +7521,6 @@ function CanvasInner() {
         onConnect={onConnect}
         onNodeDragStart={() => useBoardStore.getState().beginGesture()}
         onNodeDragStop={() => useBoardStore.getState().endGesture()}
-        onSelectionChange={({ nodes: selected }) => useBoardStore.getState().selectMany(selected.map((node) => node.id))}
         onDrop={onDrop}
         onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; }}
         onMoveEnd={(_, viewport) => {
@@ -7514,6 +7536,7 @@ function CanvasInner() {
         fitView={false}
         minZoom={0.2}
         maxZoom={2.5}
+        nodeDragThreshold={0}
       >
         <Background color="#26302f" gap={24} size={1} />
         <Controls showInteractive={false} />
@@ -7577,12 +7600,14 @@ export function CanvasView() {
 .flow-ports-in, .flow-ports-out { display: grid; gap: 5px; }
 .flow-ports-out { margin-left: auto; text-align: right; }
 .flow-port { position: relative; color: var(--text-dim); font-size: 9px; white-space: nowrap; }
-.flow-port-in { padding-left: 11px; }
-.flow-port-out { padding-right: 11px; }
+.flow-port-in { padding-left: 12px; }
+.flow-port-out { padding-right: 12px; }
 .flow-port .flow-handle { width: 9px; height: 9px; background: var(--panel); border: 1px solid var(--mint); }
-.flow-port-in .flow-handle { top: 50%; left: -16px; transform: translateY(-50%); }
-.flow-port-out .flow-handle { top: 50%; right: -16px; transform: translateY(-50%); }
-.flow-node.is-group { width: auto; height: 100%; min-width: 260px; min-height: 180px; background: rgba(32, 41, 42, .55); border-style: dashed; }
+.flow-port-in .flow-handle { left: 0; transform: translate(-50%, -50%); }
+.flow-port-out .flow-handle { right: 0; transform: translate(50%, -50%); }
+.flow-port.is-inactive { opacity: .4; }
+.flow-port.is-inactive .flow-handle { border-color: var(--line-strong); }
+.flow-node.is-group { width: 100%; height: 100%; min-width: 260px; min-height: 180px; background: rgba(32, 41, 42, .55); border-style: dashed; }
 .flow-node.is-group header { padding-bottom: 4px; }
 .flow-node.is-group .flow-group-body { padding-bottom: 0; }
 .flow-node-unknown { padding: 10px 12px; color: var(--danger); }
@@ -7590,6 +7615,8 @@ export function CanvasView() {
 ```
 
 注意：`is-group` 的宽高由 `board` 里的 `size` 以内联样式覆盖；不要给 `.flow-node` 设置 `overflow: hidden`，否则端口手柄会被裁掉。
+
+端口手柄位置用 `left: 0; transform: translate(-50%, -50%)` 而不是 `left: -16px`：React Flow 的 `.react-flow__handle-left` 自带 `left: 0; transform: translate(-50%,-50%)`，我们的类要覆盖它才能把手柄压在端口圆点的位置上。端口文字用 `padding-left` 留出空间，避免压到手柄。
 
 - [ ] **Step 10: 运行测试与构建**
 
@@ -7610,12 +7637,29 @@ Expected:
 4. 多选后 Delete 删除全部选中节点；撤销可一次恢复。
 5. 打开画布时运行历史被加载，卡片显示最近一次运行状态/耗时。
 
+> 实测记录（2026-10-31，1440×900 无头 Chrome + `vite preview` 1431 端口）：
+>
+> 1. 七类卡片全部渲染正常，标题各异；状态徽章为「未运行」；端口数为 文本 3、图片 4、视频 7（其中 4 个未接线端口变暗）、音频 3、剧本 4、便签 0、分组 0。
+> 2. 编组：两个节点编组后子节点坐标不变（文本 268,208 / 图片 628,208），分组框 650×392；拖动分组，子节点同步位移（+205,+153）；`Shift+Cmd+G` 解组后子节点留在原位。
+> 3. 删除分组：子节点保留（剩 3 个节点），撤销后分组恢复（4 个节点）。
+> 4. 多选删除：选中 2 个节点按 Delete 后剩 1 个，`Cmd+Z` 一次恢复 3 个；撤销/重做按钮的可用态正确。
+> 5. 浏览器里没有 Tauri 运行时，`listRuns` 返回空数组，运行历史加载路径无法在浏览器验证；卡片徽章按「未运行」兜底。真实运行态要等 Task 21 之后在 `pnpm tauri dev` 下验证。
+>
+> 控制台零报错零警告。
+
 - [ ] **Step 12: 提交**
 
 ```bash
-git add src/nodes src/stores/runStore.ts src/canvas src/styles/studio.css
+git add src/nodes src/stores/runStore.ts src/canvas src/styles/studio.css src/domain/graph/commands.ts docs/superpowers/plans/2026-10-31-p0-canvas-foundation.md
 git commit -m "feat(p0): 七类节点卡片与运行读模型"
 ```
+
+实现补充（三处与初稿不同，按实现为准）：
+
+1. **`toFlowNodes` 去掉 `extent: 'parent'`。** React Flow 的 `extent: 'parent'` 会把子节点**夹在父框内**，而分组框是按子节点实测尺寸算出来的，一旦实测值和渲染值有偏差（卡片高度 151–380px 不等），子节点就会被推到别处。分组子节点的位置由领域层直接维护，不需要 React Flow 再夹一次。
+2. **`toFlowNodes(doc, selectedIds)` 把选中态回灌给 React Flow。** 受控模式下 React Flow 只发 `select` 变更、不认外部传入的 `selected`，多选时第二根节点会把第一根取消选中。回灌 `selected` 后卡片才有选中描边，多选也才能成立。
+3. **`onNodesChange` 合并而不是覆盖选中集。** React Flow 在普通点击时只发「被点中的那一个 `selected: true`」，覆盖式写法会把多选清成单选；合并写法才能累积多选。
+4. **编组时实测子节点尺寸传给 `group` 命令。** 命令原本按固定 300×220 估算子节点尺寸，分组框会算小、子节点溢出框外。`groupSelection` 现在从 DOM 量 `getBoundingClientRect()` 并除以当前 zoom，把真实尺寸塞进命令的 `sizes` 字段。
 
 ---
 
@@ -10409,7 +10453,8 @@ export interface StudioNodeData extends Record<string, unknown> {
 ```
 
 ```ts
-export function toFlowNodes(doc: BoardDoc, stale?: Set<string>): Node<StudioNodeData>[] {
+export function toFlowNodes(doc: BoardDoc, selectedIds: string[] = [], stale?: Set<string>): Node<StudioNodeData>[] {
+  const selected = new Set(selectedIds);
   return Object.values(doc.nodes)
     .slice()
     .sort((a, b) => a.z - b.z)
@@ -10419,11 +10464,11 @@ export function toFlowNodes(doc: BoardDoc, stale?: Set<string>): Node<StudioNode
       position: node.position,
       data: { domain: node, stale: stale?.has(node.id) ?? false },
       parentId: node.parentId,
-      extent: node.parentId ? 'parent' as const : undefined,
       zIndex: node.z,
       style: node.size ? { width: node.size.width, height: node.size.height } : undefined,
       draggable: true,
       selectable: true,
+      selected: selected.has(node.id),
     }));
 }
 ```
@@ -12646,7 +12691,8 @@ function nodeData(node: BoardNode, stale: boolean): StudioNodeData {
   return data;
 }
 
-export function toFlowNodes(doc: BoardDoc, stale?: Set<string>): Node<StudioNodeData>[] {
+export function toFlowNodes(doc: BoardDoc, selectedIds: string[] = [], stale?: Set<string>): Node<StudioNodeData>[] {
+  const selected = new Set(selectedIds);
   return Object.values(doc.nodes)
     .slice()
     .sort((a, b) => a.z - b.z)
@@ -12656,13 +12702,13 @@ export function toFlowNodes(doc: BoardDoc, stale?: Set<string>): Node<StudioNode
       position: node.position,
       data: nodeData(node, stale?.has(node.id) ?? false),
       parentId: node.parentId,
-      extent: node.parentId ? 'parent' as const : undefined,
       zIndex: node.z,
       style: node.size ? { width: node.size.width, height: node.size.height } : undefined,
       draggable: true,
-```
-
-只替换 `data:` 这一行为 `data: nodeData(node, stale?.has(node.id) ?? false),`，其余字段（`draggable` 之后的部分）保持 Task 21 的现状不动。
+      selectable: true,
+      selected: selected.has(node.id),
+    }));
+}
 
 Run: `pnpm test:unit -- src/canvas/mapping`
 Expected: PASS（3 tests）。

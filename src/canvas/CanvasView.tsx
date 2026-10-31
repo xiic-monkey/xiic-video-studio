@@ -1,31 +1,67 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react';
 import {
   Background, Controls, MiniMap, ReactFlow, ReactFlowProvider,
-  type Connection, type EdgeChange, type NodeChange, type NodeTypes,
-  useReactFlow,
+  type Connection, type EdgeChange, type NodeChange, useReactFlow,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
+import { newId } from '../domain/ids';
 import { createNode, edgeRoleFor, getNodeDefinition } from '../domain/nodes/definitions';
 import { makeEdge } from '../domain/graph/commands';
 import { validateConnection } from '../domain/graph/validate';
 import { useBoardStore } from '../stores/boardStore';
+import { useRunStore } from '../stores/runStore';
+import { nodeTypes } from '../nodes/registry';
 import { danglingEdgeCount, nodeColor, toFlowEdges, toFlowNodes } from './mapping';
-import { DefaultNode } from './DefaultNode';
-
-const nodeTypes: NodeTypes = {
-  text: DefaultNode, image: DefaultNode, video: DefaultNode, audio: DefaultNode,
-  script: DefaultNode, note: DefaultNode, group: DefaultNode,
-};
 
 function CanvasInner() {
   const board = useBoardStore((state) => state.board);
   const notice = useBoardStore((state) => state.notice);
-  const { screenToFlowPosition } = useReactFlow();
+  const selectedNodeIds = useBoardStore((state) => state.selectedNodeIds);
+  const selectedIsGroup = useBoardStore((state) => {
+    const id = state.selectedNodeId;
+    return Boolean(id && state.board?.nodes[id]?.type === 'group');
+  });
+  const canUndo = useBoardStore((state) => state.past.length > 0);
+  const canRedo = useBoardStore((state) => state.future.length > 0);
+  const { screenToFlowPosition, getZoom } = useReactFlow();
   const wrapper = useRef<HTMLDivElement>(null);
 
-  const nodes = useMemo(() => (board ? toFlowNodes(board) : []), [board]);
+  const nodes = useMemo(() => (board ? toFlowNodes(board, selectedNodeIds) : []), [board, selectedNodeIds]);
   const edges = useMemo(() => (board ? toFlowEdges(board) : []), [board]);
   const dangling = board ? danglingEdgeCount(board) : 0;
+
+  useEffect(() => {
+    void useRunStore.getState().load(board?.id);
+  }, [board?.id]);
+
+  const groupSelection = useCallback(() => {
+    const store = useBoardStore.getState();
+    if (!store.board || store.selectedNodeIds.length < 2) return;
+    const zoom = getZoom() || 1;
+    const sizes: Record<string, { width: number; height: number }> = {};
+    for (const nodeId of store.selectedNodeIds) {
+      const element = wrapper.current?.querySelector(`.react-flow__node[data-id="${nodeId}"]`);
+      if (!element) continue;
+      const rect = element.getBoundingClientRect();
+      sizes[nodeId] = { width: rect.width / zoom, height: rect.height / zoom };
+    }
+    store.apply({
+      type: 'group',
+      groupId: newId('node'),
+      childIds: store.selectedNodeIds,
+      label: '新分组',
+      sizes,
+    });
+    store.selectMany([]);
+  }, [getZoom]);
+
+  const ungroupSelection = useCallback(() => {
+    const store = useBoardStore.getState();
+    const groupId = store.selectedNodeId;
+    if (!groupId || store.board?.nodes[groupId]?.type !== 'group') return;
+    store.apply({ type: 'ungroup', groupId });
+    store.selectMany([]);
+  }, []);
 
   const onNodesChange = useCallback((changes: NodeChange[]) => {
     for (const change of changes) {
@@ -35,11 +71,14 @@ function CanvasInner() {
         useBoardStore.getState().apply({ type: 'removeNode', nodeId: change.id });
       }
     }
-    const picked = changes.find((change) => change.type === 'select' && change.selected);
-    if (picked && picked.type === 'select') {
-      useBoardStore.getState().select(picked.id);
-    } else if (changes.some((change) => change.type === 'select')) {
-      useBoardStore.getState().select(undefined);
+    const selects = changes.filter((change) => change.type === 'select');
+    if (selects.length) {
+      const next = new Set(useBoardStore.getState().selectedNodeIds);
+      for (const change of selects) {
+        if (change.type !== 'select') continue;
+        if (change.selected) next.add(change.id); else next.delete(change.id);
+      }
+      useBoardStore.getState().selectMany([...next]);
     }
   }, []);
 
@@ -87,7 +126,7 @@ function CanvasInner() {
     const center = rect
       ? screenToFlowPosition({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 })
       : { x: 80, y: 80 };
-    const node = createNode(type, { x: center.x - 150, y: center.y - 100 });
+    const node = createNode(type, { x: center.x - 132, y: center.y - 100 });
     useBoardStore.getState().apply({ type: 'addNode', node });
     useBoardStore.getState().select(node.id);
   }
@@ -95,12 +134,17 @@ function CanvasInner() {
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
       const target = event.target as HTMLElement | null;
-      if (target?.closest('input, textarea, select')) return;
+      if (target?.closest('input, textarea, select, [contenteditable="true"]')) return;
       const store = useBoardStore.getState();
       const meta = event.metaKey || event.ctrlKey;
       if (meta && event.key.toLowerCase() === 'z') {
         event.preventDefault();
         if (event.shiftKey) store.redo(); else store.undo();
+        return;
+      }
+      if (meta && event.key.toLowerCase() === 'g') {
+        event.preventDefault();
+        if (event.shiftKey) ungroupSelection(); else groupSelection();
         return;
       }
       if (meta && event.key.toLowerCase() === 'd') {
@@ -113,17 +157,17 @@ function CanvasInner() {
         }
         return;
       }
-      if ((event.key === 'Delete' || event.key === 'Backspace') && store.selectedNodeId) {
+      if ((event.key === 'Delete' || event.key === 'Backspace') && store.selectedNodeIds.length) {
         event.preventDefault();
-        store.apply({ type: 'removeNode', nodeId: store.selectedNodeId });
-        store.select(undefined);
+        store.applyMany(store.selectedNodeIds.map((nodeId) => ({ type: 'removeNode' as const, nodeId })));
+        store.selectMany([]);
         return;
       }
-      if (event.key === 'Escape') store.select(undefined);
+      if (event.key === 'Escape') store.selectMany([]);
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, []);
+  }, [groupSelection, ungroupSelection]);
 
   useEffect(() => {
     if (!notice) return;
@@ -142,9 +186,12 @@ function CanvasInner() {
             {getNodeDefinition(type)?.title ?? type}
           </button>
         ))}
+        <span className="canvas-toolbar-sep" />
+        <button className="canvas-tool" onClick={groupSelection} disabled={selectedNodeIds.length < 2}>编组</button>
+        <button className="canvas-tool" onClick={ungroupSelection} disabled={!selectedIsGroup}>解组</button>
         <span className="canvas-toolbar-spacer" />
-        <button className="canvas-tool" onClick={() => useBoardStore.getState().undo()} disabled={!useBoardStore.getState().past.length}>撤销</button>
-        <button className="canvas-tool" onClick={() => useBoardStore.getState().redo()} disabled={!useBoardStore.getState().future.length}>重做</button>
+        <button className="canvas-tool" onClick={() => useBoardStore.getState().undo()} disabled={!canUndo}>撤销</button>
+        <button className="canvas-tool" onClick={() => useBoardStore.getState().redo()} disabled={!canRedo}>重做</button>
         {dangling > 0 && <span className="canvas-warning">{dangling} 条断开的引用</span>}
       </div>
       <ReactFlow
