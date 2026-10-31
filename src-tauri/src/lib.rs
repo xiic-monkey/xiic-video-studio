@@ -18,10 +18,13 @@ use tauri::{Manager, State};
 mod assets;
 mod db;
 mod gateway;
+mod jobs;
+mod runs;
 mod security;
 
-struct AppState {
-    db_path: Mutex<PathBuf>,
+pub(crate) struct AppState {
+    pub(crate) db_path: Mutex<PathBuf>,
+    pub(crate) data_dir: PathBuf,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -407,6 +410,35 @@ fn chat_content(value: &Value) -> Option<String> {
 
 fn open_db(path: &PathBuf) -> Result<Connection, String> {
     db::open(path)
+}
+
+/// 资产桶配置：连接参数存在 app_settings，密钥只在 keychain。
+pub(crate) fn asset_host_internal(
+    state: &AppState,
+) -> Result<gateway::transport::AssetHostConfig, String> {
+    let path = state
+        .db_path
+        .lock()
+        .map_err(|_| "Project database lock poisoned".to_string())?;
+    let connection = open_db(&path)?;
+    let stored: Option<String> = connection
+        .query_row(
+            "SELECT value FROM app_settings WHERE key='asset_host'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    let mut config: gateway::transport::AssetHostConfig = match stored {
+        Some(payload) => serde_json::from_str(&payload).unwrap_or_default(),
+        None => gateway::transport::AssetHostConfig::default(),
+    };
+    if let Ok(entry) = Entry::new("com.frameforge.studio", "asset-host/access-key") {
+        config.access_key = entry.get_password().ok();
+    }
+    if let Ok(entry) = Entry::new("com.frameforge.studio", "asset-host/secret-key") {
+        config.secret_key = entry.get_password().ok();
+    }
+    Ok(config)
 }
 
 fn project_identity(project: &Value) -> Result<(String, String), String> {
@@ -2558,6 +2590,7 @@ pub fn run() {
             open_db(&db_path).map_err(std::io::Error::other)?;
             app.manage(AppState {
                 db_path: Mutex::new(db_path),
+                data_dir: app_data.clone(),
             });
             Ok(())
         })

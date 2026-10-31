@@ -3682,7 +3682,8 @@ git commit -m "feat(p0): data URL 与 S3 兼容资产外链传输"
 
 **Files:**
 - Create: `src-tauri/src/runs.rs`
-- Modify: `src-tauri/src/lib.rs`（`mod runs;`；`AppState` 增加 `data_dir: PathBuf`；setup 传入 `app_data`）
+- Create: `src-tauri/src/jobs.rs`（先落 `attach_task` 的任务落库；Task 14 在此文件补轮询）
+- Modify: `src-tauri/src/lib.rs`（`mod runs;` `mod jobs;`；`AppState` 增加 `data_dir` 并改为 `pub(crate)`；setup 传入 `app_data`；新增 `pub(crate) fn asset_host_internal`）
 - Modify: `src-tauri/src/gateway/mod.rs`（无）
 - Test: `src-tauri/src/runs.rs` 内联测试
 
@@ -3971,7 +3972,7 @@ pub async fn execute_run(
             return;
         }
     };
-    let host = crate::commands::load_asset_host_internal(&state).unwrap_or_default();
+    let host = crate::asset_host_internal(&state).unwrap_or_default();
     let inputs = match prepare_inputs(&state, &request, &capability, &host).await {
         Ok(inputs) => inputs,
         Err(error) => { fail_run(&app, &state, &run, error); return; }
@@ -4082,47 +4083,6 @@ fn fail_run(app: &AppHandle, state: &AppState, run: &RunRecord, error: AppError)
     let _ = app.emit("run.updated", &RunUpdatedEvent { run: finished, assets: Vec::new() });
 }
 
-pub fn resume_pending(app: AppHandle, state: &AppState) -> Result<usize, String> {
-    let path = db_path(state)?;
-    let connection = db::open(&path)?;
-    let mut statement = connection.prepare("SELECT id, run_id, provider_id, capability, remote_task_id, payload FROM jobs WHERE status IN ('queued','submitted','polling')")
-        .map_err(|error| error.to_string())?;
-    let rows: Vec<(String, String, String, String, Option<String>, String)> = statement
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    let count = rows.len();
-    for (job_id, run_id, provider_id, capability, remote_task_id, payload) in rows {
-        if remote_task_id.is_none() {
-            if let Ok(mut run) = load_run(state, &run_id) {
-                fail_run(&app, state, &run, AppError::new("TASK_INTERRUPTED", "任务在提交阶段被中断，请重新运行", true));
-                let _ = connection.execute("UPDATE jobs SET status='failed', updated_at=?1 WHERE id=?2", rusqlite::params![chrono::Utc::now().to_rfc3339(), job_id]);
-            }
-            continue;
-        }
-        let request: StartRunRequest = match serde_json::from_str(&payload) {
-            Ok(request) => request,
-            Err(_) => continue,
-        };
-        let key = match crate::load_provider_credential(provider_id.clone()) {
-            Ok(Some(key)) => key,
-            _ => continue,
-        };
-        let profile: gateway::ProviderProfile = match load_provider_profile(state, &provider_id) {
-            Ok(Some(profile)) => profile,
-            _ => continue,
-        };
-        let model = match profile.models.iter().find(|item| item.id == request.model) {
-            Some(model) => model.clone(),
-            None => continue,
-        };
-        let runtime = ProviderRuntime { profile, api_key: key };
-        crate::jobs::resume_poll(app.clone(), state.clone(), run_id, job_id, request, runtime, model, remote_task_id.unwrap(), capability);
-    }
-    Ok(count)
-}
-
 pub fn load_provider_profile(state: &AppState, provider_id: &str) -> Result<Option<gateway::ProviderProfile>, String> {
     let path = db_path(state)?;
     let connection = db::open(&path)?;
@@ -4138,16 +4098,18 @@ pub fn load_provider_profile(state: &AppState, provider_id: &str) -> Result<Opti
 }
 ```
 
-注意：`AppState` 需要 `Clone`，并且 `resume_pending` 里 `state.clone()`；把 `AppState` 的 `db_path` 从 `Mutex<PathBuf>` 改成 `Arc<Mutex<PathBuf>>`，或给 `AppState` 实现 `Clone`（PathBuf clone + new Mutex）。更简单：`resume_poll` 只接收 `PathBuf` 与 `data_dir`，不要 clone AppState。把 `jobs::resume_poll(app, db_path, data_dir, ...)` 的参数改成 `db_path: PathBuf, data_dir: PathBuf`。计划里按后者实现，避免 `AppState: Clone`。
+注意：`resume_pending` 依赖 `jobs::resume_poll`，而 jobs.rs 在 Task 14 才补齐轮询实现，因此 `resume_pending` 整个函数下移到 Task 14 的 `jobs.rs`（它的语义就是「扫表 + 恢复轮询」）。Task 13 只落运行记录与同步执行。
+
+`AppState` 不需要 `Clone`：轮询器只持有 `db_path`/`data_dir` 两个值（它在自己的任务里独立开连接），把 `jobs::resume_poll(app, db_path, data_dir, ...)` 的参数改成 `db_path: PathBuf, data_dir: PathBuf`，避免 `AppState: Clone`。
 
 - [ ] **Step 4: 修改 AppState 与 setup**
 
 `src-tauri/src/lib.rs`：
 
 ```rust
-struct AppState {
-    db_path: Mutex<PathBuf>,
-    data_dir: PathBuf,
+pub(crate) struct AppState {
+    pub(crate) db_path: Mutex<PathBuf>,
+    pub(crate) data_dir: PathBuf,
 }
 ```
 
@@ -4155,6 +4117,29 @@ setup 中：
 
 ```rust
 app.manage(AppState { db_path: Mutex::new(db_path), data_dir: app_data.clone() });
+```
+
+同时在 lib.rs 里加资产桶配置读取（连接参数存 app_settings，密钥只在 keychain；Task 20 的 `save_asset_host`/`load_asset_host` 复用它）：
+
+```rust
+pub(crate) fn asset_host_internal(state: &AppState) -> Result<gateway::transport::AssetHostConfig, String> {
+    let path = state.db_path.lock().map_err(|_| "Project database lock poisoned".to_string())?;
+    let connection = open_db(&path)?;
+    let stored: Option<String> = connection
+        .query_row("SELECT value FROM app_settings WHERE key='asset_host'", [], |row| row.get(0))
+        .ok();
+    let mut config: gateway::transport::AssetHostConfig = match stored {
+        Some(payload) => serde_json::from_str(&payload).unwrap_or_default(),
+        None => gateway::transport::AssetHostConfig::default(),
+    };
+    if let Ok(entry) = Entry::new("com.frameforge.studio", "asset-host/access-key") {
+        config.access_key = entry.get_password().ok();
+    }
+    if let Ok(entry) = Entry::new("com.frameforge.studio", "asset-host/secret-key") {
+        config.secret_key = entry.get_password().ok();
+    }
+    Ok(config)
+}
 ```
 
 并把 `resume_pending` 放在 setup 末尾用 `tauri::async_runtime::spawn` 调用（Task 14 完成 jobs 后）。
@@ -4167,7 +4152,7 @@ Expected: PASS（2 tests）。需要 `uuid` 依赖：在 Cargo.toml 加 `uuid = 
 - [ ] **Step 6: 提交**
 
 ```bash
-git add src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/src/runs.rs src-tauri/src/lib.rs
+git add src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/src/runs.rs src-tauri/src/jobs.rs src-tauri/src/lib.rs
 git commit -m "feat(p0): 运行记录、缓存命中与同步结果落盘"
 ```
 
@@ -4176,7 +4161,8 @@ git commit -m "feat(p0): 运行记录、缓存命中与同步结果落盘"
 ### Task 14: 异步视频轮询、取消与重启恢复
 
 **Files:**
-- Create: `src-tauri/src/jobs.rs`
+- Modify: `src-tauri/src/jobs.rs`（Task 13 已落 `attach_task` 的任务落库，这里补轮询、取消与启动恢复）
+- Modify: `src-tauri/src/runs.rs`（新增 `store_outputs_for_poll`）
 - Modify: `src-tauri/src/lib.rs`（`mod jobs;`；setup 调用 `jobs::resume_pending_on_start`)
 - Test: `src-tauri/src/jobs.rs` 内联测试
 
@@ -4427,9 +4413,78 @@ pub fn cancel(app: &AppHandle, state: &AppState, run_id: &str) {
 }
 
 pub fn resume_pending_on_start(app: AppHandle, state: &AppState) {
-    let _ = runs::resume_pending(app, state);
+    let path = match runs::db_path(state) {
+        Ok(path) => path,
+        Err(_) => return,
+    };
+    let connection = match db::open(&path) {
+        Ok(connection) => connection,
+        Err(_) => return,
+    };
+    let mut statement = match connection.prepare(
+        "SELECT id, run_id, provider_id, remote_task_id, payload FROM jobs WHERE status IN ('submitted','polling')",
+    ) {
+        Ok(statement) => statement,
+        Err(_) => return,
+    };
+    let rows: Vec<(String, String, String, Option<String>, String)> = match statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })
+        .and_then(|mapped| mapped.collect::<Result<Vec<_>, _>>())
+    {
+        Ok(rows) => rows,
+        Err(_) => return,
+    };
+    for (job_id, run_id, provider_id, remote_task_id, payload) in rows {
+        let task_id = match remote_task_id {
+            Some(task_id) => task_id,
+            None => continue,
+        };
+        let request: StartRunRequest = match serde_json::from_str(&payload) {
+            Ok(request) => request,
+            Err(_) => continue,
+        };
+        let key = match crate::load_provider_credential(provider_id.clone()) {
+            Ok(Some(key)) => key,
+            _ => continue,
+        };
+        let profile = match runs::load_provider_profile(state, &provider_id) {
+            Ok(Some(profile)) => profile,
+            _ => continue,
+        };
+        let model = match profile.models.iter().find(|item| item.id == request.model) {
+            Some(model) => model.clone(),
+            None => continue,
+        };
+        let run = match runs::load_run(state, &run_id) {
+            Ok(run) => run,
+            Err(_) => continue,
+        };
+        let runtime = ProviderRuntime { profile, api_key: key };
+        let db_path = path.clone();
+        let data_dir = state.data_dir.clone();
+        let handle = app.clone();
+        let job_id = job_id.clone();
+        tauri::async_runtime::spawn(async move {
+            poll_loop(
+                handle,
+                db_path,
+                data_dir,
+                run,
+                job_id,
+                task_id,
+                request,
+                runtime,
+                model,
+            )
+            .await;
+        });
+    }
 }
 ```
+
+注意：`resume_pending` 从 Task 13 整体下移到本任务——它的语义就是「扫表 + 恢复轮询」，而轮询器只有到本任务才存在。上一版计划把它放在 runs.rs 并调用 `crate::jobs::resume_poll`，Task 13 编译不过；现在改成 jobs.rs 内部直接 spawn `poll_loop`，少一层转发。
 
 轮询器只持有 `db_path`/`data_dir` 两个值（它在自己的任务里独立开连接），而 Task 13 的 `store_outputs` 收的是 `&AppState`。不要重写 `store_outputs` 的内部逻辑，加一层薄适配即可——`AppState` 的两个字段在 Task 13 已是 `pub(crate)`，可以在 jobs.rs 里现场组装：
 
@@ -4455,7 +4510,7 @@ pub(crate) async fn store_outputs_for_poll(
 
 - [ ] **Step 4: 注册模块与启动恢复**
 
-`src-tauri/src/lib.rs` 顶部加 `mod jobs;`、`mod runs;`。setup 末尾：
+`src-tauri/src/lib.rs` 的 `mod jobs;`、`mod runs;` 在 Task 13 已加好，本任务只需在 setup 末尾追加：
 
 ```rust
 {
