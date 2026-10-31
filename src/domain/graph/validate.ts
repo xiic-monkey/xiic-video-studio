@@ -1,11 +1,11 @@
-import { getNodeDefinition, visibleInputPorts } from '../nodes/definitions';
+import { edgeRoleFor, getNodeDefinition, visibleInputPorts } from '../nodes/definitions';
 import type { Issue, NodeContext } from '../nodes/types';
 import type { BoardDoc, BoardEdge, BoardNode, DataType } from '../types';
 import { topoSort } from './topo';
 
 const IMAGE_LIKE = new Set<DataType>(['image', 'frame']);
 
-function compatible(source: DataType, target: DataType): boolean {
+export function compatibleTypes(source: DataType, target: DataType): boolean {
   if (source === 'any' || target === 'any' || source === target) return true;
   return IMAGE_LIKE.has(source) && IMAGE_LIKE.has(target);
 }
@@ -53,15 +53,20 @@ function validateEdge(doc: BoardDoc, item: BoardEdge): Issue[] {
     issues.push({ code: 'GRAPH_UNKNOWN_PORT', message: '连线端口不存在', severity: 'error', nodeId: target.id });
     return issues;
   }
-  if (!compatible(sourcePort.dataType, targetPort.dataType)) {
+  if (targetDef && !visibleInputPorts(targetDef, target).some((port) => port.key === item.targetPort)) {
+    issues.push({ code: 'GRAPH_PORT_HIDDEN', message: '当前节点模式不接受这个端口，请切换模式或改用其他端口', severity: 'error', nodeId: target.id, portKey: item.targetPort });
+    return issues;
+  }
+  if (!compatibleTypes(sourcePort.dataType, targetPort.dataType)) {
     issues.push({ code: 'GRAPH_TYPE_MISMATCH', message: `${sourcePort.label} 不能连接到 ${targetPort.label}`, severity: 'error', nodeId: target.id, portKey: targetPort.key });
   }
   if (targetPort.role && item.role !== targetPort.role) {
     issues.push({ code: 'GRAPH_ROLE_MISMATCH', message: `连线角色应为 ${targetPort.role}`, severity: 'error', nodeId: target.id, portKey: targetPort.key });
   }
   if (!targetPort.multi) {
-    const count = Object.values(doc.edges).filter((other) => other.target === item.target && other.targetPort === item.targetPort).length;
-    if (count > 1) {
+    const others = Object.values(doc.edges).filter((other) =>
+      other.target === item.target && other.targetPort === item.targetPort && other.id !== item.id);
+    if (others.length) {
       issues.push({ code: 'GRAPH_SINGLE_INPUT', message: `${targetPort.label} 只能连接一个来源`, severity: 'error', nodeId: target.id, portKey: targetPort.key });
     }
   }
@@ -108,4 +113,31 @@ function validateVideoMode(doc: BoardDoc, node: BoardNode): Issue[] {
 
 export function nodeIssues(doc: BoardDoc, nodeId: string, ctx: NodeContext): Issue[] {
   return validateBoard(doc, ctx).filter((issue) => issue.nodeId === nodeId);
+}
+
+export function validateConnection(
+  doc: BoardDoc,
+  sourceId: string,
+  sourcePortKey: string,
+  targetId: string,
+  targetPortKey: string,
+): Issue[] {
+  const source = doc.nodes[sourceId];
+  const target = doc.nodes[targetId];
+  if (!source || !target) {
+    return [{ code: 'GRAPH_BROKEN_EDGE', message: '连线的一端不存在', severity: 'error' }];
+  }
+  const sourceDef = getNodeDefinition(source.type);
+  const targetDef = getNodeDefinition(target.type);
+  const sourcePort = sourceDef?.outputs.find((port) => port.key === sourcePortKey);
+  const targetPort = targetDef?.inputs.find((port) => port.key === targetPortKey);
+  if (!sourcePort || !targetPort) {
+    return [{ code: 'GRAPH_UNKNOWN_PORT', message: '端口不存在', severity: 'error', nodeId: targetId, portKey: targetPortKey }];
+  }
+  const probe: BoardEdge = {
+    id: '__probe__', source: sourceId, sourcePort: sourcePortKey,
+    target: targetId, targetPort: targetPortKey,
+    role: edgeRoleFor(sourcePort, targetPort), createdAt: 'probe',
+  };
+  return validateEdge(doc, probe);
 }

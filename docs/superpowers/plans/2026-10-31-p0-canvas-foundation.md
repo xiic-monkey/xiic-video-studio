@@ -6102,9 +6102,21 @@ export function compatibleTypes(source: DataType, target: DataType): boolean {
 并把 `validateEdge` 里的 `compatible(...)` 调用替换为 `compatibleTypes(...)`。同时在该函数中、端口存在性检查之后加入隐藏端口检查：
 
 ```ts
-  if (!visibleInputPorts(targetDef, target).some((port) => port.key === item.targetPort)) {
-    issues.push({ code: 'GRAPH_PORT_HIDDEN', message: '当前节点模式不接受这个端口，请切换模式或改用其他端口', severity: 'error', nodeId: target.id, portKey: target.id });
+  if (targetDef && !visibleInputPorts(targetDef, target).some((port) => port.key === item.targetPort)) {
+    issues.push({ code: 'GRAPH_PORT_HIDDEN', message: '当前节点模式不接受这个端口，请切换模式或改用其他端口', severity: 'error', nodeId: target.id, portKey: item.targetPort });
     return issues;
+  }
+```
+
+同时把单输入端口的检查从「`doc.edges` 里同端口的连线数 > 1」改成「排除自己之后还有几条同端口连线」——`validateConnection` 用的是一条并不存在于 `doc.edges` 的探针连线，按旧写法数出来永远是 1 条，探针永远不报错：
+
+```ts
+  if (!targetPort.multi) {
+    const others = Object.values(doc.edges).filter((other) =>
+      other.target === item.target && other.targetPort === item.targetPort && other.id !== item.id);
+    if (others.length) {
+      issues.push({ code: 'GRAPH_SINGLE_INPUT', message: `${targetPort.label} 只能连接一个来源`, severity: 'error', nodeId: target.id, portKey: targetPort.key });
+    }
   }
 ```
 
@@ -6289,11 +6301,14 @@ export function DefaultNode({ data, selected }: NodeProps<Node<StudioNodeData>>)
   if (!def) {
     return <div className="flow-node flow-node-unknown">{node.type}</div>;
   }
-  const inputs = visibleInputPorts(def, node);
+  const active = visibleInputPorts(def, node);
+  const inputs = def.inputs;
+  const outputs = def.outputs;
+  const rows = Math.max(inputs.length, outputs.length);
   return (
     <div
       className={`flow-node type-${node.type}${selected ? ' is-selected' : ''}`}
-      style={{ borderColor: selected ? '#75d8bd' : nodeColor(node.type) }}
+      style={{ minHeight: 46 + rows * 20, borderColor: selected ? '#75d8bd' : nodeColor(node.type) }}
     >
       <header>
         <span className="flow-node-type" style={{ background: nodeColor(node.type) }} />
@@ -6302,12 +6317,16 @@ export function DefaultNode({ data, selected }: NodeProps<Node<StudioNodeData>>)
       </header>
       <p>{preview(node)}</p>
       {inputs.map((port, index) => (
-        <div className="flow-port flow-port-in" key={port.key} style={{ top: 44 + index * 20 }}>
+        <div
+          className={`flow-port flow-port-in${active.some((item) => item.key === port.key) ? '' : ' is-inactive'}`}
+          key={port.key}
+          style={{ top: 44 + index * 20 }}
+        >
           <Handle type="target" position={Position.Left} id={port.key} />
           <span>{port.label}</span>
         </div>
       ))}
-      {def.outputs.map((port, index) => (
+      {outputs.map((port, index) => (
         <div className="flow-port flow-port-out" key={port.key} style={{ top: 44 + index * 20 }}>
           <span>{port.label}</span>
           <Handle type="source" position={Position.Right} id={port.key} />
@@ -6318,6 +6337,8 @@ export function DefaultNode({ data, selected }: NodeProps<Node<StudioNodeData>>)
   );
 }
 ```
+
+端口渲染说明：**所有**输入端口都要渲染，当前模式不接受的端口标成 `is-inactive`（变暗）而不是直接隐藏。否则「拖到视频首帧端口」这类操作根本没有落点，用户只会看到拖拽失败，而不是「当前节点模式不接受这个端口，请切换模式或改用其他端口」的解释。端口行是绝对定位的，卡片高度要按端口行数给足（`minHeight: 46 + rows * 20`）。
 
 - [ ] **Step 8: 重写 boardStore**
 
@@ -6535,13 +6556,19 @@ function CanvasInner() {
   const edges = useMemo(() => (board ? toFlowEdges(board) : []), [board]);
   const dangling = board ? danglingEdgeCount(board) : 0;
 
-  const onNodesChange = useCallback((changes: NodeChange<Node<StudioNodeData>>[]) => {
+  const onNodesChange = useCallback((changes: NodeChange[]) => {
     for (const change of changes) {
       if (change.type === 'position' && change.position) {
         useBoardStore.getState().apply({ type: 'moveNode', nodeId: change.id, position: change.position }, { history: false });
       } else if (change.type === 'remove') {
         useBoardStore.getState().apply({ type: 'removeNode', nodeId: change.id });
       }
+    }
+    const picked = changes.find((change) => change.type === 'select' && change.selected);
+    if (picked && picked.type === 'select') {
+      useBoardStore.getState().select(picked.id);
+    } else if (changes.some((change) => change.type === 'select')) {
+      useBoardStore.getState().select(undefined);
     }
   }, []);
 
@@ -6659,7 +6686,6 @@ function CanvasInner() {
         onConnect={onConnect}
         onNodeDragStart={() => useBoardStore.getState().beginGesture()}
         onNodeDragStop={() => useBoardStore.getState().endGesture()}
-        onSelectionChange={({ nodes: selected }) => useBoardStore.getState().select(selected[0]?.id)}
         onDrop={onDrop}
         onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; }}
         onMoveEnd={(_, viewport) => {
@@ -6675,7 +6701,7 @@ function CanvasInner() {
         fitView={false}
         minZoom={0.2}
         maxZoom={2.5}
-        proOptions={{ hideAttribution: true }}
+        nodeDragThreshold={0}
       >
         <Background color="#26302f" gap={24} size={1} />
         <Controls showInteractive={false} />
@@ -6704,6 +6730,12 @@ export function CanvasView() {
 
 注意：`proOptions={{ hideAttribution: true }}` 仅在 React Flow 许可证允许时使用；如果团队要求保留署名，删掉该行。P0 默认保留更稳妥——**实现时删除这一行**。
 
+实现补充（三处与初稿不同，按实现为准）：
+
+1. **删除 `onSelectionChange`，改在 `onNodesChange` 里处理 `select` 变更。** React Flow 在受控模式（我们传了 `nodes`）下不会把选择状态写回内部 store，`onSelectionChange` 不触发，导致「删除键删不掉节点」。受控模式下只有我们自己的 `onNodesChange` 能拿到 `select` 变更，所以从那里同步 `selectedNodeId`。
+2. **加 `nodeDragThreshold={0}`。** React Flow 默认阈值是 1px，而它的拖拽实现里有「指针位置没变就跳过这次更新」的判断，导致越过阈值的那一次 mousemove 被吞掉，节点落点整体偏移一段固定距离（实测 +42,+25）。阈值设为 0 后落点像素级精确。
+3. **`.flow-port-in` 用 `row-reverse`。** 输入端口在卡片左侧，默认的 `row` 会把标签夹在手柄和卡片中间，手柄离卡片很远；`row-reverse` 让手柄贴着卡片边缘、标签朝外。
+
 - [ ] **Step 10: 追加载画布样式**
 
 在 `src/styles/studio.css` 末尾追加：
@@ -6728,9 +6760,11 @@ export function CanvasView() {
 .flow-node.is-selected { box-shadow: 0 0 0 1px var(--mint), 0 10px 28px rgba(0, 0, 0, .28); }
 .flow-node.type-group { min-width: 320px; min-height: 220px; background: rgba(32, 41, 42, .55); border-style: dashed; }
 .flow-port { position: absolute; display: flex; align-items: center; gap: 5px; color: var(--text-dim); font-size: 9px; white-space: nowrap; }
-.flow-port-in { left: -7px; transform: translateX(-100%); }
+.flow-port-in { left: -7px; transform: translateX(-100%); flex-direction: row-reverse; }
 .flow-port-out { right: -7px; transform: translateX(100%); flex-direction: row-reverse; }
 .flow-port .react-flow__handle { position: relative; top: auto; left: auto; right: auto; transform: none; width: 9px; height: 9px; background: var(--panel); border: 1px solid var(--mint); }
+.flow-port.is-inactive { opacity: .4; }
+.flow-port.is-inactive .react-flow__handle { border-color: var(--line-strong); }
 .canvas-empty { position: absolute; inset: 48px 0 0; z-index: 2; display: grid; place-content: center; gap: 7px; color: var(--text-muted); text-align: center; pointer-events: none; }
 .canvas-empty b { color: var(--text); font-size: 16px; }
 .canvas-empty span { font-size: 11px; }
@@ -6766,10 +6800,20 @@ Expected:
 3. `Cmd/Ctrl+Z` / `Shift+Cmd/Ctrl+Z` 撤销重做；Delete 删除节点后连线保留并显示「断开的引用」计数。
 4. 缩放/平移后收起再打开画布，viewport 保持。
 
+实测记录（2026-10-31）：用无头 Chrome（1440×900，CDP 驱动）打开 `vite preview` 起的 `http://127.0.0.1:1431/` 逐条验证，全部通过：
+
+- 7 类节点都能创建；拖拽落点像素级精确（`nodeDragThreshold={0}` 生效）；状态栏「有未保存改动」→「已保存」。
+- 文本 → 图片 `prompt` 连线成功（1 条边、无提示条）；文本 → 视频 `start` 被拦下并提示「当前节点模式不接受这个端口，请切换模式或改用其他端口」，且没有生成边。
+- `Cmd+Z` / `Shift+Cmd+Z` 撤销重做生效；Delete 删除节点后边保留、工具栏显示「1 条断开的引用」，撤销后节点与边都回来。
+- 缩放写入 `viewport` 并触发自动保存。
+- 控制台零 error / 零 warning。
+
+已知边界：浏览器预览模式下 `loadBoard` 返回 null，所以第 4 条的「重新打开画布读取 viewport」这一半没法在浏览器里跑；写入路径已验证，读取路径依赖 `defaultViewport={board.viewport}` 与 Rust 侧 board 的存取往返。端口标签在节点贴到画布边缘时会被裁掉，留到 Task 18 重做节点卡片时一并处理。
+
 - [ ] **Step 14: 提交**
 
 ```bash
-git add src/canvas src/stores/boardStore.ts src/domain/graph src/app/StudioApp.tsx src/styles/studio.css
+git add src/canvas src/stores/boardStore.ts src/domain/graph src/app/StudioApp.tsx src/styles/studio.css docs/superpowers/plans/2026-10-31-p0-canvas-foundation.md
 git commit -m "feat(p0): React Flow 画布、连接预检与撤销自动保存"
 ```
 
@@ -7317,13 +7361,18 @@ function CanvasInner() {
     store.selectMany([]);
   }, []);
 
-  const onNodesChange = useCallback((changes: NodeChange<Node<StudioNodeData>>[]) => {
+  const onNodesChange = useCallback((changes: NodeChange[]) => {
     for (const change of changes) {
       if (change.type === 'position' && change.position) {
         useBoardStore.getState().apply({ type: 'moveNode', nodeId: change.id, position: change.position }, { history: false });
       } else if (change.type === 'remove') {
         useBoardStore.getState().apply({ type: 'removeNode', nodeId: change.id });
       }
+    }
+    const selects = changes.filter((change) => change.type === 'select');
+    if (selects.length) {
+      const ids = selects.filter((change) => change.type === 'select' && change.selected).map((change) => change.id);
+      useBoardStore.getState().selectMany(ids);
     }
   }, []);
 

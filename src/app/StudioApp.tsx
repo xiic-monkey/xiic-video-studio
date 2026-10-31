@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { FolderKanban, Plus, Save } from 'lucide-react';
 import { ProjectLibrary } from './ProjectLibrary';
+import { CanvasView } from '../canvas/CanvasView';
 import { useStudioStore } from '../stores/studioStore';
 import { useBoardStore } from '../stores/boardStore';
 
@@ -117,11 +118,7 @@ export function StudioApp() {
 
         <main className="studio-main">
           {board ? (
-            <section className="studio-empty-canvas">
-              <b>{board.name}</b>
-              <span>{Object.keys(board.nodes).length} 个节点 · {Object.keys(board.edges).length} 条连线</span>
-              <span>画布引擎将在 Task 17 接入；当前数据已可自动保存。</span>
-            </section>
+            <CanvasView key={board.id} />
           ) : (
             <ProjectLibrary onOpenBoard={(id) => { void openBoard(id); }} />
           )}
