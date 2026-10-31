@@ -17,6 +17,7 @@ use tauri::{Manager, State};
 
 mod assets;
 mod db;
+mod gateway;
 
 struct AppState {
     db_path: Mutex<PathBuf>,
@@ -381,7 +382,7 @@ async fn provider_json(response: reqwest::Response, label: &str) -> Result<Value
     serde_json::from_str(&raw).map_err(|error| format!("Invalid {label} response: {error}"))
 }
 
-fn http_client() -> Result<Client, String> {
+pub(crate) fn http_client() -> Result<Client, String> {
     Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(180))
