@@ -1,0 +1,46 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;600;700&display=swap');
+
+:root {
+  color-scheme: dark;
+  --bg: #111617;
+  --panel: #151b1c;
+  --panel-2: #1a2223;
+  --panel-3: #20292a;
+  --line: #2c383a;
+  --line-strong: #3a4a4c;
+  --text: #e9f0ee;
+  --text-muted: #9aa9a7;
+  --text-dim: #6f7f7d;
+  --mint: #75d8bd;
+  --mint-strong: #9ae6d0;
+  --warm: #bf7256;
+  --danger: #d87368;
+  --warning: #d8b66a;
+  --radius: 6px;
+  --font-ui: 'Noto Sans SC', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'DM Mono', ui-monospace, monospace;
+  --node-text: #d8b66a;
+  --node-script: #d8b66a;
+  --node-image: #b08ad8;
+  --node-video: #b08ad8;
+  --node-audio: #62c8b4;
+  --node-note: #7f908e;
+  --node-group: #52605e;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; }
+body {
+  margin: 0;
+  color: var(--text);
+  background: var(--bg);
+  font-family: var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+}
+button, input, select, textarea { font: inherit; color: inherit; }
+button { border: 0; cursor: pointer; background: transparent; }
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: 2px solid var(--mint);
+  outline-offset: 2px;
+}
+::selection { background: rgba(117, 216, 189, .28); }

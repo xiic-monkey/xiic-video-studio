@@ -5313,6 +5313,8 @@ git commit -m "feat(p0): 画布/Provider/运行命令与前端桥"
 - Modify: `src/main.tsx`
 - Modify: `index.html`（`<title>` 改为 Frameforge）
 
+> 实施备注：`src/styles/studio.css` 自带 `@import '../ui/tokens.css'`，所以样式由 `src/main.tsx` 统一 `import './styles/studio.css'` 引入，`StudioApp.tsx` 不再单独 import，避免同一份 CSS 被两条路径加载。
+
 **Interfaces:**
 - Consumes: `src/services/tauri.ts` 的项目/画布命令、`newId`、`emptyStyleGuide`。
 - Produces:
@@ -5982,6 +5984,7 @@ export function StudioApp() {
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { StudioApp } from './app/StudioApp';
+import './styles/studio.css';
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode><StudioApp /></React.StrictMode>,
@@ -6004,10 +6007,12 @@ Expected: 工厂测试通过；`tsc -b` 无错。若 `useStudioStore` 在 Node �
 Run: `pnpm tauri dev`
 Expected: 首次启动显示「新建第一个项目」；创建项目后进入项目库，能看到「主画布」并打开；顶栏显示「已保存」。重启应用后项目与画布仍在。
 
+> 实施备注：端口 1420 常年被同机的其它工程占用，`pnpm dev` 会直接报 `Port 1420 is already in use`。验证壳层时可以 `pnpm exec vite --port 1431` 换端口；浏览器里 `isTauri()` 为 false，所有落库调用是空操作，但「新建第一个项目 → 自动建主画布 → 顶栏显示已保存」这条交互链路可以在浏览器里跑通。纯浏览器没有 Tauri 运行时，`window.innerWidth/innerHeight` 为 0，媒体查询会全部落到移动端断点，量桌面栅格时要手动给 `html/body/#root` 写死宽高再看 `gridTemplateColumns`。
+
 - [ ] **Step 12: 提交**
 
 ```bash
-git add src/ui src/app src/stores/studioStore.ts src/styles/studio.css src/main.tsx index.html
+git add src/ui src/app src/stores src/styles/studio.css src/main.tsx index.html docs/superpowers/plans/2026-10-31-p0-canvas-foundation.md
 git commit -m "feat(p0): 画布优先应用壳与项目库"
 ```
 
