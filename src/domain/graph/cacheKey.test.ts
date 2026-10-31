@@ -1,0 +1,46 @@
+import { describe, expect, it } from 'vitest';
+import type { CacheContext } from './cacheKey';
+import { computeCacheKey, selectedAssetOf } from './cacheKey';
+import { edge, makeDoc, node } from './testFixtures';
+import type { RunRecord } from '../types';
+
+function run(partial: Partial<RunRecord>): RunRecord {
+  return {
+    id: 'run_1', projectId: 'project_test', boardId: 'board_test', nodeId: 'a',
+    action: 'generate', cacheKey: 'old', status: 'succeeded', promptSnapshot: { text: '', segments: [], hash: 'h', locked: false },
+    params: {}, inputAssetIds: [], outputAssetIds: ['asset_upstream'], selectedAssetId: 'asset_upstream',
+    startedAt: '2026-10-31T00:00:00.000Z', ...partial,
+  };
+}
+
+const ctx: CacheContext = {
+  runs: [run({ nodeId: 'a' })],
+  runtime: { b: { providerId: 'openai-compatible', model: 'gpt-image-1', params: { size: '1024x1536' } } },
+  promptHashes: { b: 'prompt-hash' },
+};
+
+describe('computeCacheKey', () => {
+  it('is stable regardless of position and ui changes', () => {
+    const doc = makeDoc([node('a', 'text'), node('b', 'image')], [edge('e1', 'a', 'b')]);
+    const moved = { ...doc, nodes: { ...doc.nodes, b: { ...doc.nodes.b, position: { x: 999, y: 999 }, ui: { pinned: false } } } };
+    expect(computeCacheKey(doc, 'b', ctx)).toBe(computeCacheKey(moved, 'b', ctx));
+  });
+
+  it('changes when the upstream selected asset changes', () => {
+    const doc = makeDoc([node('a', 'text'), node('b', 'image')], [edge('e1', 'a', 'b')]);
+    const before = computeCacheKey(doc, 'b', ctx);
+    const changed: CacheContext = { ...ctx, runs: [run({ nodeId: 'a', selectedAssetId: 'asset_other', outputAssetIds: ['asset_upstream', 'asset_other'] })] };
+    expect(computeCacheKey(doc, 'b', changed)).not.toBe(before);
+  });
+
+  it('changes when prompt hash changes', () => {
+    const doc = makeDoc([node('a', 'text'), node('b', 'image')], [edge('e1', 'a', 'b')]);
+    const before = computeCacheKey(doc, 'b', ctx);
+    expect(computeCacheKey(doc, 'b', { ...ctx, promptHashes: { b: 'other-hash' } })).not.toBe(before);
+  });
+
+  it('selects the explicit candidate over the first output', () => {
+    expect(selectedAssetOf(run({ selectedAssetId: 'asset_b', outputAssetIds: ['asset_a', 'asset_b'] }))).toBe('asset_b');
+    expect(selectedAssetOf(run({ selectedAssetId: undefined, outputAssetIds: ['asset_a'] }))).toBe('asset_a');
+  });
+});
