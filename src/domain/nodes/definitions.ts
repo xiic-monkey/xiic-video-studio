@@ -28,7 +28,7 @@ function textNode(): NodeDefinition<TextNodeData> {
       { key: 'mode', label: '模式', type: 'select', options: [{ label: '生成', value: 'generate' }, { label: '改写', value: 'rewrite' }] },
     ],
     createDefaults: () => ({ prompt: '', system: '', mode: 'generate', providerId: '', model: '' }),
-    validate: (node) => (String(node.data.prompt ?? '').trim() ? [] : [missing('PARAM_PROMPT_REQUIRED', '请填写文本提示词')]),
+    validate: () => [],
     actions: [{ key: 'generate', label: '生成文本', capability: 'text.chat' }],
   };
 }

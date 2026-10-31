@@ -45,17 +45,7 @@ export function capabilityLabel(capability: string): string {
   return CAPABILITY_LABEL[capability] ?? capability;
 }
 
-export function capabilityForNode(board: BoardDoc, node: BoardNode): string | undefined {
-  if (node.type === 'text') return 'text.chat';
-  if (node.type === 'image') {
-    const hasReference = Object.values(board.edges).some((edge) =>
-      edge.target === node.id && (edge.targetPort === 'references' || edge.targetPort === 'style'));
-    return hasReference ? 'image.edit' : 'image.generate';
-  }
-  if (node.type === 'video') return 'video.generate';
-  if (node.type === 'audio') return 'audio.tts';
-  return undefined;
-}
+export { runCapability as capabilityForNode } from '../domain/run/runtime';
 
 export interface ModelOption {
   providerId: string;
