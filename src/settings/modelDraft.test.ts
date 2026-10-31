@@ -106,7 +106,9 @@ describe('model draft merge', () => {
     expect(merged[0].id).toBe('gpt-4o-mini');
     expect(merged[0].displayName).toBe('gpt-4o-mini');
     expect(merged[0].capabilities.map((item) => item.capability)).toEqual(['text.chat', 'image.generate']);
-    expect(merged[0].capabilities[0].price).toEqual({ unit: 'image', amount: 0.04, currency: 'USD' });
+    // 已存在的 text.chat 保留自己的价，草稿价只给新增的 image.generate。
+    expect(merged[0].capabilities[0].price).toEqual({ unit: 'request', amount: 0.01, currency: 'USD' });
+    expect(merged[0].capabilities[1].price).toEqual({ unit: 'image', amount: 0.04, currency: 'USD' });
   });
 
   it('keeps the original currency and falls back to the original price', () => {
@@ -124,7 +126,7 @@ describe('model draft merge', () => {
       id: 'cny-chat', displayName: 'CNY 模型', capabilities: ['text.chat'],
       priceAmount: 0.05, priceUnit: 'request',
     }]);
-    expect(priced[0].capabilities[0].price).toEqual({ unit: 'request', amount: 0.05, currency: 'CNY' });
+    expect(priced[0].capabilities[0].price).toEqual({ unit: 'request', amount: 0.02, currency: 'CNY' });
 
     const unpriced = mergeModelDrafts([cnyModel], [{
       id: 'cny-chat', displayName: 'CNY 模型', capabilities: ['text.chat'], priceUnit: 'request',
@@ -217,13 +219,13 @@ describe('model draft merge semantics', () => {
     expect(image?.price).toEqual({ unit: 'image', amount: 0.04, currency: 'USD' });
   });
 
-  it('applies a new draft price to simple capabilities only', () => {
+  it('does not overwrite an existing capability price with the draft price', () => {
     const merged = mergeModelDrafts([mixedModel], [{
       id: 'mixed', displayName: '混合模型', capabilities: ['text.chat'], priceAmount: 0.03, priceUnit: 'request',
     }]);
     const chat = merged[0].capabilities.find((item) => item.capability === 'text.chat');
     const video = merged[0].capabilities.find((item) => item.capability === 'video.generate');
-    expect(chat?.price).toEqual({ unit: 'request', amount: 0.03, currency: 'USD' });
+    expect(chat?.price).toEqual({ unit: 'request', amount: 0.01, currency: 'USD' });
     expect(video?.price).toEqual({ unit: 'second', amount: 0.2, currency: 'USD' });
   });
 
@@ -253,5 +255,121 @@ describe('model draft merge semantics', () => {
       id: 'gpt-4o-mini', displayName: 'GPT-4o mini', capabilities: [], priceUnit: 'request',
     }]);
     expect(merged).toHaveLength(0);
+  });
+});
+
+const multiPriceModel: ModelConfig = {
+  id: 'multi-price',
+  displayName: '多价模型',
+  capabilities: [
+    {
+      capability: 'text.chat', inputTransport: ['dataUrl'], async: false,
+      price: { unit: 'request', amount: 0.01, currency: 'USD' },
+    },
+    {
+      capability: 'image.generate', inputTransport: ['dataUrl'], async: false,
+      price: { unit: 'image', amount: 0.04, currency: 'USD' },
+    },
+  ],
+};
+
+const singlePriceModel: ModelConfig = {
+  id: 'single-price',
+  displayName: '单价模型',
+  capabilities: [
+    {
+      capability: 'text.chat', inputTransport: ['dataUrl'], async: false,
+      price: { unit: 'request', amount: 0.01, currency: 'USD' },
+    },
+    { capability: 'image.generate', inputTransport: ['dataUrl'], async: false },
+  ],
+};
+
+describe('model draft price consistency', () => {
+  it('leaves the draft price empty when the priced capabilities disagree', () => {
+    const draft = draftFromModel(multiPriceModel);
+    expect(draft.capabilities).toEqual(['text.chat', 'image.generate']);
+    expect(draft.priceAmount).toBeUndefined();
+    expect(draft.priceUnit).toBe('request');
+  });
+
+  it('keeps every capability price when the draft is saved without edits', () => {
+    const merged = mergeModelDrafts([multiPriceModel], [draftFromModel(multiPriceModel)]);
+    expect(merged).toHaveLength(1);
+    const chat = merged[0].capabilities.find((item) => item.capability === 'text.chat');
+    const image = merged[0].capabilities.find((item) => item.capability === 'image.generate');
+    expect(chat?.price).toEqual({ unit: 'request', amount: 0.01, currency: 'USD' });
+    expect(image?.price).toEqual({ unit: 'image', amount: 0.04, currency: 'USD' });
+  });
+
+  it('shows the price when only one capability is priced', () => {
+    const draft = draftFromModel(singlePriceModel);
+    expect(draft.priceAmount).toBe(0.01);
+    expect(draft.priceUnit).toBe('request');
+  });
+
+  it('does not add a price to an existing capability that had none', () => {
+    const merged = mergeModelDrafts([singlePriceModel], [{
+      ...draftFromModel(singlePriceModel),
+      priceAmount: 0.02,
+    }]);
+    const chat = merged[0].capabilities.find((item) => item.capability === 'text.chat');
+    const image = merged[0].capabilities.find((item) => item.capability === 'image.generate');
+    expect(chat?.price).toEqual({ unit: 'request', amount: 0.01, currency: 'USD' });
+    expect(image?.price).toBeUndefined();
+  });
+
+  it('gives the draft price to a new capability but keeps the existing prices', () => {
+    const merged = mergeModelDrafts([multiPriceModel], [{
+      ...draftFromModel(multiPriceModel),
+      capabilities: ['text.chat', 'image.generate', 'audio.tts'],
+      priceAmount: 0.02,
+      priceUnit: 'request',
+    }]);
+    expect(merged).toHaveLength(1);
+    const chat = merged[0].capabilities.find((item) => item.capability === 'text.chat');
+    const image = merged[0].capabilities.find((item) => item.capability === 'image.generate');
+    const tts = merged[0].capabilities.find((item) => item.capability === 'audio.tts');
+    expect(chat?.price).toEqual({ unit: 'request', amount: 0.01, currency: 'USD' });
+    expect(image?.price).toEqual({ unit: 'image', amount: 0.04, currency: 'USD' });
+    expect(tts?.price).toEqual({ unit: 'request', amount: 0.02, currency: 'USD' });
+  });
+
+  it('fills the draft price when every priced capability shares the same price', () => {
+    const uniform: ModelConfig = {
+      id: 'uniform',
+      displayName: '同价模型',
+      capabilities: [
+        {
+          capability: 'text.chat', inputTransport: ['dataUrl'], async: false,
+          price: { unit: 'request', amount: 0.01, currency: 'USD' },
+        },
+        {
+          capability: 'image.generate', inputTransport: ['dataUrl'], async: false,
+          price: { unit: 'request', amount: 0.01, currency: 'USD' },
+        },
+      ],
+    };
+    const draft = draftFromModel(uniform);
+    expect(draft.priceAmount).toBe(0.01);
+    expect(draft.priceUnit).toBe('request');
+  });
+
+  it('keeps a zero price instead of treating it as missing', () => {
+    const free: ModelConfig = {
+      id: 'free',
+      displayName: '免费模型',
+      capabilities: [
+        {
+          capability: 'text.chat', inputTransport: ['dataUrl'], async: false,
+          price: { unit: 'request', amount: 0, currency: 'USD' },
+        },
+      ],
+    };
+    const draft = draftFromModel(free);
+    expect(draft.priceAmount).toBe(0);
+
+    const merged = mergeModelDrafts([free], [draft]);
+    expect(merged[0].capabilities[0].price).toEqual({ unit: 'request', amount: 0, currency: 'USD' });
   });
 });
