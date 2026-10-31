@@ -103,7 +103,11 @@ pub fn create_run(state: &AppState, request: &StartRunRequest) -> Result<RunReco
 
 pub fn save_run(state: &AppState, run: &RunRecord) -> Result<(), String> {
     let path = db_path(state)?;
-    let connection = db::open(&path)?;
+    save_run_at(&path, run)
+}
+
+pub(crate) fn save_run_at(path: &PathBuf, run: &RunRecord) -> Result<(), String> {
+    let connection = db::open(path)?;
     let payload = serde_json::to_string(run).map_err(|error| error.to_string())?;
     connection
         .execute(
@@ -402,6 +406,21 @@ async fn store_outputs(
         assets_out.push(asset);
     }
     Ok(assets_out)
+}
+
+/// 轮询器只持有 db_path / data_dir，这里现场组装一个临时 AppState 复用同一条落盘路径。
+pub(crate) async fn store_outputs_for_poll(
+    app: &AppHandle,
+    db_path: &PathBuf,
+    data_dir: &PathBuf,
+    run: &RunRecord,
+    outputs: Vec<gateway::AssetPayload>,
+) -> Result<Vec<AssetRef>, AppError> {
+    let state = crate::AppState {
+        db_path: std::sync::Mutex::new(db_path.clone()),
+        data_dir: data_dir.clone(),
+    };
+    store_outputs(app, &state, run, outputs).await
 }
 
 fn save_asset(state: &AppState, asset: &AssetRef) -> Result<(), AppError> {

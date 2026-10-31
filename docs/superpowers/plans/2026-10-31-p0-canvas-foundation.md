@@ -4219,9 +4219,17 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
+const POLL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const MAX_TRANSIENT_RETRIES: u32 = 8;
+
 pub fn poll_delay(attempt: u32) -> Duration {
     Duration::from_secs(match attempt {
-        0 => 2, 1 => 3, 2 => 5, 3 => 8, 4 => 12, _ => 15,
+        0 => 2,
+        1 => 3,
+        2 => 5,
+        3 => 8,
+        4 => 12,
+        _ => 15,
     })
 }
 
@@ -4234,16 +4242,7 @@ fn db_connection(state: &AppState) -> Result<rusqlite::Connection, String> {
     db::open(&path)
 }
 
-fn set_job(app: &AppHandle, state: &AppState, job_id: &str, status: &str, remote_task_id: Option<&str>, attempts: u32) {
-    if let Ok(connection) = db_connection(state) {
-        let _ = connection.execute(
-            "UPDATE jobs SET status=?1, remote_task_id=COALESCE(?2, remote_task_id), attempts=?3, updated_at=?4 WHERE id=?5",
-            rusqlite::params![status, remote_task_id, attempts, chrono::Utc::now().to_rfc3339(), job_id],
-        );
-    }
-    let _ = app.emit("job.updated", json!({ "id": job_id, "status": status, "attempts": attempts }));
-}
-
+/// 记录已提交到远端的异步任务并启动轮询。
 pub fn attach_task(
     app: &AppHandle,
     state: &AppState,
@@ -4263,7 +4262,13 @@ pub fn attach_task(
             rusqlite::params![job_id, run.id, request.provider_id, request.capability, task_id, payload, chrono::Utc::now().to_rfc3339()],
         );
     }
-    set_job(app, state, job_id, "submitted", Some(task_id), 0);
+    if let Ok(updated) = runs::mark_running(state, &run.id) {
+        let _ = app.emit(
+            "run.updated",
+            &runs::RunUpdatedEvent { run: updated, assets: Vec::new() },
+        );
+    }
+    let _ = app.emit("job.updated", json!({ "id": job_id, "status": "submitted", "attempts": 0 }));
     let app = app.clone();
     let db_path = runs::db_path(state).unwrap_or_default();
     let data_dir = state.data_dir.clone();
@@ -4271,7 +4276,7 @@ pub fn attach_task(
     let job_id = job_id.to_string();
     let task_id = task_id.to_string();
     tauri::async_runtime::spawn(async move {
-        poll_loop(app, db_path, data_dir, run, job_id, task_id, request, runtime, model).await;
+        poll_loop(app, db_path, data_dir, run, job_id, task_id, runtime, model).await;
     });
 }
 
@@ -4282,14 +4287,19 @@ async fn poll_loop(
     run: RunRecord,
     job_id: String,
     task_id: String,
-    request: StartRunRequest,
     runtime: ProviderRuntime,
     model: ModelConfig,
 ) {
     let client = match crate::http_client() {
         Ok(client) => client,
         Err(message) => {
-            finish_failed(&app, &db_path, &run, gateway::AppError::new("UNAVAILABLE_HTTP", message, false));
+            finish_failed(
+                &app,
+                &db_path,
+                &run,
+                gateway::AppError::new("UNAVAILABLE_HTTP", message, false),
+            );
+            set_job_values(&db_path, &job_id, "failed", 0);
             return;
         }
     };
@@ -4300,15 +4310,23 @@ async fn poll_loop(
         if is_cancelled(&db_path, &run.id) {
             let _ = gateway::minimax::cancel(&client, &runtime, &model, &task_id).await;
             finish_cancelled(&app, &db_path, &run);
+            set_job_values(&db_path, &job_id, "cancelled", attempt);
             return;
         }
-        if started.elapsed() > Duration::from_secs(20 * 60) {
-            finish_failed(&app, &db_path, &run, gateway::AppError::new("TIMEOUT_TASK", "视频任务轮询超时", true));
+        if started.elapsed() > POLL_TIMEOUT {
+            finish_failed(
+                &app,
+                &db_path,
+                &run,
+                gateway::AppError::new("TIMEOUT_TASK", "视频任务轮询超时", true),
+            );
+            set_job_values(&db_path, &job_id, "failed", attempt);
             return;
         }
         match gateway::minimax::poll(&client, &runtime, &model, &task_id).await {
             Ok(status) if status.status == "succeeded" => {
-                match crate::runs::store_outputs_for_poll(&app, &db_path, &data_dir, &run, status.outputs).await {
+                match runs::store_outputs_for_poll(&app, &db_path, &data_dir, &run, status.outputs).await
+                {
                     Ok(assets) => finish_succeeded(&app, &db_path, &run, assets),
                     Err(error) => finish_failed(&app, &db_path, &run, error),
                 }
@@ -4316,7 +4334,9 @@ async fn poll_loop(
                 return;
             }
             Ok(status) if status.status == "failed" => {
-                let error = status.error.unwrap_or_else(|| gateway::AppError::new("TASK_FAILED", "视频任务失败", false));
+                let error = status.error.unwrap_or_else(|| {
+                    gateway::AppError::new("TASK_FAILED", "视频任务失败", false)
+                });
                 finish_failed(&app, &db_path, &run, error);
                 set_job_values(&db_path, &job_id, "failed", attempt);
                 return;
@@ -4328,10 +4348,18 @@ async fn poll_loop(
             }
             Ok(status) => {
                 set_job_values(&db_path, &job_id, "polling", attempt);
-                let _ = app.emit("job.updated", json!({ "id": job_id, "status": "polling", "progress": status.progress, "rawStatus": status.raw_status }));
+                let _ = app.emit(
+                    "job.updated",
+                    json!({
+                        "id": job_id,
+                        "status": "polling",
+                        "progress": status.progress,
+                        "rawStatus": status.raw_status,
+                    }),
+                );
                 attempt = attempt.saturating_add(1);
             }
-            Err(error) if error.retryable && attempt < 8 => {
+            Err(error) if error.retryable && attempt < MAX_TRANSIENT_RETRIES => {
                 attempt = attempt.saturating_add(1);
             }
             Err(error) => {
@@ -4355,7 +4383,13 @@ fn set_job_values(db_path: &PathBuf, job_id: &str, status: &str, attempts: u32) 
 fn is_cancelled(db_path: &PathBuf, run_id: &str) -> bool {
     db::open(db_path)
         .ok()
-        .and_then(|connection| connection.query_row("SELECT status FROM runs WHERE id=?1", [run_id], |row| row.get::<_, String>(0)).ok())
+        .and_then(|connection| {
+            connection
+                .query_row("SELECT status FROM runs WHERE id=?1", [run_id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .ok()
+        })
         .map(|status| status == "cancelled")
         .unwrap_or(false)
 }
@@ -4366,14 +4400,11 @@ fn finish_succeeded(app: &AppHandle, db_path: &PathBuf, run: &RunRecord, assets:
     finished.output_asset_ids = assets.iter().map(|asset| asset.id.clone()).collect();
     finished.selected_asset_id = finished.output_asset_ids.first().cloned();
     finished.finished_at = Some(chrono::Utc::now().to_rfc3339());
-    if let Ok(connection) = db::open(db_path) {
-        let payload = serde_json::to_string(&finished).unwrap_or_default();
-        let _ = connection.execute(
-            "UPDATE runs SET status='succeeded', payload=?1, updated_at=?2 WHERE id=?3",
-            rusqlite::params![payload, chrono::Utc::now().to_rfc3339(), finished.id],
-        );
-    }
-    let _ = app.emit("run.updated", &runs::RunUpdatedEvent { run: finished, assets });
+    let _ = runs::save_run_at(db_path, &finished);
+    let _ = app.emit(
+        "run.updated",
+        &runs::RunUpdatedEvent { run: finished, assets },
+    );
 }
 
 fn finish_failed(app: &AppHandle, db_path: &PathBuf, run: &RunRecord, error: gateway::AppError) {
@@ -4381,37 +4412,34 @@ fn finish_failed(app: &AppHandle, db_path: &PathBuf, run: &RunRecord, error: gat
     finished.status = "failed".to_string();
     finished.error = Some(error);
     finished.finished_at = Some(chrono::Utc::now().to_rfc3339());
-    if let Ok(connection) = db::open(db_path) {
-        let payload = serde_json::to_string(&finished).unwrap_or_default();
-        let _ = connection.execute(
-            "UPDATE runs SET status='failed', payload=?1, updated_at=?2 WHERE id=?3",
-            rusqlite::params![payload, chrono::Utc::now().to_rfc3339(), finished.id],
-        );
-    }
-    let _ = app.emit("run.updated", &runs::RunUpdatedEvent { run: finished, assets: Vec::new() });
+    let _ = runs::save_run_at(db_path, &finished);
+    let _ = app.emit(
+        "run.updated",
+        &runs::RunUpdatedEvent { run: finished, assets: Vec::new() },
+    );
 }
 
 fn finish_cancelled(app: &AppHandle, db_path: &PathBuf, run: &RunRecord) {
     let mut finished = run.clone();
     finished.status = "cancelled".to_string();
     finished.finished_at = Some(chrono::Utc::now().to_rfc3339());
-    if let Ok(connection) = db::open(db_path) {
-        let payload = serde_json::to_string(&finished).unwrap_or_default();
-        let _ = connection.execute(
-            "UPDATE runs SET status='cancelled', payload=?1, updated_at=?2 WHERE id=?3",
-            rusqlite::params![payload, chrono::Utc::now().to_rfc3339(), finished.id],
-        );
-    }
-    let _ = app.emit("run.updated", &runs::RunUpdatedEvent { run: finished, assets: Vec::new() });
+    let _ = runs::save_run_at(db_path, &finished);
+    let _ = app.emit(
+        "run.updated",
+        &runs::RunUpdatedEvent { run: finished, assets: Vec::new() },
+    );
 }
 
 pub fn cancel(app: &AppHandle, state: &AppState, run_id: &str) {
-    if let Ok(run) = runs::load_run(state, run_id) {
-        let _ = runs::mark_cancelled(state, run_id);
-        let _ = app.emit("run.updated", &runs::RunUpdatedEvent { run, assets: Vec::new() });
+    if let Ok(run) = runs::mark_cancelled(state, run_id) {
+        let _ = app.emit(
+            "run.updated",
+            &runs::RunUpdatedEvent { run, assets: Vec::new() },
+        );
     }
 }
 
+/// 启动时恢复未完成的远端任务：已有远端 task_id 的续轮询，没拿到 task_id 的判定为提交中断。
 pub fn resume_pending_on_start(app: AppHandle, state: &AppState) {
     let path = match runs::db_path(state) {
         Ok(path) => path,
@@ -4422,28 +4450,44 @@ pub fn resume_pending_on_start(app: AppHandle, state: &AppState) {
         Err(_) => return,
     };
     let mut statement = match connection.prepare(
-        "SELECT id, run_id, provider_id, remote_task_id, payload FROM jobs WHERE status IN ('submitted','polling')",
+        "SELECT id, run_id, provider_id, status, remote_task_id, payload FROM jobs WHERE status IN ('queued','submitted','polling')",
     ) {
         Ok(statement) => statement,
         Err(_) => return,
     };
-    let rows: Vec<(String, String, String, Option<String>, String)> = match statement
+    let rows: Vec<(String, String, String, String, Option<String>, String)> = match statement
         .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
         })
         .and_then(|mapped| mapped.collect::<Result<Vec<_>, _>>())
     {
         Ok(rows) => rows,
         Err(_) => return,
     };
-    for (job_id, run_id, provider_id, remote_task_id, payload) in rows {
-        let task_id = match remote_task_id {
-            Some(task_id) => task_id,
-            None => continue,
-        };
+    for (job_id, run_id, provider_id, status, remote_task_id, payload) in rows {
         let request: StartRunRequest = match serde_json::from_str(&payload) {
             Ok(request) => request,
             Err(_) => continue,
+        };
+        if !should_resume(&status, remote_task_id.as_deref()) {
+            if let Ok(run) = runs::load_run(state, &run_id) {
+                finish_failed(
+                    &app,
+                    &path,
+                    &run,
+                    gateway::AppError::new(
+                        "TASK_INTERRUPTED",
+                        "任务在提交阶段被中断，请重新运行",
+                        true,
+                    ),
+                );
+                set_job_values(&path, &job_id, "failed", 0);
+            }
+            continue;
+        }
+        let task_id = match remote_task_id {
+            Some(task_id) => task_id,
+            None => continue,
         };
         let key = match crate::load_provider_credential(provider_id.clone()) {
             Ok(Some(key)) => key,
@@ -4462,24 +4506,33 @@ pub fn resume_pending_on_start(app: AppHandle, state: &AppState) {
             Err(_) => continue,
         };
         let runtime = ProviderRuntime { profile, api_key: key };
+        let handle = app.clone();
         let db_path = path.clone();
         let data_dir = state.data_dir.clone();
-        let handle = app.clone();
-        let job_id = job_id.clone();
         tauri::async_runtime::spawn(async move {
-            poll_loop(
-                handle,
-                db_path,
-                data_dir,
-                run,
-                job_id,
-                task_id,
-                request,
-                runtime,
-                model,
-            )
-            .await;
+            poll_loop(handle, db_path, data_dir, run, job_id, task_id, runtime, model).await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_grows_then_caps() {
+        assert_eq!(poll_delay(0), std::time::Duration::from_secs(2));
+        assert_eq!(poll_delay(1), std::time::Duration::from_secs(3));
+        assert_eq!(poll_delay(2), std::time::Duration::from_secs(5));
+        assert_eq!(poll_delay(9), std::time::Duration::from_secs(15));
+    }
+
+    #[test]
+    fn resume_only_when_remote_task_exists() {
+        assert!(!should_resume("queued", None));
+        assert!(should_resume("submitted", Some("task_1")));
+        assert!(should_resume("polling", Some("task_1")));
+        assert!(!should_resume("succeeded", Some("task_1")));
     }
 }
 ```
@@ -4506,22 +4559,11 @@ pub(crate) async fn store_outputs_for_poll(
 }
 ```
 
-`succeed_run`/`fail_run` 的事件发送仍留在 runs.rs 的同步路径里，poller 用 jobs.rs 自己的 `finish_succeeded`/`finish_failed`（上面已给出），两者互不复用。
+`succeed_run`/`fail_run` 的事件发送仍留在 runs.rs 的同步路径里，poller 用 jobs.rs 自己的 `finish_succeeded`/`finish_failed`（上面已给出），两者互不复用事件发送，但**落盘走同一条路径**：jobs.rs 调 `runs::save_run_at(db_path, &run)`，所以 Task 13 的 `save_run` 要拆成「按 AppState 取路径」和「按路径写」两层。
 
 - [ ] **Step 4: 注册模块与启动恢复**
 
 `src-tauri/src/lib.rs` 的 `mod jobs;`、`mod runs;` 在 Task 13 已加好，本任务只需在 setup 末尾追加：
-
-```rust
-{
-    let handle = app.handle().clone();
-    let state = app.state::<AppState>();
-    // AppState 不能 clone；在 setup 内直接调用同步扫描，轮询任务内部自行拿连接
-    jobs::resume_pending_on_start(handle, &state);
-}
-```
-
-`app.state::<AppState>()` 在 setup 闭包内是同步借用的，`resume_pending_on_start` 又是同步函数（内部只做「扫表 + spawn」），所以这个写法成立，不要为了它再加一个 `resume_from_paths`。若编译真的报 `State<'_, AppState>` 生命周期问题，唯一允许的方向是在 setup 里把两个字段拷出来再组装一个临时 owned `AppState` 传进去：
 
 ```rust
 {
@@ -4535,6 +4577,11 @@ pub(crate) async fn store_outputs_for_poll(
 }
 ```
 
+`app.state::<AppState>()` 在 setup 闭包内是同步借用的，`resume_pending_on_start` 又是同步函数（内部只做「扫表 + spawn」），但 `State<'_, AppState>` 带生命周期，不能直接传进需要 `&AppState` 的函数——所以按上面的兜底写法把两个字段拷出来组装一个临时 owned `AppState`。setup 返回 `Result` 时 `?` 可用；不要用 `unwrap` 让启动崩掉。
+    jobs::resume_pending_on_start(handle, &owned);
+}
+```
+
 注意这段只作为编译兜底：`setup` 返回 `Result` 时才能用 `?`，若当前 setup 是 `Ok(())` 结尾就把它包进 `if let Ok(...)`，不要用 `unwrap` 让启动崩掉。
 
 - [ ] **Step 5: 运行测试**
@@ -4542,10 +4589,12 @@ pub(crate) async fn store_outputs_for_poll(
 Run: `cargo test --manifest-path src-tauri/Cargo.toml jobs::tests`
 Expected: PASS（2 tests）。`store_outputs_for_poll` 已在上一步给出实现，若仍报未定义，检查它是否写在 `runs.rs` 且是 `pub(crate)`，不要改成公开 API。
 
+`tokio::time::sleep` 需要 tokio 的 `time` feature：Cargo.toml 改成 `tokio = { version = "1", features = ["sync", "macros", "rt", "time"] }`。
+
 - [ ] **Step 6: 提交**
 
 ```bash
-git add src-tauri/src/jobs.rs src-tauri/src/runs.rs src-tauri/src/lib.rs
+git add src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/src/jobs.rs src-tauri/src/runs.rs src-tauri/src/lib.rs
 git commit -m "feat(p0): 异步视频轮询、取消与启动恢复"
 ```
 

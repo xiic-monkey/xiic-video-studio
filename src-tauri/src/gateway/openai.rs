@@ -182,7 +182,7 @@ fn decode_data_input(value: &str) -> Result<(String, Vec<u8>), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gateway::{CapabilityRequest, PreparedInput, ProviderRuntime};
+    use crate::gateway::{CapabilityRequest, ProviderRuntime};
     use serde_json::json;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

@@ -2592,6 +2592,21 @@ pub fn run() {
                 db_path: Mutex::new(db_path),
                 data_dir: app_data.clone(),
             });
+            {
+                let handle = app.handle().clone();
+                let state = app.state::<AppState>();
+                let owned = AppState {
+                    db_path: Mutex::new(
+                        state
+                            .db_path
+                            .lock()
+                            .map_err(|_| "db lock poisoned".to_string())?
+                            .clone(),
+                    ),
+                    data_dir: state.data_dir.clone(),
+                };
+                jobs::resume_pending_on_start(handle, &owned);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
