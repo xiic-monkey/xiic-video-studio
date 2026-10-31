@@ -7,7 +7,7 @@ vi.mock('@tauri-apps/api/core', () => ({
   convertFileSrc: (path: string) => `file://${path}`,
 }));
 
-import { makeDoc, node } from '../domain/graph/testFixtures';
+import { makeDoc, edge, node } from '../domain/graph/testFixtures';
 import { TEST_KEYS, TEST_PROFILES, assetRef, succeededRun, testProject } from '../domain/run/runFixtures';
 import type { BoardDoc, RunRecord } from '../domain/types';
 import { useBoardStore } from '../stores/boardStore';
@@ -48,8 +48,12 @@ beforeEach(() => {
   invoke.mockReset();
   dbRuns = [];
   enableTauri();
-  invoke.mockImplementation(async (cmd: string, args?: { request: StartRunPayload }) => {
+  invoke.mockImplementation(async (cmd: string, args?: { request: StartRunPayload; assetId?: string }) => {
     if (cmd === 'list_runs') return dbRuns;
+    if (cmd === 'read_asset_text') {
+      if (args?.assetId === 'asset_missing') throw new Error('资产文件缺失');
+      return '上游文本';
+    }
     if (cmd === 'start_run') {
       const request = args!.request;
       const run: RunRecord = {
@@ -173,5 +177,70 @@ describe('run controller', () => {
     useRunStore.getState().upsertRun({ ...done, status: 'running' });
 
     expect(useRunStore.getState().runs[done.id].status).toBe('succeeded');
+  });
+
+  it('blocks the run and logs a warning when an upstream text cannot be read', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const upstream = succeededRun('t', 'asset_missing');
+    useRunStore.setState({
+      runs: { [upstream.id]: upstream },
+      latestByNode: { t: upstream.id },
+      assets: { asset_missing: assetRef('asset_missing', 'text', 'text/plain') },
+    });
+    loadBoard(makeDoc(
+      [node('t', 'text', { prompt: '上游' }), node('i', 'image', { prompt: '海报' })],
+      [edge('e1', 't', 'i', 'text', 'prompt', 'prompt')],
+    ));
+
+    await useRunController.getState().requestRun('i');
+
+    expect(useBoardStore.getState().notice).toBe('上游「文本 / LLM」的文本读取失败或为空，请先重新运行该上游节点');
+    expect(useRunController.getState().pending).toBeUndefined();
+    expect(startCalls()).toHaveLength(0);
+    expect(warn).toHaveBeenCalled();
+  });
+
+  it('blocks the run when an upstream node has no usable output yet', async () => {
+    loadBoard(makeDoc(
+      [node('t', 'text', { prompt: '上游' }), node('i', 'image', { prompt: '海报' })],
+      [edge('e1', 't', 'i', 'text', 'prompt', 'prompt')],
+    ));
+
+    await useRunController.getState().requestRun('i');
+
+    expect(useBoardStore.getState().notice).toBe('上游「文本 / LLM」还没有可用结果，请先运行该上游节点');
+    expect(useRunController.getState().pending).toBeUndefined();
+    expect(startCalls()).toHaveLength(0);
+  });
+
+  it('drops the pending run when the board changed before confirming', async () => {
+    loadBoard(makeDoc([node('i', 'image', { prompt: '海报' })], []));
+
+    await useRunController.getState().requestRun('i');
+    expect(useRunController.getState().pending).toBeDefined();
+
+    loadBoard({ ...makeDoc([node('j', 'image', { prompt: '另一张' })], []), id: 'board_other' });
+    await useRunController.getState().confirmRun();
+
+    expect(startCalls()).toHaveLength(0);
+    expect(useRunController.getState().pending).toBeUndefined();
+    expect(useBoardStore.getState().notice).toBe('画布已切换，本次运行已取消');
+    expect(Object.keys(useRunStore.getState().runs)).toHaveLength(0);
+  });
+
+  it('ignores another run request while a confirmation is pending', async () => {
+    loadBoard(makeDoc(
+      [node('i', 'image', { prompt: '海报' }), node('j', 'image', { prompt: '另一张' })],
+      [],
+    ));
+
+    await useRunController.getState().requestRun('i');
+    const pending = useRunController.getState().pending;
+
+    await useRunController.getState().requestRun('j');
+
+    expect(useRunController.getState().pending).toBe(pending);
+    expect(pending?.nodeId).toBe('i');
+    expect(startCalls()).toHaveLength(0);
   });
 });

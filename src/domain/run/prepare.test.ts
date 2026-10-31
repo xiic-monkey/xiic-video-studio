@@ -86,6 +86,27 @@ describe('prepareRun', () => {
     expect(outcome.request.promptSnapshot.text).toBe('写分镜');
   });
 
+  it('appends the upstream system prompt after the local one instead of replacing it', () => {
+    const doc = makeDoc(
+      [node('s', 'text'), node('t', 'text', { prompt: '写分镜', system: '本地系统提示' })],
+      [edge('e1', 's', 't', 'text', 'system', 'prompt')],
+    );
+    const outcome = prepareRun(doc, 't', deps({
+      runs: [succeededRun('s', 'asset_sys')],
+      texts: { asset_sys: '你是短剧编剧' },
+    }));
+    if (!outcome.ok) throw new Error('expected ok');
+    expect(outcome.request.params.system).toBe('本地系统提示\n\n你是短剧编剧');
+    expect(outcome.request.promptSnapshot.text).toBe('写分镜');
+  });
+
+  it('keeps the local system prompt when no upstream system is connected', () => {
+    const doc = makeDoc([node('t', 'text', { prompt: '写分镜', system: '本地系统提示' })], []);
+    const outcome = prepareRun(doc, 't', deps());
+    if (!outcome.ok) throw new Error('expected ok');
+    expect(outcome.request.params.system).toBe('本地系统提示');
+  });
+
   it('refuses a public-url-only model when the asset host is not configured', () => {
     const doc = makeDoc(
       [node('f', 'image'), videoNode('v', { mode: 'firstLast', prompt: '镜头推进' })],
@@ -162,14 +183,33 @@ describe('prepareRun', () => {
     expect(second.request.cacheKey).toBe(first.request.cacheKey);
   });
 
-  it('warns when an upstream node has no usable output yet', () => {
+  it('blocks the run when an upstream node has no usable output yet', () => {
     const doc = makeDoc(
       [node('t', 'text', { prompt: '上游' }), node('i', 'image', { prompt: '海报' })],
       [edge('e1', 't', 'i', 'text', 'prompt', 'prompt')],
     );
     const outcome = prepareRun(doc, 'i', deps());
-    if (!outcome.ok) throw new Error('expected ok');
-    expect(outcome.warnings.map((issue) => issue.code)).toContain('RUN_UPSTREAM_MISSING');
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.issues.map((issue) => issue.code)).toContain('RUN_UPSTREAM_MISSING');
+      expect(outcome.issues[0].message).toContain('上游「文本 / LLM」还没有可用结果，请先运行该上游节点');
+    }
+  });
+
+  it('blocks the run when an upstream text cannot be read', () => {
+    const doc = makeDoc(
+      [node('t', 'text', { prompt: '上游' }), node('i', 'image', { prompt: '海报' })],
+      [edge('e1', 't', 'i', 'text', 'prompt', 'prompt')],
+    );
+    const outcome = prepareRun(doc, 'i', deps({
+      runs: [succeededRun('t', 'asset_text')],
+      texts: { asset_text: '   ' },
+    }));
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.issues.map((issue) => issue.code)).toContain('RUN_UPSTREAM_TEXT_EMPTY');
+      expect(outcome.issues[0].message).toContain('上游「文本 / LLM」的文本读取失败或为空，请先重新运行该上游节点');
+    }
   });
 
   it('returns the graph error when the node itself is invalid', () => {

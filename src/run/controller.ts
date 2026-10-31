@@ -11,6 +11,7 @@ import { useRunStore } from '../stores/runStore';
 import { useStudioStore } from '../stores/studioStore';
 
 export interface PendingRun {
+  boardId: string;
   nodeId: string;
   request: RunRequestDraft;
   label: RunLabel;
@@ -42,7 +43,10 @@ async function readTexts(assetIds: string[]): Promise<Record<string, string>> {
       const value = await readAssetText(assetId);
       textCache.set(assetId, value);
       out[assetId] = value;
-    } catch {
+    } catch (error) {
+      // 读取失败与「内容本来为空」要能区分：留一条日志，运行前由 domain 拦截。
+      // 只记录资产 id 与错误信息，不打印 API Key，也不打印资产内容。
+      console.warn('[run] 读取上游文本失败', { assetId, message: messageOf(error) });
       out[assetId] = '';
     }
   }));
@@ -78,6 +82,9 @@ export const useRunController = create<RunControllerState>((set, get) => ({
   busy: {},
 
   async requestRun(nodeId) {
+    // 确认框打开期间不再接受新的运行请求：背景里的「运行」按钮此时是失效的，
+    // 避免 Enter 之类的按键重复发起运行、替换掉正在等待确认的那一次。
+    if (get().pending) return;
     const doc = useBoardStore.getState().board;
     if (!doc) return;
     set((state) => ({ busy: { ...state.busy, [nodeId]: true } }));
@@ -91,13 +98,14 @@ export const useRunController = create<RunControllerState>((set, get) => ({
       }
       if (outcome.cached) {
         const run = await startRun(outcome.request);
+        // 只回写这条运行记录：load() 会清空素材表（assets），不能在这里调用。
         useRunStore.getState().upsertRun(run);
-        await useRunStore.getState().load(doc.id);
         notify('缓存命中，未产生费用');
         return;
       }
       set({
         pending: {
+          boardId: doc.id,
           nodeId,
           request: outcome.request,
           label: outcome.label,
@@ -116,6 +124,13 @@ export const useRunController = create<RunControllerState>((set, get) => ({
   async confirmRun() {
     const pending = get().pending;
     if (!pending) return;
+    const currentBoardId = useBoardStore.getState().board?.id;
+    if (currentBoardId !== pending.boardId) {
+      // 画板已经切换：丢弃这次待确认的运行，不要用旧画板的请求发起运行。
+      set({ pending: undefined });
+      notify('画布已切换，本次运行已取消');
+      return;
+    }
     set({ pending: undefined, busy: { ...get().busy, [pending.nodeId]: true } });
     try {
       const run = await startRun(pending.request);

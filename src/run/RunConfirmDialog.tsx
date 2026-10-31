@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react';
 import type { RunRequestDraft } from '../domain/run/prepare';
 import { useRunController } from './controller';
 
@@ -35,12 +36,36 @@ export function RunConfirmDialog() {
   const pending = useRunController((state) => state.pending);
   const confirmRun = useRunController((state) => state.confirmRun);
   const dismissRun = useRunController((state) => state.dismissRun);
+  const dialogRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!pending) return;
+    const dialog = dialogRef.current;
+    // 焦点移进确认框，背景里那个「运行」按钮就不再是活动焦点。
+    dialog?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        dismissRun();
+        return;
+      }
+      if (event.key !== 'Enter') return;
+      // Enter 只允许在确认框内部生效，背景按钮不得被再次触发（否则会重复发起运行）。
+      const target = event.target as Node | null;
+      if (target && dialog?.contains(target)) return;
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [pending, dismissRun]);
 
   if (!pending) return null;
 
   return (
     <div className="confirm-backdrop" role="dialog" aria-modal="true" aria-label="运行确认">
-      <div className="confirm-dialog">
+      <div className="confirm-dialog" ref={dialogRef} tabIndex={-1}>
         <header>
           <h2>运行「{pending.label.nodeTitle}」</h2>
           <p className="confirm-sub">这次会真实调用模型并产生费用。</p>

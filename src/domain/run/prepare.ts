@@ -139,7 +139,12 @@ export function prepareRun(doc: BoardDoc, nodeId: string, deps: PrepareDeps): Pr
   for (const item of items) {
     if (item.kind === 'text' || item.kind === 'json') {
       const value = (deps.texts[item.assetId] ?? '').trim();
-      if (!value) continue;
+      if (!value) {
+        // 上游文本读取失败或为空：花钱前拦住，并且不把这条变量写进 prompt。
+        const sourceTitle = getNodeDefinition(doc.nodes[item.edge.source]?.type ?? '')?.title ?? item.edge.source;
+        issues.push(error('RUN_UPSTREAM_TEXT_EMPTY', `上游「${sourceTitle}」的文本读取失败或为空，请先重新运行该上游节点`));
+        continue;
+      }
       const key = item.edge.targetPort;
       variables[key] = variables[key] ? `${variables[key]}\n\n${value}` : value;
       if (key === 'prompt') variables.text = variables.prompt;
@@ -154,8 +159,8 @@ export function prepareRun(doc: BoardDoc, nodeId: string, deps: PrepareDeps): Pr
       const sourceTitle = getNodeDefinition(doc.nodes[edge.source]?.type ?? '')?.title ?? edge.source;
       issues.push({
         code: 'RUN_UPSTREAM_MISSING',
-        message: `上游「${sourceTitle}」还没有可用结果，本次会忽略这条连线`,
-        severity: 'warning',
+        message: `上游「${sourceTitle}」还没有可用结果，请先运行该上游节点`,
+        severity: 'error',
       });
     }
   }
@@ -189,7 +194,11 @@ export function prepareRun(doc: BoardDoc, nodeId: string, deps: PrepareDeps): Pr
   }
 
   const params = nodeParams(node, capability);
-  if (variables.system) params.system = variables.system;
+  // 节点里写的系统提示在前，上游带来的系统提示在后（不再整段覆盖本地的）。
+  const localSystem = String(params.system ?? '').trim();
+  const upstreamSystem = String(variables.system ?? '').trim();
+  if (localSystem && upstreamSystem) params.system = `${localSystem}\n\n${upstreamSystem}`;
+  else if (upstreamSystem) params.system = upstreamSystem;
   if (capability === 'audio.tts') params.text = finalText;
 
   if (capability === 'video.generate') {
