@@ -9,6 +9,8 @@ use tauri::{AppHandle, Manager, State};
 mod assets;
 mod db;
 mod gateway;
+// 旧项目导入（纯映射）；命令注册与素材下载在下一段接入。
+mod import;
 mod jobs;
 mod runs;
 mod security;
