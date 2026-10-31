@@ -27,7 +27,20 @@ export interface ReviewBatch { id: string; number: number; shotIds: string[]; st
 export interface ProjectExport { id: string; path: string; thumbnailPath?: string; format: 'mp4'; kind?: 'final' | 'batch-preview'; aspectRatio: AspectRatio; clipCount: number; duration: number; createdAt: string; }
 export interface Project { id: string; name: string; logline: string; aspectRatio: AspectRatio; source?: SourceDocument; chapters: Chapter[]; episodes?: Episode[]; styleGuide: StyleGuide; characters: Character[]; scenes: Scene[]; shots: Shot[]; timeline?: TimelineClip[]; prompts: PromptRevision[]; candidates: CandidateAsset[]; storyboards?: StoryboardAsset[]; referenceBindings?: ReferenceBinding[]; qcReports?: MediaQcReport[]; reviewBatches?: ReviewBatch[]; jobs: GenerationJob[]; audioTracks: AudioTrack[]; subtitles?: SubtitleCue[]; exports?: ProjectExport[]; }
 
-export interface ProviderCapabilities { text: boolean; image: boolean; video: boolean; voice: boolean; music: boolean; soundEffect: boolean; referenceImages: boolean; supportedRatios: AspectRatio[]; maxCandidates: number; }
+export interface ProviderCapabilities {
+  text: boolean;
+  image: boolean;
+  video: boolean;
+  voice: boolean;
+  music: boolean;
+  soundEffect: boolean;
+  referenceImages: boolean;
+  supportedRatios: AspectRatio[];
+  maxCandidates: number;
+  asyncTasks?: boolean;
+  firstLastFrames?: boolean;
+  nativeAudio?: boolean;
+}
 export interface ProviderProfile { id: string; name: string; model: string; mode: 'ready' | 'configure'; capabilities: ProviderCapabilities; }
 
 export const stageNames = ['故事', '角色', '分镜', '素材', '合成', '画布'] as const;

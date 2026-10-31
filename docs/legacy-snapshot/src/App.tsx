@@ -4,9 +4,10 @@ import { open, save } from '@tauri-apps/plugin-dialog';
 import {
   ArrowDown, ArrowUp, ArrowUpRight, BookOpenText, Captions, Check, ChevronDown, ChevronRight, Clapperboard,
   Clock3, Copy, Download, FileText, Film, FolderOpen, Gauge, ImagePlus, Layers3, Menu, MoreHorizontal,
-  Mic2, Music2, PanelLeftClose, Play, Plus, RotateCcw, ScanFace, Settings2, SlidersHorizontal,
+  Mic2, Music2, PanelLeftClose, Pause, Play, Plus, RotateCcw, ScanFace, Settings2, SlidersHorizontal,
   Sparkles, Upload, Video, Volume2, WandSparkles, X, Workflow, ZoomIn, ZoomOut, Maximize2,
-  RefreshCw, AlertTriangle, Eye, EyeOff, RotateCw,
+  RefreshCw, AlertTriangle, Eye, EyeOff, RotateCw, CheckCircle2, CircleAlert, CircleDashed, ListChecks,
+  SkipBack, SkipForward, Trash2, LockKeyhole,
 } from 'lucide-react';
 import { demoProject, providers } from './demo';
 import { appendGenerationTaskId, cancelVideoGeneration, enqueueGenerationJob, exportFinalCut, exportProjectPackage, generateGptImage, generateSpeech, generateText, importProjectPackage, listGenerationJobs, listProjects, listProviderSettings, loadCurrentProjectId, loadProject, loadProviderCredential, pollVideoGeneration, runMediaQc, saveCurrentProjectId, saveProject, saveProviderCredential, saveProviderSettings, storeAudioAsset, storeMediaAsset, submitVideoGeneration, updateGenerationJobStatus } from './bridge';
@@ -17,6 +18,32 @@ import type { ApprovalStatus, AudioTrack, CandidateAsset, Character, MediaQcRepo
 type ModelConnection = { baseUrl: string; apiKey: string; model: string; textModel?: string; voice?: string };
 type ProviderConnections = Record<string, ModelConnection>;
 type FinalCutExportOptions = { kind?: 'final' | 'batch-preview'; coverDuration?: number; endCardDuration?: number };
+type ModelTask = 'text' | 'image' | 'video' | 'voice';
+
+const modelTaskMeta: Record<ModelTask, { label: string; detail: string }> = {
+  text: { label: '文本与改编', detail: '剧本改写、角色提取、分镜拆解' },
+  image: { label: '图片与分镜帧', detail: '角色形象、起始帧、末帧和中间帧' },
+  video: { label: '视频生成', detail: '异步生成、首尾帧和连续性参考' },
+  voice: { label: '配音', detail: '台词语音、音色和本机音频落盘' },
+};
+
+function providerSupportsTask(provider: ProviderProfile, task: ModelTask) {
+  if (task === 'text') return provider.capabilities.text;
+  if (task === 'image') return provider.capabilities.image;
+  if (task === 'video') return provider.capabilities.video;
+  return provider.capabilities.voice;
+}
+
+function taskCapabilityLabel(provider: ProviderProfile, task: ModelTask) {
+  if (!providerSupportsTask(provider, task)) return '不支持';
+  if (task === 'video') {
+    const frameMode = provider.capabilities.firstLastFrames ? '首尾帧' : '首帧';
+    return provider.capabilities.referenceImages ? `${frameMode} + 参考图` : `${frameMode} + 文本`;
+  }
+  if (task === 'image') return provider.capabilities.referenceImages ? '参考图' : '文本生成';
+  if (task === 'voice') return '语音输出';
+  return '文本输出';
+}
 
 function mediaDisplayUrl(source: string) {
   if (!source || /^(https?:|data:|blob:|asset:)/.test(source)) return source;
@@ -30,13 +57,86 @@ function mediaProviderSource(asset: CandidateAsset) {
 }
 
 const stageMeta: { id: Stage; icon: typeof BookOpenText; caption: string }[] = [
-  { id: '故事', icon: BookOpenText, caption: '改编与剧本' },
-  { id: '角色', icon: ScanFace, caption: '人物与造型' },
+  { id: '故事', icon: BookOpenText, caption: '剧本与改编' },
+  { id: '角色', icon: ScanFace, caption: '角色与造型' },
   { id: '分镜', icon: Clapperboard, caption: '镜头规划' },
-  { id: '素材', icon: ImagePlus, caption: '抽卡与生成' },
-  { id: '合成', icon: Film, caption: '声音与成片' },
-  { id: '画布', icon: Workflow, caption: '连线工作流' },
+  { id: '素材', icon: ImagePlus, caption: '画面与视频' },
+  { id: '合成', icon: Film, caption: '声音与输出' },
+  { id: '画布', icon: Workflow, caption: '关系与血缘' },
 ];
+
+type StageState = 'done' | 'review' | 'todo' | 'blocked';
+type StageStateInfo = { state: StageState; label: string; detail: string };
+
+function stageStateInfo(project: Project, stage: Stage): StageStateInfo {
+  const activeShots = project.shots.filter((shot) => !shot.archived);
+  const selectedAssets = activeShots.filter((shot) => Boolean(selectedAssetForShot(project, shot.id)));
+  switch (stage) {
+    case '故事': {
+      if (!project.source && !project.scenes.length) return { state: 'blocked', label: '待导入', detail: '导入剧本后开始' };
+      if (project.scenes.length && project.scenes.every((scene) => scene.status === 'approved')) return { state: 'done', label: '已确认', detail: `${project.scenes.length} 个场景已确认` };
+      if (project.scenes.length) return { state: 'review', label: '待审核', detail: '检查剧本并确认' };
+      return { state: 'todo', label: '待改编', detail: '生成短剧初稿' };
+    }
+    case '角色': {
+      if (!project.scenes.some((scene) => scene.status === 'approved')) return { state: 'blocked', label: '被阻塞', detail: '先确认剧本' };
+      if (project.characters.length && project.characters.every((character) => character.status === 'approved')) return { state: 'done', label: '已确认', detail: `${project.characters.length} 个角色已确认` };
+      if (project.characters.length) return { state: 'review', label: '待审核', detail: '确认形象与造型' };
+      return { state: 'todo', label: '待提取', detail: '从剧本提取角色' };
+    }
+    case '分镜': {
+      if (!project.scenes.some((scene) => scene.status === 'approved')) return { state: 'blocked', label: '被阻塞', detail: '先确认剧本' };
+      if (!activeShots.length) return { state: 'todo', label: '待拆分', detail: '生成镜头规划' };
+      if (activeShots.every((shot) => shot.status === 'approved')) return { state: 'done', label: '已确认', detail: `${activeShots.length} 个镜头已确认` };
+      return { state: 'review', label: '待审核', detail: `${activeShots.length} 个镜头待审核` };
+    }
+    case '素材': {
+      if (!activeShots.length) return { state: 'blocked', label: '被阻塞', detail: '先生成镜头' };
+      if (selectedAssets.length === activeShots.length) return { state: 'done', label: '已备齐', detail: `${selectedAssets.length} / ${activeShots.length} 个镜头有首选素材` };
+      if (selectedAssets.length) return { state: 'review', label: '进行中', detail: `${selectedAssets.length} / ${activeShots.length} 个镜头有素材` };
+      return { state: 'todo', label: '待抽卡', detail: '为镜头生成素材' };
+    }
+    case '合成': {
+      if (!selectedAssets.length) return { state: 'blocked', label: '被阻塞', detail: '先选定镜头素材' };
+      if (project.exports?.length) return { state: 'done', label: '已导出', detail: `最近导出 ${project.exports[0].clipCount} 段` };
+      return { state: 'review', label: '待合成', detail: '检查序列并导出' };
+    }
+    case '画布':
+      return activeShots.length ? { state: 'review', label: '可查看', detail: `${activeShots.length} 个镜头关系` } : { state: 'todo', label: '待生成', detail: '生成镜头后可查看' };
+  }
+}
+
+type SequenceCheckLevel = 'pass' | 'warning' | 'error';
+type SequenceCheckItem = { level: SequenceCheckLevel; label: string; detail: string; shotId?: string; assetId?: string; trackId?: string; subtitleId?: string };
+type SequenceCheckReport = { items: SequenceCheckItem[]; activeCount: number; duration: number };
+type SequenceFocus = { kind: 'track' | 'subtitle'; id: string };
+
+function buildSequenceCheck(project: Project): SequenceCheckReport {
+  const entries = timelineEntries(project);
+  const active = entries.filter((entry) => entry.clip.enabled);
+  const duration = active.reduce((total, entry) => total + entry.clip.duration, 0);
+  const items: SequenceCheckItem[] = [];
+  if (!active.length) items.push({ level: 'error', label: '序列为空', detail: '至少保留一个镜头并选定素材后才能导出。' });
+  for (const { shot, asset } of active) {
+    if (!asset) {
+      items.push({ level: 'error', label: `镜头 ${String(shot.number).padStart(2, '0')} 没有首选素材`, detail: '回到素材页选择图片帧或通过质检的视频。', shotId: shot.id });
+      continue;
+    }
+    if (asset.kind === 'video') {
+      const report = qcReportFor(project, asset.id);
+      if (!report || report.status !== 'approved') items.push({ level: 'error', label: `${asset.label} 未通过 QC`, detail: report?.status === 'ready' ? '报告已完成，请人工通过后再进入终剪。' : '视频必须先完成媒体质检并人工确认。', shotId: shot.id, assetId: asset.id });
+      if (report?.errors.length) items.push({ level: 'error', label: `${asset.label} 存在媒体阻断问题`, detail: report.errors.join('；'), shotId: shot.id, assetId: asset.id });
+    }
+    if (asset.metadata.ratio && asset.metadata.ratio !== project.aspectRatio) items.push({ level: 'warning', label: `${asset.label} 画幅与项目不一致`, detail: `素材为 ${String(asset.metadata.ratio)}，项目为 ${project.aspectRatio}，导出时会裁切。`, shotId: shot.id, assetId: asset.id });
+  }
+  for (const track of project.audioTracks.filter((track) => track.kind !== 'subtitle' && track.enabled && !track.sourceUrl)) items.push({ level: 'warning', label: `${track.label} 没有音频文件`, detail: '该轨道会保留在项目中，但导出时不会混入声音。', trackId: track.id });
+  for (const cue of project.subtitles ?? []) {
+    if (cue.end <= cue.start) items.push({ level: 'error', label: '字幕时间范围无效', detail: `“${cue.text.slice(0, 18)}”的结束时间必须晚于开始时间。`, subtitleId: cue.id });
+    else if (cue.end > duration) items.push({ level: 'warning', label: '字幕超出当前片长', detail: `“${cue.text.slice(0, 18)}”会被截断到 ${duration.toFixed(1)} 秒。`, subtitleId: cue.id });
+  }
+  if (!items.some((item) => item.level === 'error')) items.unshift({ level: 'pass', label: '序列可进入导出', detail: `${active.length} 段镜头，内容时长 ${duration.toFixed(1)} 秒。` });
+  return { items, activeCount: active.length, duration };
+}
 
 function Status({ value }: { value: ApprovalStatus }) {
   const label = value === 'approved' ? '已确认' : value === 'review' ? '待审核' : '草稿';
@@ -167,8 +267,14 @@ export function App() {
   const [candidateCount, setCandidateCount] = useState(4);
   const [showSettings, setShowSettings] = useState(false);
   const [showAssetLibrary, setShowAssetLibrary] = useState(false);
+  const [showMobileNav, setShowMobileNav] = useState(false);
+  const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
+  const [sequenceReport, setSequenceReport] = useState<SequenceCheckReport | null>(null);
+  const [sequenceFocus, setSequenceFocus] = useState<SequenceFocus | null>(null);
+  const [canUndo, setCanUndo] = useState(false);
   const [provider] = useState<ProviderProfile>(providers[0]);
   const [settingsProvider, setSettingsProvider] = useState<ProviderProfile>(providers[0]);
+  const [settingsTask, setSettingsTask] = useState<ModelTask>('image');
   const [connections, setConnections] = useState<ProviderConnections>({
     'gpt-image': { baseUrl: 'https://api.openai.com/v1', apiKey: '', model: providers[0].model, textModel: 'gpt-4.1-mini' },
     'openai-voice': { baseUrl: 'https://api.openai.com/v1', apiKey: '', model: providers[1].model, voice: 'alloy' },
@@ -196,6 +302,7 @@ export function App() {
   const cancelledVideoJobs = useRef(new Set<string>());
   const resumedVideoJobs = useRef(new Set<string>());
   const pendingProjectSave = useRef<{ next: Project | null; running: boolean }>({ next: null, running: false });
+  const historyRef = useRef<Project[]>([]);
   const saveFailureNotified = useRef(false);
   const jobPersistenceFailureNotified = useRef(false);
 
@@ -280,6 +387,11 @@ export function App() {
   const activeShots = project.shots.filter((shot) => !shot.archived);
   const totalDuration = timelineClipsFor(project).filter((clip) => clip.enabled).reduce((total, clip) => total + clip.duration, 0);
   const notice = (message: string) => { setToast(message); window.setTimeout(() => setToast(null), 2600); };
+  const openModelSettings = (task: ModelTask, preferredProvider?: ProviderProfile) => {
+    setSettingsTask(task);
+    if (preferredProvider) setSettingsProvider(preferredProvider);
+    setShowSettings(true);
+  };
   const persistProject = (next: Project) => {
     pendingProjectSave.current.next = next;
     if (pendingProjectSave.current.running) return;
@@ -309,6 +421,10 @@ export function App() {
     }
   };
   const commit = (next: Project, message?: string) => {
+    if (next.id === project.id && JSON.stringify(next) !== JSON.stringify(project)) {
+      historyRef.current = [...historyRef.current.slice(-39), project];
+      setCanUndo(true);
+    }
     setProject(next);
     setAvailableProjects((current) => current.some((item) => item.id === next.id)
       ? current.map((item) => item.id === next.id ? next : item)
@@ -316,8 +432,89 @@ export function App() {
     persistProject(next);
     if (message) notice(message);
   };
-  const setQcReport = (assetId: string, changes: Partial<MediaQcReport> & Pick<MediaQcReport, 'status'>) => {
+  const syncCurrent = (updater: (current: Project) => Project) => {
     setProject((current) => {
+      const next = updater(current);
+      if (next === current) return current;
+      setAvailableProjects((items) => items.some((item) => item.id === next.id)
+        ? items.map((item) => item.id === next.id ? next : item)
+        : [next, ...items]);
+      persistProject(next);
+      return next;
+    });
+  };
+  const commitCurrent = (updater: (current: Project) => Project, message?: string) => {
+    setProject((current) => {
+      const next = updater(current);
+      if (JSON.stringify(next) === JSON.stringify(current)) return current;
+      historyRef.current = [...historyRef.current.slice(-39), current];
+      setCanUndo(true);
+      setAvailableProjects((items) => items.some((item) => item.id === next.id)
+        ? items.map((item) => item.id === next.id ? next : item)
+        : [next, ...items]);
+      persistProject(next);
+      return next;
+    });
+    if (message) notice(message);
+  };
+  const undo = () => {
+    const previous = historyRef.current.pop();
+    if (!previous) { notice('没有可撤销的改动'); return; }
+    setProject(previous);
+    setAvailableProjects((current) => current.map((item) => item.id === previous.id ? previous : item));
+    persistProject(previous);
+    setCanUndo(historyRef.current.length > 0);
+    setActiveShot(previous.shots.find((shot) => !shot.archived)?.id ?? '');
+    setActiveEpisodeId(previous.episodes?.[0]?.id ?? previous.scenes[0]?.id ?? '');
+    notice('已撤销上一步改动');
+  };
+  const selectShot = (shotId: string) => {
+    const shot = project.shots.find((item) => item.id === shotId && !item.archived);
+    if (!shot) return;
+    const episode = project.episodes?.find((item) => item.sceneId === shot.sceneId);
+    setActiveEpisodeId(episode?.id ?? shot.sceneId);
+    setActiveShot(shotId);
+  };
+  const updateProjectAspectRatio = (aspectRatio: Project['aspectRatio']) => {
+    if (aspectRatio === project.aspectRatio) return;
+    const next = {
+      ...project,
+      aspectRatio,
+      shots: project.shots.map((shot) => shot.archived ? shot : { ...shot, aspectRatio, status: shot.status === 'approved' ? 'review' as const : shot.status }),
+    };
+    commit(next, `项目画幅已切换为 ${aspectRatio}，现有镜头需重新确认`);
+  };
+  const checkSequence = () => {
+    const report = buildSequenceCheck(project);
+    setSequenceReport(report);
+    const errors = report.items.filter((item) => item.level === 'error').length;
+    notice(errors ? `序列检查发现 ${errors} 个阻断问题，请处理后再导出` : '序列检查完成，可以进入导出');
+  };
+  const navigateSequenceItem = (item: SequenceCheckItem) => {
+    if (item.shotId) {
+      selectShot(item.shotId);
+      setStage(item.assetId ? '素材' : '合成');
+      setSequenceFocus(null);
+      return;
+    }
+    if (item.trackId) {
+      setStage('合成');
+      setSequenceFocus({ kind: 'track', id: item.trackId });
+      notice('已定位到对应音轨');
+      return;
+    }
+    if (item.subtitleId) {
+      setStage('合成');
+      setSequenceFocus({ kind: 'subtitle', id: item.subtitleId });
+      notice('已定位到对应字幕');
+      return;
+    }
+    setSequenceFocus(null);
+    setStage('合成');
+    notice('已回到合成页');
+  };
+  const setQcReport = (assetId: string, changes: Partial<MediaQcReport> & Pick<MediaQcReport, 'status'>, recordHistory = changes.status !== 'processing') => {
+    const update = (current: Project) => {
       const existing = qcReportFor(current, assetId);
       const report: MediaQcReport = {
         id: existing?.id ?? `qc_${assetId}`,
@@ -333,11 +530,10 @@ export function App() {
         errors: changes.errors ?? existing?.errors ?? [],
         checkedAt: changes.checkedAt ?? existing?.checkedAt,
       };
-      const next = { ...current, qcReports: [...(current.qcReports ?? []).filter((item) => item.assetId !== assetId), report] };
-      setAvailableProjects((items) => items.map((item) => item.id === next.id ? next : item));
-      persistProject(next);
-      return next;
-    });
+      return { ...current, qcReports: [...(current.qcReports ?? []).filter((item) => item.assetId !== assetId), report] };
+    };
+    if (recordHistory) commitCurrent(update);
+    else syncCurrent(update);
   };
   const runAssetQc = async (asset: CandidateAsset, silent = false) => {
     if (asset.kind === 'audio') return;
@@ -380,6 +576,8 @@ export function App() {
       const jobs = await listGenerationJobs(next.id).catch(() => []);
       setProject(next);
       setAvailableProjects((current) => current.map((item) => item.id === next.id ? next : item));
+      historyRef.current = [];
+      setCanUndo(false);
       setDurableJobs(jobs.filter((job) => job.kind === 'video' && ['queued', 'generating', 'polling', 'unknown'].includes(job.status)));
       setActiveShot(next.shots[0]?.id ?? '');
       setActiveEpisodeId(next.episodes?.[0]?.id ?? next.scenes[0]?.id ?? '');
@@ -403,23 +601,14 @@ export function App() {
     });
   };
   const failLocalGenerationJob = (jobId: string, message: string) => {
-    setProject((current) => {
-      const next = { ...current, jobs: current.jobs.map((item) => item.id === jobId ? { ...item, status: 'failed' as const, progress: 0, error: message } : item) };
-      persistProject(next);
-      return next;
-    });
+    commitCurrent((current) => ({ ...current, jobs: current.jobs.map((item) => item.id === jobId ? { ...item, status: 'failed' as const, progress: 0, error: message } : item) }));
     notice(message);
   };
   const cancelVideoJob = async (jobId: string) => {
     cancelledVideoJobs.current.add(jobId);
     const pending = pendingVideoTasks.current[jobId];
     if (pending) await Promise.allSettled(pending.taskIds.map((taskId) => cancelVideoGeneration({ providerId: pending.providerId, baseUrl: pending.baseUrl, apiKey: pending.apiKey, taskId })));
-    setProject((current) => {
-      const jobs = current.jobs.map((job) => job.id === jobId ? { ...job, status: 'cancelled' as const, progress: 0 } : job);
-      const next = { ...current, jobs };
-      persistProject(next);
-      return next;
-    });
+    commitCurrent((current) => ({ ...current, jobs: current.jobs.map((job) => job.id === jobId ? { ...job, status: 'cancelled' as const, progress: 0 } : job) }));
     persistJobStatus(jobId, 'cancelled');
     notice('视频生成任务已取消');
   };
@@ -507,7 +696,7 @@ export function App() {
   const adaptStory = async () => {
     const selected = project.chapters.filter((chapter) => chapter.selected);
     if (!selected.length) { notice('请至少选择一个章节再改编'); return; }
-    if (!imageConnection.apiKey) { setShowSettings(true); notice('请先配置文本模型 API key'); return; }
+    if (!imageConnection.apiKey) { openModelSettings('text', provider); notice('请先配置文本模型 API key'); return; }
     setIsAdapting(true);
     try {
       const existingEpisodes = project.episodes ?? [];
@@ -557,7 +746,7 @@ export function App() {
   const extractCharacters = async () => {
     const scene = activeScene;
     if (!scene) { notice('请先生成短剧初稿'); return; }
-    if (!imageConnection.apiKey) { setShowSettings(true); notice('请先配置文本模型 API key'); return; }
+    if (!imageConnection.apiKey) { openModelSettings('text', provider); notice('请先配置文本模型 API key'); return; }
     setIsExtractingCharacters(true);
     try {
       const raw = await generateText({
@@ -603,7 +792,7 @@ export function App() {
   const generatePortraits = async (characterId: string) => {
     const character = project.characters.find((item) => item.id === characterId);
     if (!character) return;
-    if (!imageConnection.apiKey) { setShowSettings(true); notice('请先配置 GPT Image API key'); return; }
+    if (!imageConnection.apiKey) { openModelSettings('image', provider); notice('请先配置图片模型 API key'); return; }
     setPortraitJob(characterId);
     try {
       const look = character.variants.find((variant) => variant.id === character.activeVariantId) ?? character.variants[0];
@@ -720,6 +909,12 @@ export function App() {
     } finally { setIsProjectPackageBusy(false); }
   };
   const exportFinalCutToFile = async ({ kind = 'final', coverDuration = 0.6, endCardDuration = 0.6 }: FinalCutExportOptions = {}) => {
+    const check = buildSequenceCheck(project);
+    if (check.items.some((item) => item.level === 'error')) {
+      setSequenceReport(check);
+      notice('导出已暂停：序列中还有阻断问题');
+      return;
+    }
     const allSelectedTimeline = selectedTimelineItems(project);
     if (kind === 'batch-preview' && allSelectedTimeline.length < 3) { notice('批次预览至少需要 3 个已通过质检的视频或已选图片帧'); return; }
     const selectedTimeline = kind === 'batch-preview' ? allSelectedTimeline.slice(0, 5) : allSelectedTimeline;
@@ -808,7 +1003,7 @@ export function App() {
     if (!dialogue) { notice('当前剧本没有台词，无法生成配音'); return; }
     const voiceProvider = providers.find((item) => item.id === 'openai-voice');
     const connection = connections['openai-voice'];
-    if (!voiceProvider || !connection?.apiKey) { if (voiceProvider) setSettingsProvider(voiceProvider); setShowSettings(true); notice('请先配置 OpenAI 配音连接'); return; }
+    if (!voiceProvider || !connection?.apiKey) { openModelSettings('voice', voiceProvider); notice('请先配置配音连接'); return; }
     setIsVoiceGenerating(true);
     try {
       const dataUrl = await generateSpeech({ baseUrl: connection.baseUrl, apiKey: connection.apiKey, model: connection.model, voice: connection.voice ?? 'alloy', input: dialogue, responseFormat: 'mp3' });
@@ -826,7 +1021,8 @@ export function App() {
     const lines = dialogue.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     const duration = Math.max(1, project.shots.filter((shot) => shot.sceneId === activeScene?.id && !shot.archived).reduce((total, shot) => total + shot.duration, 0));
     const subtitles: SubtitleCue[] = lines.map((text, index) => ({ id: `subtitle_${crypto.randomUUID()}`, text, start: Number((duration * index / lines.length).toFixed(2)), end: Number((duration * (index + 1) / lines.length).toFixed(2)), episodeId: activeEpisodeId, sceneId: activeScene?.id }));
-    commit({ ...project, subtitles }, `已生成 ${subtitles.length} 条字幕草稿，请检查时间和文本`);
+    const preserved = (project.subtitles ?? []).filter((cue) => cue.sceneId !== activeScene?.id && cue.episodeId !== activeEpisodeId);
+    commit({ ...project, subtitles: [...preserved, ...subtitles] }, `已生成 ${subtitles.length} 条字幕草稿，请检查时间和文本`);
   };
   const updateSubtitle = (subtitleId: string, changes: Partial<SubtitleCue>) => commit({ ...project, subtitles: (project.subtitles ?? []).map((cue) => cue.id === subtitleId ? { ...cue, ...changes } : cue) });
   const importPackage = async () => {
@@ -837,6 +1033,8 @@ export function App() {
       if (!path) return;
       const imported = await importProjectPackage(path);
       setProject(imported);
+      historyRef.current = [];
+      setCanUndo(false);
       const importedJobs = await listGenerationJobs(imported.id).catch(() => []);
       setDurableJobs(importedJobs.filter((job) => job.kind === 'video' && ['queued', 'generating', 'polling', 'unknown'].includes(job.status)));
       resumedVideoJobs.current.clear();
@@ -856,7 +1054,7 @@ export function App() {
   const planShots = async () => {
     const scene = activeScene;
     if (!scene) { notice('请先生成并确认短剧剧本'); return; }
-    if (!imageConnection.apiKey) { setShowSettings(true); notice('请先配置文本模型 API key'); return; }
+    if (!imageConnection.apiKey) { openModelSettings('text', provider); notice('请先配置文本模型 API key'); return; }
     setIsPlanningShots(true);
     try {
       const cast = project.characters.map((character) => `${character.name}（${character.role}）：${character.bio}`).join('\n');
@@ -903,7 +1101,7 @@ export function App() {
     const sourceFrames = project.candidates.filter((asset) => asset.kind === 'image' && asset.promptId === activePrompt.id);
     const selectedSourceFrames = sourceFrames.filter((asset) => asset.selected);
     if (!selectedSourceFrames.length) { notice('请先选定至少一张起始帧、末帧或中间帧，再生成视频'); return; }
-    if (!videoConnection?.apiKey) { setSettingsProvider(videoProvider); setShowSettings(true); notice(`请先配置 ${videoProvider.name} 的端点和 API key`); return; }
+    if (!videoConnection?.apiKey) { openModelSettings('video', videoProvider); notice(`请先配置 ${videoProvider.name} 的端点和 API key`); return; }
     const confirmed = window.confirm(`即将向 ${videoProvider.name} 提交 ${candidateCount} 个视频任务。\n镜头：${activeShotPlan.number} · ${activeShotPlan.duration} 秒\n提交后可能产生供应商费用，是否继续？`);
     if (!confirmed) return;
     const jobId = `video_${crypto.randomUUID()}`;
@@ -924,7 +1122,7 @@ export function App() {
       failLocalGenerationJob(jobId, `本地任务记录失败，未提交视频供应商：${error instanceof Error ? error.message : String(error)}`);
       return;
     }
-    setProject((current) => ({ ...current, jobs: current.jobs.map((item) => item.id === jobId ? { ...item, status: 'generating' as const, progress: 5 } : item) }));
+    syncCurrent((current) => ({ ...current, jobs: current.jobs.map((item) => item.id === jobId ? { ...item, status: 'generating' as const, progress: 5 } : item) }));
     persistJobStatus(jobId, 'generating');
     const sleep = (milliseconds: number) => new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
     const request = {
@@ -956,7 +1154,7 @@ export function App() {
         if (cancelledVideoJobs.current.has(jobId)) return { ...task, status: 'cancelled' as const, outputUrls: [] };
         task = await pollVideoGeneration({ providerId: request.providerId, baseUrl: request.baseUrl, apiKey: request.apiKey, taskId: task.taskId });
         const progress = Math.min(95, task.progress ?? 10 + Math.round((attempt / 90) * 80));
-        setProject((current) => ({ ...current, jobs: current.jobs.map((item) => item.id === jobId ? { ...item, status: 'polling' as const, progress } : item) }));
+        syncCurrent((current) => ({ ...current, jobs: current.jobs.map((item) => item.id === jobId ? { ...item, status: 'polling' as const, progress } : item) }));
         if (!pollingPersisted) { pollingPersisted = true; persistJobStatus(jobId, 'polling'); }
       }
       if (task.status !== 'succeeded' || !task.outputUrls.length) throw new Error(task.error || `视频任务 ${task.taskId} 未返回可用视频`);
@@ -968,7 +1166,7 @@ export function App() {
     const terminalStatus = wasCancelled ? 'cancelled' as const : succeeded.length ? 'succeeded' as const : errors.length ? 'unknown' as const : 'failed' as const;
     const cachedVideos = await Promise.all(succeeded.map(async (task, index) => ({ task, url: await cacheMediaAsset(task.outputUrls[0], 'video', `${jobId}-${index}.mp4`) })));
     let generatedVideoAssets: CandidateAsset[] = [];
-    setProject((current) => {
+    syncCurrent((current) => {
       const videos: CandidateAsset[] = cachedVideos.map(({ task, url }, index) => ({
         id: `${jobId}_${index}`, jobId, kind: 'video', label: `视频候选 ${String(index + 1).padStart(2, '0')}`,
         url, promptId: prompt.id, provider: task.provider, model: task.model ?? videoConnection.model,
@@ -977,9 +1175,7 @@ export function App() {
       }));
       generatedVideoAssets = videos;
       const jobs = current.jobs.map((item) => item.id === jobId ? { ...item, status: terminalStatus, progress: terminalStatus === 'cancelled' ? 0 : 100, error: errors.join('\n') || undefined } : item);
-      const next = { ...current, jobs, candidates: [...videos, ...current.candidates] };
-      persistProject(next);
-      return next;
+      return { ...current, jobs, candidates: [...videos, ...current.candidates] };
     });
     await Promise.all(generatedVideoAssets.map((asset) => runAssetQc(asset, true)));
     const knownTaskIds = pendingVideoTasks.current[jobId]?.taskIds ?? [];
@@ -993,9 +1189,10 @@ export function App() {
   };
   const generateCards = async () => {
     if (!activePrompt) { notice('请先为当前镜头创建提示词'); return; }
-    if (!imageConnection.apiKey) { setSettingsProvider(provider); setShowSettings(true); notice('请先配置 GPT Image API key'); return; }
+    if (!imageConnection.apiKey) { openModelSettings('image', provider); notice('请先配置图片模型 API key'); return; }
     const activeShotPlan = project.shots.find((shot) => shot.id === activePrompt.assetId);
     if (!activeShotPlan) { notice('当前提示词没有对应镜头'); return; }
+    if (activeShotPlan.status !== 'approved') { notice('请先确认当前镜头，再提交图片生成'); return; }
     const jobId = `job_${crypto.randomUUID()}`;
     const frameLabel = frameRole === 'start' ? '起始帧' : frameRole === 'end' ? '末帧' : '中间帧';
     const frameInstruction = frameRole === 'start' ? 'Establish the opening composition and character placement.' : frameRole === 'end' ? 'Resolve the action in its final composition while preserving the same characters and setting.' : 'Capture the pivotal mid-action beat while preserving continuity from the opening frame.';
@@ -1011,7 +1208,7 @@ export function App() {
       failLocalGenerationJob(jobId, `本地任务记录失败，未提交图片供应商：${error instanceof Error ? error.message : String(error)}`);
       return;
     }
-    setProject((current) => ({ ...current, jobs: current.jobs.map((item) => item.id === jobId ? { ...item, status: 'generating' as const, progress: 5 } : item) }));
+    syncCurrent((current) => ({ ...current, jobs: current.jobs.map((item) => item.id === jobId ? { ...item, status: 'generating' as const, progress: 5 } : item) }));
     persistJobStatus(jobId, 'generating');
     try {
       const results = (await Promise.all(Array.from({ length: candidateCount }, () => generateGptImage({
@@ -1021,21 +1218,15 @@ export function App() {
       })))).flat();
       if (!results.length) throw new Error('未收到图片候选，请在桌面端检查模型连接');
       const cachedUrls = await Promise.all(results.map((result, index) => cacheMediaAsset(result.url, 'image', `${jobId}-${index}.png`)));
-      setProject((current) => {
+      commitCurrent((current) => {
         const completedJobs = current.jobs.map((item) => item.id === jobId ? { ...item, status: 'succeeded' as const, progress: 100 } : item);
         const returned = results.map((result, index) => ({ id: `${jobId}_asset_${index}`, jobId, kind: 'image' as const, label: `${frameLabel}候选 ${String(index + 1).padStart(2, '0')}`, url: cachedUrls[index], promptId: activePrompt.id, provider: result.provider, model: result.model, createdAt: new Date().toISOString(), selected: false, metadata: { ratio: current.aspectRatio, reference: referenceImages.length > 0, frameRole, referenceAssetIds: referenceAssetIds.join(','), seed: 'provider-managed', sourceUrl: result.url, localCached: cachedUrls[index] !== result.url } }));
-        const next = { ...current, jobs: completedJobs, candidates: [...returned, ...current.candidates] };
-        persistProject(next);
-        return next;
+        return { ...current, jobs: completedJobs, candidates: [...returned, ...current.candidates] };
       });
       persistJobStatus(jobId, 'succeeded');
       notice(`已返回 ${results.length} 个 GPT Image 候选`);
     } catch (error) {
-      setProject((current) => {
-        const next = { ...current, jobs: current.jobs.map((item) => item.id === jobId ? { ...item, status: 'failed' as const, error: error instanceof Error ? error.message : String(error) } : item) };
-        persistProject(next);
-        return next;
-      });
+      commitCurrent((current) => ({ ...current, jobs: current.jobs.map((item) => item.id === jobId ? { ...item, status: 'failed' as const, error: error instanceof Error ? error.message : String(error) } : item) }));
       persistJobStatus(jobId, 'failed');
       notice('GPT Image 请求失败，请检查端点、模型和 API key');
     }
@@ -1054,11 +1245,7 @@ export function App() {
     const duration = typeof payload.duration === 'number' && payload.duration > 0 ? payload.duration : 5;
     const generateAudio = payload.generateAudio === true;
     const failRecovery = (message: string) => {
-      setProject((current) => {
-        const next = { ...current, jobs: current.jobs.map((item) => item.id === durable.id ? { ...item, status: 'failed' as const, error: message } : item) };
-        persistProject(next);
-        return next;
-      });
+      commitCurrent((current) => ({ ...current, jobs: current.jobs.map((item) => item.id === durable.id ? { ...item, status: 'failed' as const, error: message } : item) }));
       persistJobStatus(durable.id, 'failed');
       setDurableJobs((current) => current.filter((item) => item.id !== durable.id));
       notice(message);
@@ -1069,7 +1256,7 @@ export function App() {
     }
     const currentProvider = providers.find((item) => item.id === providerId);
     pendingVideoTasks.current[durable.id] = { providerId, baseUrl: connection.baseUrl, apiKey: connection.apiKey, taskIds };
-    setProject((current) => ({ ...current, jobs: current.jobs.map((item) => item.id === durable.id ? { ...item, status: 'polling' as const, progress: Math.max(item.progress, 10) } : item) }));
+    syncCurrent((current) => ({ ...current, jobs: current.jobs.map((item) => item.id === durable.id ? { ...item, status: 'polling' as const, progress: Math.max(item.progress, 10) } : item) }));
     persistJobStatus(durable.id, 'polling');
     const sleep = (milliseconds: number) => new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
     const results = await Promise.allSettled(taskIds.map(async (taskId) => {
@@ -1079,7 +1266,7 @@ export function App() {
         await sleep(2500);
         task = await pollVideoGeneration({ providerId, baseUrl: connection.baseUrl, apiKey: connection.apiKey, taskId });
         const progress = Math.min(95, task.progress ?? 10 + Math.round((attempt / 90) * 80));
-        setProject((current) => ({ ...current, jobs: current.jobs.map((item) => item.id === durable.id ? { ...item, status: 'polling' as const, progress } : item) }));
+        syncCurrent((current) => ({ ...current, jobs: current.jobs.map((item) => item.id === durable.id ? { ...item, status: 'polling' as const, progress } : item) }));
       }
       if (task.status !== 'succeeded' || !task.outputUrls.length) throw new Error(task.error || `视频任务 ${task.taskId} 未返回可用视频`);
       return task;
@@ -1089,7 +1276,7 @@ export function App() {
     const terminalStatus = cancelledVideoJobs.current.has(durable.id) ? 'cancelled' as const : succeeded.length ? 'succeeded' as const : errors.length ? 'unknown' as const : 'failed' as const;
     const cachedVideos = await Promise.all(succeeded.map(async (task, index) => ({ task, url: await cacheMediaAsset(task.outputUrls[0], 'video', `${durable.id}-recovered-${index}.mp4`) })));
     let recoveredVideoAssets: CandidateAsset[] = [];
-    setProject((current) => {
+    syncCurrent((current) => {
       const videos: CandidateAsset[] = cachedVideos.map(({ task, url }, index) => ({
         id: `${durable.id}_recovered_${index}`, jobId: durable.id, kind: 'video', label: `视频候选 ${String(index + 1).padStart(2, '0')}`,
         url, promptId, provider: task.provider, model: task.model ?? connection.model, createdAt: new Date().toISOString(), selected: false,
@@ -1097,9 +1284,7 @@ export function App() {
       }));
       recoveredVideoAssets = videos;
       const jobs = current.jobs.map((item) => item.id === durable.id ? { ...item, status: terminalStatus, progress: terminalStatus === 'cancelled' ? 0 : 100, error: errors.join('\n') || undefined } : item);
-      const next = { ...current, jobs, candidates: [...videos, ...current.candidates.filter((asset) => asset.jobId !== durable.id)] };
-      persistProject(next);
-      return next;
+      return { ...current, jobs, candidates: [...videos, ...current.candidates.filter((asset) => asset.jobId !== durable.id)] };
     });
     await Promise.all(recoveredVideoAssets.map((asset) => runAssetQc(asset, true)));
     delete pendingVideoTasks.current[durable.id];
@@ -1126,54 +1311,57 @@ export function App() {
     }
   }, [durableJobs, connections, project.id]);
 
+  const stageStates = stageMeta.map(({ id }) => ({ id, ...stageStateInfo(project, id) }));
+  const currentStageInfo = stageStates.find((item) => item.id === stage) ?? stageStates[0];
+  const selectedAssetCount = activeShots.filter((shot) => Boolean(selectedAssetForShot(project, shot.id))).length;
+
   return <div className="app-shell">
-    <aside className="rail">
-      <div className="brand"><div className="brand-mark"><img src="/frameforge-logo-v3.svg" alt="Frameforge" /></div><span>FRAMEFORGE</span></div>
-      <div className="project-switcher"><span>项目</span><label><span className="project-initial">{project.name.slice(0, 1)}</span><select value={project.id} onChange={(event) => void switchProject(event.target.value)} aria-label="切换项目">{availableProjects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><ChevronDown size={14} /></label></div>
+    <aside className={`rail ${showMobileNav ? 'is-open' : ''}`}>
+      <div className="brand"><div className="brand-mark"><img src="/frameforge-logo-v3.svg" alt="Frameforge" /></div><div><span>FRAMEFORGE</span><small>VIDEO WORKSPACE</small></div></div>
+      <div className="project-switcher"><span>当前项目</span><label><span className="project-initial">{project.name.slice(0, 1)}</span><select value={project.id} onChange={(event) => void switchProject(event.target.value)} aria-label="切换项目">{availableProjects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><ChevronDown size={14} /></label></div>
       <nav className="stage-nav" aria-label="创作阶段">
-        {stageMeta.map(({ id, icon: Icon, caption }) => <button key={id} className={stage === id ? 'active' : ''} onClick={() => setStage(id)}><Icon size={18} /><span><b>{id}</b><small>{caption}</small></span>{stage === id && <ChevronRight size={15} />}</button>)}
+        {stageStates.map(({ id }) => {
+          const meta = stageMeta.find((item) => item.id === id)!;
+          const info = stageStateInfo(project, id);
+          const Icon = meta.icon;
+          return <button key={id} className={stage === id ? 'active' : ''} onClick={() => { setStage(id); setShowMobileNav(false); }} title={info.detail}><span className="stage-icon"><Icon size={17} /></span><span><b>{id}</b><small>{meta.caption}</small></span><em className={`stage-state state-${info.state}`}>{info.state === 'done' ? <Check size={11} /> : info.state === 'blocked' ? <CircleAlert size={11} /> : info.state === 'review' ? <CircleDashed size={11} /> : null}{info.label}</em></button>;
+        })}
       </nav>
       <div className="rail-bottom">
-        <button onClick={() => setShowAssetLibrary(true)}><FolderOpen size={17} />素材库</button>
-        <button onClick={() => setShowSettings(true)}><Settings2 size={17} />模型与设置</button>
-        <div className="usage"><span><Gauge size={15} /> 本月生成</span><b>38 / 自带密钥</b></div>
+        <button onClick={() => setShowAssetLibrary(true)}><FolderOpen size={16} /><span>素材库</span><small>{project.candidates.length} 项</small></button>
+        <button onClick={() => setShowSettings(true)}><Settings2 size={16} /><span>模型与设置</span><small>{providers.filter((item) => connections[item.id]?.apiKey).length}/{providers.length}</small></button>
+        <div className="usage"><span><Gauge size={14} /> 生成使用情况</span><b>{project.jobs.filter((job) => job.status === 'succeeded').length} 次完成 <i>·</i> 自带密钥</b></div>
       </div>
     </aside>
+    {showMobileNav && <button className="rail-scrim" aria-label="关闭导航" onClick={() => setShowMobileNav(false)} />}
 
     <main className="workbench">
       <input ref={sourceInput} className="visually-hidden" type="file" accept=".txt,.md,.markdown,.docx,text/plain,text/markdown,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={(event) => void importStory(event)} />
       <header className="topbar">
-        <div className="breadcrumbs"><button className="mobile-menu" aria-label="菜单"><Menu size={20} /></button><span>项目</span><ChevronRight size={14} /><b>{project.name}</b><span className="sync-dot">已保存到本地</span></div>
-        <div className="top-actions"><IconButton label="撤销"><RotateCcw size={17} /></IconButton><IconButton label="导入项目包" onClick={() => void importPackage()}><FolderOpen size={17} /></IconButton><button className="export-button" disabled={isProjectPackageBusy} onClick={() => void exportPackage()}><Upload size={16} />{isProjectPackageBusy ? '处理中...' : '导出项目包'}</button></div>
+        <div className="breadcrumbs"><button className="mobile-menu" aria-label="菜单" onClick={() => setShowMobileNav(true)}><Menu size={20} /></button><span>项目</span><ChevronRight size={14} /><b>{project.name}</b><span className="sync-dot">本地已保存</span></div>
+        <div className="top-actions"><IconButton label="撤销上一步" onClick={undo} active={canUndo}><RotateCcw size={16} /></IconButton><IconButton label="导入项目包" onClick={() => void importPackage()}><FolderOpen size={16} /></IconButton><button className="export-button" disabled={isProjectPackageBusy} onClick={() => void exportPackage()}><Upload size={15} />{isProjectPackageBusy ? '处理中...' : '导出项目包'}</button></div>
       </header>
 
       <section className="project-head">
-        <div><div className="eyebrow">{project.episodes?.length ? `EP${String(project.episodes[0].number).padStart(2, '0')} · ${project.episodes[0].status === 'approved' ? '已确认' : '改编中'}` : 'STORY ROOM · 改编中'}</div><h1>{project.name}</h1><p>{project.logline}</p></div>
-        <div className="project-metrics"><div><b>{Math.floor(totalDuration / 60).toString().padStart(2, '0')}:{Math.round(totalDuration % 60).toString().padStart(2, '0')}</b><span>预计片长</span></div><div><b>{activeShots.length}</b><span>已拆镜头</span></div><div><b>{project.aspectRatio}</b><span>主画幅</span></div></div>
+        <div className="project-title"><div className="eyebrow">{currentStageInfo.label} · {stage}工作区</div><h1>{project.name}</h1><p>{project.logline}</p><div className="project-context"><span><CircleDashed size={13} /> 当前任务：{currentStageInfo.detail}</span><span><ListChecks size={13} /> {selectedAssetCount}/{activeShots.length || 0} 个镜头已有首选素材</span></div></div>
+        <div className="project-metrics"><div><b>{Math.floor(totalDuration / 60).toString().padStart(2, '0')}:{Math.round(totalDuration % 60).toString().padStart(2, '0')}</b><span>序列时长</span></div><div><b>{activeShots.length}</b><span>有效镜头</span></div><div><b>{project.aspectRatio}</b><span>输出画幅</span></div></div>
       </section>
 
       <section className="approval-strip">
-        <div className="workflow-steps">{stageMeta.map(({ id, icon: Icon }, index) => <button key={id} onClick={() => setStage(id)} className={stage === id ? 'current' : index < stageMeta.findIndex((item) => item.id === stage) ? 'complete' : ''}><span>{index < stageMeta.findIndex((item) => item.id === stage) ? <Check size={13} /> : <Icon size={14} />}</span>{id}</button>)}</div>
-        <div className="approval-callout"><Sparkles size={15} /><span>每一步确认后，素材和提示词都会保留版本记录。</span></div>
+        <div className="workflow-steps">{stageStates.map(({ id, state, label }) => <button key={id} onClick={() => setStage(id)} className={`${stage === id ? 'current' : ''} state-${state}`}><span>{state === 'done' ? <Check size={13} /> : state === 'blocked' ? <CircleAlert size={13} /> : <CircleDashed size={13} />}</span><b>{id}</b><small>{label}</small></button>)}</div>
+        <div className="approval-callout"><Sparkles size={15} /><span>审核、选材、QC 和导出状态会自动汇总</span></div>
       </section>
 
-      <div className="canvas">
+      <div className={`canvas ${inspectorCollapsed ? 'inspector-collapsed' : ''}`}>
         <section className="primary-panel">
           {stage === '故事' && <StoryStage project={project} activeEpisodeId={activeEpisodeId} setActiveEpisodeId={setActiveEpisodeId} toggleChapter={toggleChapter} updateChapter={updateChapter} updateScene={updateScene} approveScene={approveScene} adaptStory={() => void adaptStory()} adapting={isAdapting} openImport={() => sourceInput.current?.click()} />}
           {stage === '角色' && <CharacterStage project={project} extracting={isExtractingCharacters} onExtract={() => void extractCharacters()} portraitJob={portraitJob} onGeneratePortrait={(id) => void generatePortraits(id)} onAddCharacter={addCharacter} onUpdateCharacter={updateCharacter} onSelectPortrait={selectPortrait} onAddVariant={addAppearanceVariant} onSelectVariant={selectAppearanceVariant} onUpdateVariant={updateAppearanceVariant} onApproveVariant={approveAppearanceVariant} onSaveStyleGuide={updateStyleGuide} onApprove={(id) => commit({ ...project, characters: project.characters.map((person) => person.id === id ? { ...person, status: 'approved' } : person) }, '角色标准形象已确认')}/>}
           {stage === '分镜' && <StoryboardStage project={project} activeEpisodeId={activeEpisodeId} setActiveEpisodeId={setActiveEpisodeId} activeShot={activeShot} setActiveShot={setActiveShot} planning={isPlanningShots} onPlan={() => void planShots()} onUpdateShot={updateShot} onApproveShot={approveShot} />}
-          {stage === '素材' && <AssetsStage project={project} activeShot={activeShot} prompt={activePrompt} selectedAsset={selectedAsset} candidateCount={candidateCount} setCandidateCount={setCandidateCount} selectCandidate={selectCandidate} generateCards={() => void generateCards()} assetMode={assetMode} setAssetMode={setAssetMode} generateNativeAudio={generateNativeAudio} setGenerateNativeAudio={setGenerateNativeAudio} frameRole={frameRole} setFrameRole={setFrameRole} videoProvider={videoProvider} setVideoProvider={setVideoProvider} generateVideoCards={() => void generateVideoCards()} provider={provider} editingPrompt={editingPrompt} setEditingPrompt={setEditingPrompt} revisePrompt={revisePrompt} qcBusyAssetId={qcBusyAssetId} onRunQc={(asset) => void runAssetQc(asset)} onSetQcStatus={setAssetQcStatus} onSetStoryboard={setStoryboard} />}
-          {stage === '合成' && <AssemblyStage project={project} notice={notice} exporting={isFinalCutExporting} voiceGenerating={isVoiceGenerating} onExport={(options) => void exportFinalCutToFile(options)} onGenerateVoice={() => void generateVoiceTrack()} onImportAudio={(kind) => void importAudioTrack(kind)} onToggleAudio={toggleAudioTrack} onUpdateAudio={updateAudioTrack} onToggleTimeline={toggleTimelineClip} onMoveTimeline={moveTimelineClip} onUpdateTimelineDuration={updateTimelineDuration} onResetTimeline={resetTimeline} onGenerateSubtitles={generateSubtitleDraft} onUpdateSubtitle={updateSubtitle} />}
-          {stage === '画布' && <WorkspaceCanvas key={project.id} project={project} activeShot={activeShot} onSelectShot={(shotId) => {
-            const shot = project.shots.find((item) => item.id === shotId);
-            if (!shot) return;
-            const episode = project.episodes?.find((item) => item.sceneId === shot.sceneId);
-            setActiveEpisodeId(episode?.id ?? shot.sceneId);
-            setActiveShot(shotId);
-            setStage('素材');
-          }} />}
+          {stage === '素材' && <AssetsStage project={project} activeShot={activeShot} onSelectShot={selectShot} prompt={activePrompt} selectedAsset={selectedAsset} candidateCount={candidateCount} setCandidateCount={setCandidateCount} selectCandidate={selectCandidate} generateCards={() => void generateCards()} assetMode={assetMode} setAssetMode={setAssetMode} generateNativeAudio={generateNativeAudio} setGenerateNativeAudio={setGenerateNativeAudio} frameRole={frameRole} setFrameRole={setFrameRole} videoProvider={videoProvider} setVideoProvider={setVideoProvider} generateVideoCards={() => void generateVideoCards()} provider={provider} editingPrompt={editingPrompt} setEditingPrompt={setEditingPrompt} revisePrompt={revisePrompt} qcBusyAssetId={qcBusyAssetId} onRunQc={(asset) => void runAssetQc(asset)} onSetQcStatus={setAssetQcStatus} onSetStoryboard={setStoryboard} />}
+          {stage === '合成' && <ProfessionalAssemblyStage project={project} onSelectShot={selectShot} exporting={isFinalCutExporting} voiceGenerating={isVoiceGenerating} onExport={(options) => void exportFinalCutToFile(options)} onGenerateVoice={() => void generateVoiceTrack()} onImportAudio={(kind) => void importAudioTrack(kind)} onToggleAudio={toggleAudioTrack} onUpdateAudio={updateAudioTrack} onDeleteAudio={(trackId) => commit({ ...project, audioTracks: project.audioTracks.filter((track) => track.id !== trackId) }, '音频轨道已删除')} onToggleTimeline={toggleTimelineClip} onMoveTimeline={moveTimelineClip} onUpdateTimelineDuration={updateTimelineDuration} onResetTimeline={resetTimeline} onGenerateSubtitles={generateSubtitleDraft} onAddSubtitle={() => commit({ ...project, subtitles: [...(project.subtitles ?? []), { id: `subtitle_${crypto.randomUUID()}`, text: '新字幕', start: 0, end: 2, episodeId: activeEpisodeId, sceneId: activeScene?.id }] }, '已新增字幕，可继续调整时间和内容')} onUpdateSubtitle={updateSubtitle} onDeleteSubtitle={(subtitleId) => commit({ ...project, subtitles: (project.subtitles ?? []).filter((cue) => cue.id !== subtitleId) }, '字幕已删除')} onCheckSequence={checkSequence} sequenceReport={sequenceReport} onNavigateSequenceItem={navigateSequenceItem} focusTarget={sequenceFocus} onFocusHandled={() => setSequenceFocus(null)} />}
+          {stage === '画布' && <WorkspaceCanvas key={project.id} project={project} activeShot={activeShot} onSelectShot={(shotId) => { selectShot(shotId); setStage('素材'); }} />}
         </section>
-        <Inspector project={project} stage={stage} activeShot={activeShot} selectedAsset={selectedAsset} setShowSettings={setShowSettings} cancelVideoJob={cancelVideoJob} recheckVideoJob={recheckVideoJob} />
+        <Inspector project={project} stage={stage} activeShot={activeShot} selectedAsset={selectedAsset} setShowSettings={setShowSettings} cancelVideoJob={cancelVideoJob} recheckVideoJob={recheckVideoJob} collapsed={inspectorCollapsed} onToggle={() => setInspectorCollapsed((value) => !value)} onAspectRatioChange={updateProjectAspectRatio} />
       </div>
       {toast && <div className="toast"><Check size={17} />{toast}</div>}
       {showAssetLibrary && <AssetLibrary project={project} close={() => setShowAssetLibrary(false)} onOpenAsset={(asset) => {
@@ -1187,7 +1375,7 @@ export function App() {
         }
         setShowAssetLibrary(false);
       }} />}
-      {showSettings && <ProviderSettings key={settingsProvider.id} provider={settingsProvider} setProvider={setSettingsProvider} connection={connections[settingsProvider.id]} setConnections={setConnections} close={() => setShowSettings(false)} notice={notice} />}
+      {showSettings && <ProfessionalProviderSettings key={`${settingsTask}:${settingsProvider.id}`} task={settingsTask} setTask={setSettingsTask} provider={settingsProvider} setProvider={setSettingsProvider} connection={connections[settingsProvider.id]} setConnections={setConnections} close={() => setShowSettings(false)} notice={notice} />}
     </main>
   </div>;
 }
@@ -1195,12 +1383,12 @@ export function App() {
 function SectionTitle({ eyebrow, title, children }: { eyebrow: string; title: string; children?: React.ReactNode }) { return <div className="section-title"><div><div className="eyebrow">{eyebrow}</div><h2>{title}</h2></div>{children}</div>; }
 
 function StoryStage({ project, activeEpisodeId, setActiveEpisodeId, toggleChapter, updateChapter, updateScene, approveScene, adaptStory, adapting, openImport }: { project: Project; activeEpisodeId: string; setActiveEpisodeId: (id: string) => void; toggleChapter: (id: string) => void; updateChapter: (id: string, changes: Partial<Project['chapters'][number]>) => void; updateScene: (id: string, changes: Partial<Project['scenes'][number]>) => void; approveScene: () => void; adaptStory: () => void; adapting: boolean; openImport: () => void }) {
-  const fallbackEpisode = project.scenes[0] ? [{ id: project.scenes[0].id, number: 1, title: 'EP01', chapterIds: [], synopsis: '', sceneId: project.scenes[0].id, status: project.scenes[0].status }] : [];
+  const fallbackEpisode = project.scenes[0] ? [{ id: project.scenes[0].id, number: 1, title: '第 1 集', chapterIds: [], synopsis: '', sceneId: project.scenes[0].id, status: project.scenes[0].status }] : [];
   const episodes = project.episodes?.length ? project.episodes : fallbackEpisode;
   const episode = episodes.find((item) => item.id === activeEpisodeId) ?? episodes[0];
   const scene = project.scenes.find((item) => item.id === episode?.sceneId) ?? project.scenes[0];
-  if (!scene) return <><SectionTitle eyebrow="STORY ROOM" title="章节改编"><button className="quiet-action" onClick={openImport}><Upload size={15} />导入文本</button></SectionTitle><div className="empty-story"><FileText size={28} /><h3>导入小说或剧本</h3><p>支持 TXT、Markdown 与 DOCX。导入后会自动识别章节，并为短剧改编创建初稿。</p><button className="primary-button" onClick={openImport}><Upload size={16} />选择本地文件</button></div></>;
-  return <><SectionTitle eyebrow="STORY ROOM" title="章节改编"><div className="section-actions"><button className="quiet-action" onClick={openImport}><Upload size={15} />导入文本</button><button className="primary-button" disabled={adapting} onClick={adaptStory}><WandSparkles size={15} />{adapting ? '改编中...' : 'AI 改编初稿'}</button></div></SectionTitle>
+  if (!scene) return <><SectionTitle eyebrow="剧本开发" title="章节改编"><button className="quiet-action" onClick={openImport}><Upload size={15} />导入文本</button></SectionTitle><div className="empty-story"><FileText size={28} /><h3>导入小说或剧本</h3><p>支持 TXT、Markdown 与 DOCX。导入后会自动识别章节，并为短剧改编创建初稿。</p><button className="primary-button" onClick={openImport}><Upload size={16} />选择本地文件</button></div></>;
+  return <><SectionTitle eyebrow="剧本开发" title="章节改编"><div className="section-actions"><button className="quiet-action" onClick={openImport}><Upload size={15} />导入文本</button><button className="primary-button" disabled={adapting} onClick={adaptStory}><WandSparkles size={15} />{adapting ? '改编中...' : 'AI 改编初稿'}</button></div></SectionTitle>
     <div className="episode-tabs" role="tablist" aria-label="短剧集数">{episodes.map((item) => <button key={item.id} className={item.id === episode?.id ? 'active' : ''} onClick={() => setActiveEpisodeId(item.id)} role="tab" aria-selected={item.id === episode?.id}><span>EP{String(item.number).padStart(2, '0')}</span><b>{item.title}</b></button>)}</div><div className="source-card"><div className="source-file"><FileText size={22} /><div><b>{project.source?.name}</b><span>{project.source?.format.toUpperCase()} · 已解析 {project.chapters.length} 章 · 当前第 {episode?.number ?? 1} 集</span></div></div><button className="text-button" onClick={openImport}>更换</button></div>
     <div className="chapter-list">{project.chapters.map((chapter) => <article key={chapter.id} className={`chapter ${chapter.selected ? 'chosen' : ''}`}><button className="chapter-toggle" onClick={() => toggleChapter(chapter.id)} aria-pressed={chapter.selected}><span className="chapter-number">{String(chapter.number).padStart(2, '0')}</span><div><b>{chapter.title}</b><small>{chapter.wordCount.toLocaleString()} 字</small></div><span className="check-circle">{chapter.selected && <Check size={14} />}</span></button><label className="chapter-summary">短剧保留摘要<textarea value={chapter.summary} onChange={(event) => updateChapter(chapter.id, { summary: event.target.value })} /></label></article>)}</div>
     <div className="script-card"><div className="script-card-head"><div><span className="pill">EP{String(episode?.number ?? 1).padStart(2, '0')} 初稿</span><Status value={scene.status} /></div><button className="text-button" disabled={adapting} onClick={adaptStory}><WandSparkles size={15} />重新改写全部选中集</button></div><div className="script-editor"><label>场景<input value={scene.heading} onChange={(event) => updateScene(scene.id, { heading: event.target.value })} /></label><label>动作<textarea value={scene.action} onChange={(event) => updateScene(scene.id, { action: event.target.value })} /></label><label>台词<textarea value={scene.dialogue} onChange={(event) => updateScene(scene.id, { dialogue: event.target.value })} /></label><div className="script-editor-pair"><label>情绪<textarea value={scene.emotionalBeat} onChange={(event) => updateScene(scene.id, { emotionalBeat: event.target.value })} /></label><label>结尾钩子<textarea value={scene.hook} onChange={(event) => updateScene(scene.id, { hook: event.target.value })} /></label></div></div><div className="script-foot"><span>编辑后需重新确认，才可进入镜头拆分</span><button className="primary-button" onClick={approveScene}><Check size={16} />确认剧本</button></div></div>
@@ -1208,8 +1396,8 @@ function StoryStage({ project, activeEpisodeId, setActiveEpisodeId, toggleChapte
 }
 
 function CharacterStage({ project, extracting, onExtract, portraitJob, onGeneratePortrait, onAddCharacter, onUpdateCharacter, onSelectPortrait, onAddVariant, onSelectVariant, onUpdateVariant, onApproveVariant, onSaveStyleGuide, onApprove }: { project: Project; extracting: boolean; onExtract: () => void; portraitJob: string | null; onGeneratePortrait: (id: string) => void; onAddCharacter: () => void; onUpdateCharacter: (characterId: string, changes: Pick<Character, 'name' | 'role' | 'bio'>) => void; onSelectPortrait: (id: string, asset: CandidateAsset) => void; onAddVariant: (id: string) => void; onSelectVariant: (characterId: string, variantId: string) => void; onUpdateVariant: (characterId: string, variantId: string, changes: Partial<Character['variants'][number]>) => void; onApproveVariant: (characterId: string, variantId: string) => void; onSaveStyleGuide: (styleGuide: Project['styleGuide']) => void; onApprove: (id: string) => void }) {
-  if (!project.characters.length) return <><SectionTitle eyebrow="CAST BIBLE" title="角色与造型"><div className="section-actions"><button className="quiet-action" onClick={onAddCharacter}><Plus size={15} />新建角色</button><button className="primary-button" disabled={extracting} onClick={onExtract}><Sparkles size={15} />{extracting ? '提取中...' : '从剧本提取角色'}</button></div></SectionTitle><StyleGuidePanel key={`${project.styleGuide.genre}-${project.styleGuide.visualStyle}`} styleGuide={project.styleGuide} onSave={onSaveStyleGuide} /><div className="empty-stage"><ScanFace size={28} /><h3>尚未生成角色档案</h3><p>确认短剧剧本后，系统会提取角色画像、标准形象与剧情阶段造型。</p></div></>;
-  return <><SectionTitle eyebrow="CAST BIBLE" title="角色与造型"><div className="section-actions"><button className="quiet-action" onClick={onAddCharacter}><Plus size={15} />新建角色</button><button className="primary-button" disabled={extracting} onClick={onExtract}><Sparkles size={15} />{extracting ? '提取中...' : '重新提取角色'}</button></div></SectionTitle><StyleGuidePanel key={`${project.styleGuide.genre}-${project.styleGuide.visualStyle}`} styleGuide={project.styleGuide} onSave={onSaveStyleGuide} /><div className="cast-grid">{project.characters.map((person) => {
+  if (!project.characters.length) return <><SectionTitle eyebrow="角色设定" title="角色与造型"><div className="section-actions"><button className="quiet-action" onClick={onAddCharacter}><Plus size={15} />新建角色</button><button className="primary-button" disabled={extracting} onClick={onExtract}><Sparkles size={15} />{extracting ? '提取中...' : '从剧本提取角色'}</button></div></SectionTitle><StyleGuidePanel key={`${project.styleGuide.genre}-${project.styleGuide.visualStyle}`} styleGuide={project.styleGuide} onSave={onSaveStyleGuide} /><div className="empty-stage"><ScanFace size={28} /><h3>尚未生成角色档案</h3><p>确认短剧剧本后，系统会提取角色画像、标准形象与剧情阶段造型。</p></div></>;
+  return <><SectionTitle eyebrow="角色设定" title="角色与造型"><div className="section-actions"><button className="quiet-action" onClick={onAddCharacter}><Plus size={15} />新建角色</button><button className="primary-button" disabled={extracting} onClick={onExtract}><Sparkles size={15} />{extracting ? '提取中...' : '重新提取角色'}</button></div></SectionTitle><StyleGuidePanel key={`${project.styleGuide.genre}-${project.styleGuide.visualStyle}`} styleGuide={project.styleGuide} onSave={onSaveStyleGuide} /><div className="cast-grid">{project.characters.map((person) => {
     const portraitOptions = project.candidates.filter((asset) => asset.metadata.characterId === person.id && asset.metadata.assetRole === 'canonical-portrait');
     const activeVariant = person.variants.find((variant) => variant.id === person.activeVariantId) ?? person.variants[0];
     return <article className="character-card" key={person.id}>{person.portraitUrl ? <img src={mediaDisplayUrl(person.portraitUrl)} alt={`${person.name}角色画像`} /> : <div className="portrait-placeholder"><ScanFace size={32} /><span>{person.name.slice(0, 1)}</span></div>}<div className="character-card-body"><div className="row-between"><div className="character-editor"><label>人物定位<input defaultValue={person.role} onBlur={(event) => onUpdateCharacter(person.id, { name: person.name, role: event.target.value, bio: person.bio })} /></label><label>角色名称<input defaultValue={person.name} onBlur={(event) => onUpdateCharacter(person.id, { name: event.target.value, role: person.role, bio: person.bio })} /></label></div><Status value={person.status} /></div><label className="character-bio">人物设定<textarea defaultValue={person.bio} onBlur={(event) => onUpdateCharacter(person.id, { name: person.name, role: person.role, bio: event.target.value })} /></label><div className="variant-list">{person.variants.map((variant) => <button key={variant.id} className={activeVariant?.id === variant.id ? 'active' : ''} onClick={() => onSelectVariant(person.id, variant.id)}><i></i>{variant.label} · {variant.storyRange}</button>)}<button className="add-variant" onClick={() => onAddVariant(person.id)}><Plus size={12} />新增剧情造型</button></div>{activeVariant && <div className="variant-editor"><div className="variant-editor-head"><b>当前剧情造型</b><Status value={activeVariant.status} /></div><label>名称<input value={activeVariant.label} onChange={(event) => onUpdateVariant(person.id, activeVariant.id, { label: event.target.value })} /></label><label>剧情段<input value={activeVariant.storyRange} onChange={(event) => onUpdateVariant(person.id, activeVariant.id, { storyRange: event.target.value })} /></label><label>服装、妆容、皮肤与状态<textarea value={activeVariant.description} onChange={(event) => onUpdateVariant(person.id, activeVariant.id, { description: event.target.value })} /></label><div className="variant-editor-actions"><button className="text-button" onClick={() => onSelectVariant(person.id, activeVariant.id)}>应用到镜头</button>{activeVariant.status !== 'approved' && <button className="small-primary" onClick={() => onApproveVariant(person.id, activeVariant.id)}><Check size={14} />确认造型</button>}</div></div>}{portraitOptions.length > 0 && <div className="portrait-options">{portraitOptions.map((asset, index) => <button key={asset.id} className={person.referenceIds.includes(asset.id) ? 'active' : ''} onClick={() => onSelectPortrait(person.id, asset)} title={`选用形象 ${index + 1}`}><img src={mediaDisplayUrl(asset.url)} alt={`${person.name}形象候选 ${index + 1}`} /></button>)}</div>}<div className="card-actions"><button className="text-button" disabled={portraitJob === person.id} onClick={() => onGeneratePortrait(person.id)}><ImagePlus size={15} />{portraitJob === person.id ? '生成中...' : person.referenceIds.length ? '重抽角色图' : '抽取角色图'}</button>{person.status !== 'approved' && person.referenceIds.length > 0 && <button className="small-primary" onClick={() => onApprove(person.id)}><Check size={14} />确认形象</button>}</div></div></article>;
@@ -1224,14 +1412,15 @@ function StyleGuidePanel({ styleGuide, onSave }: { styleGuide: Project['styleGui
 }
 
 function StoryboardStage({ project, activeEpisodeId, setActiveEpisodeId, activeShot, setActiveShot, planning, onPlan, onUpdateShot, onApproveShot }: { project: Project; activeEpisodeId: string; setActiveEpisodeId: (id: string) => void; activeShot: string; setActiveShot: (id: string) => void; planning: boolean; onPlan: () => void; onUpdateShot: (id: string, changes: Partial<Project['shots'][number]>) => void; onApproveShot: (id: string) => void }) {
-  if (!project.scenes.length) return <><SectionTitle eyebrow="SHOT DESIGN" title="镜头规划" /><div className="empty-stage"><Clapperboard size={28} /><h3>等待已确认的剧本</h3><p>先在故事阶段确认短剧剧本，再自动拆解为可编辑镜头。</p></div></>;
-  const fallbackEpisode = [{ id: project.scenes[0].id, number: 1, title: 'EP01', chapterIds: [], synopsis: '', sceneId: project.scenes[0].id, status: project.scenes[0].status }];
+  if (!project.scenes.length) return <><SectionTitle eyebrow="分镜设计" title="镜头规划" /><div className="empty-stage"><Clapperboard size={28} /><h3>等待已确认的剧本</h3><p>先在故事阶段确认短剧剧本，再自动拆解为可编辑镜头。</p></div></>;
+  const fallbackEpisode = [{ id: project.scenes[0].id, number: 1, title: '第 1 集', chapterIds: [], synopsis: '', sceneId: project.scenes[0].id, status: project.scenes[0].status }];
   const episodes = project.episodes?.length ? project.episodes : fallbackEpisode;
   const episode = episodes.find((item) => item.id === activeEpisodeId) ?? episodes[0];
   const scene = project.scenes.find((item) => item.id === episode?.sceneId) ?? project.scenes[0];
   const visibleShots = project.shots.filter((shot) => shot.sceneId === scene.id && !shot.archived);
   const selected = visibleShots.find((shot) => shot.id === activeShot) ?? visibleShots[0];
-  return <><SectionTitle eyebrow="SHOT DESIGN" title="镜头规划"><div className="section-actions"><button className="quiet-action" disabled={planning} onClick={onPlan}><Sparkles size={15} />{planning ? '拆解中...' : visibleShots.length ? '重新拆分本集' : 'AI 拆分本集'}</button></div></SectionTitle><div className="episode-tabs" role="tablist" aria-label="分镜集数">{episodes.map((item) => <button key={item.id} className={item.id === episode?.id ? 'active' : ''} onClick={() => setActiveEpisodeId(item.id)} role="tab" aria-selected={item.id === episode?.id}><span>EP{String(item.number).padStart(2, '0')}</span><b>{item.title}</b></button>)}</div><div className="scene-banner"><div><span className="pill">EP{String(episode?.number ?? 1).padStart(2, '0')} · 场景 01</span><h3>{scene.heading}</h3><p>{scene.action}</p></div><Status value={scene.status} /></div>{visibleShots.length ? <><div className="shot-stack">{visibleShots.map((shot) => <button key={shot.id} onClick={() => setActiveShot(shot.id)} className={`shot-row ${activeShot === shot.id ? 'selected' : ''}`}><span className="shot-index">{String(shot.number).padStart(2, '0')}</span><div className="frame-mini"><span></span></div><div className="shot-main"><div><b>{shot.framing}</b><small><Clock3 size={12} /> {shot.duration}s · {shot.aspectRatio}</small></div><p>{shot.action}</p><span className="audio-label"><Music2 size={13} />{shot.audioCue}</span></div><Status value={shot.status} /><ChevronRight size={17} /></button>)}</div>{selected && <ShotEditor key={selected.id} shot={selected} characters={project.characters} onSave={onUpdateShot} onApprove={onApproveShot} />}</> : <div className="inline-empty"><Clapperboard size={20} /><span>本集尚未生成镜头。先审核本集剧本，再使用 AI 拆分镜头。</span></div>}</>;
+  const sceneNumber = Math.max(1, project.scenes.findIndex((item) => item.id === scene.id) + 1);
+  return <><SectionTitle eyebrow="分镜设计" title="镜头规划"><div className="section-actions"><button className="quiet-action" disabled={planning} onClick={onPlan}><Sparkles size={15} />{planning ? '拆解中...' : visibleShots.length ? '重新拆分本集' : 'AI 拆分本集'}</button></div></SectionTitle><div className="episode-tabs" role="tablist" aria-label="分镜集数">{episodes.map((item) => <button key={item.id} className={item.id === episode?.id ? 'active' : ''} onClick={() => setActiveEpisodeId(item.id)} role="tab" aria-selected={item.id === episode?.id}><span>EP{String(item.number).padStart(2, '0')}</span><b>{item.title}</b></button>)}</div><div className="scene-banner"><div><span className="pill">EP{String(episode?.number ?? 1).padStart(2, '0')} · 场景 {String(sceneNumber).padStart(2, '0')}</span><h3>{scene.heading}</h3><p>{scene.action}</p></div><Status value={scene.status} /></div>{visibleShots.length ? <><div className="shot-stack">{visibleShots.map((shot) => { const preview = selectedAssetForShot(project, shot.id); return <button key={shot.id} onClick={() => setActiveShot(shot.id)} className={`shot-row ${activeShot === shot.id ? 'selected' : ''}`}><span className="shot-index">{String(shot.number).padStart(2, '0')}</span><div className="frame-mini">{preview?.kind === 'video' ? <video src={mediaDisplayUrl(preview.url)} muted playsInline preload="metadata" aria-label={`镜头 ${shot.number}视频缩略图`} /> : preview ? <img src={mediaDisplayUrl(preview.url)} alt={`镜头 ${shot.number}画面`} /> : <span className="frame-empty"><Clapperboard size={16} /></span>}</div><div className="shot-main"><div><b>{shot.framing}</b><small><Clock3 size={12} /> {shot.duration}s · {shot.aspectRatio}</small></div><p>{shot.action}</p><span className="audio-label"><Music2 size={13} />{shot.audioCue}</span></div><Status value={shot.status} /><ChevronRight size={17} /></button>; })}</div>{selected && <ShotEditor key={selected.id} shot={selected} characters={project.characters} onSave={onUpdateShot} onApprove={onApproveShot} />}</> : <div className="inline-empty"><Clapperboard size={20} /><span>本集尚未生成镜头。先审核本集剧本，再使用 AI 拆分镜头。</span></div>}</>;
 }
 
 function ShotEditor({ shot, characters, onSave, onApprove }: { shot: Project['shots'][number]; characters: Character[]; onSave: (id: string, changes: Partial<Project['shots'][number]>) => void; onApprove: (id: string) => void }) {
@@ -1240,39 +1429,84 @@ function ShotEditor({ shot, characters, onSave, onApprove }: { shot: Project['sh
   return <section className="shot-editor"><div className="shot-editor-head"><div><span className="eyebrow">SHOT {String(shot.number).padStart(2, '0')}</span><h3>镜头详情</h3></div><Status value={shot.status} /></div><div className="shot-editor-grid"><label>景别<input value={draft.framing} onChange={(event) => setDraft((current) => ({ ...current, framing: event.target.value }))} /></label><label>时长（秒）<input type="number" min="1" max="8" value={draft.duration} onChange={(event) => setDraft((current) => ({ ...current, duration: Math.max(1, Math.min(8, Number(event.target.value) || 1)) }))} /></label></div><label>镜头运动<input value={draft.cameraMotion} placeholder="例如：缓慢推近、跟拍、静止或手持" onChange={(event) => setDraft((current) => ({ ...current, cameraMotion: event.target.value }))} /></label><label>主体动作<textarea value={draft.action} onChange={(event) => setDraft((current) => ({ ...current, action: event.target.value }))} /></label><label>声音提示<input value={draft.audioCue} onChange={(event) => setDraft((current) => ({ ...current, audioCue: event.target.value }))} /></label><div className="shot-cast"><span>出镜角色</span><div>{characters.map((character) => <label key={character.id}><input type="checkbox" checked={draft.characters.includes(character.id)} onChange={() => toggleCharacter(character.id)} />{character.name}</label>)}</div></div><div className="shot-editor-actions"><button className="quiet-action" onClick={() => onSave(shot.id, draft)}>保存并更新提示词</button>{shot.status !== 'approved' && <button className="primary-button" onClick={() => onApprove(shot.id)}><Check size={16} />确认镜头</button>}</div></section>;
 }
 
-function AssetsStage({ project, activeShot, prompt, selectedAsset, candidateCount, setCandidateCount, selectCandidate, generateCards, assetMode, setAssetMode, generateNativeAudio, setGenerateNativeAudio, frameRole, setFrameRole, videoProvider, setVideoProvider, generateVideoCards, provider, editingPrompt, setEditingPrompt, revisePrompt, qcBusyAssetId, onRunQc, onSetQcStatus, onSetStoryboard }: { project: Project; activeShot: string; prompt?: Project['prompts'][number]; selectedAsset?: CandidateAsset; candidateCount: number; setCandidateCount: (value: number) => void; selectCandidate: (id: string) => void; generateCards: () => void; assetMode: 'image' | 'video'; setAssetMode: (mode: 'image' | 'video') => void; generateNativeAudio: boolean; setGenerateNativeAudio: (value: boolean) => void; frameRole: 'start' | 'end' | 'middle'; setFrameRole: (role: 'start' | 'end' | 'middle') => void; videoProvider: ProviderProfile; setVideoProvider: (provider: ProviderProfile) => void; generateVideoCards: () => void; provider: ProviderProfile; editingPrompt: boolean; setEditingPrompt: (value: boolean) => void; revisePrompt: (promptId: string, text: string, negativeText: string) => void; qcBusyAssetId: string | null; onRunQc: (asset: CandidateAsset) => void; onSetQcStatus: (assetId: string, status: 'approved' | 'rejected') => void; onSetStoryboard: (asset: CandidateAsset) => void }) {
-  const shot = project.shots.find((item) => item.id === activeShot);
-  if (!prompt) return <><SectionTitle eyebrow="ASSET LAB" title="素材抽卡" /><div className="empty-stage"><ImagePlus size={28} /><h3>等待当前镜头的提示词</h3><p>请先在分镜阶段选择一个镜头并完成提示词拆解，再为起始帧、末帧和中间帧抽卡。</p></div></>;
-  const visibleAssets = project.candidates.filter((asset) => asset.kind === assetMode && asset.promptId === prompt.id && (assetMode === 'video' || !asset.metadata.frameRole || asset.metadata.frameRole === frameRole));
+function ShotQueue({ project, activeShot, onSelectShot }: { project: Project; activeShot: string; onSelectShot: (shotId: string) => void }) {
+  const shots = orderShots(project);
+  return <aside className="shot-queue"><div className="shot-queue-head"><div><span className="eyebrow">镜头队列</span><b>本集镜头</b></div><span>{shots.length} 个</span></div>{shots.length ? <div className="shot-queue-list">{shots.map((shot, index) => {
+    const scene = project.scenes.find((item) => item.id === shot.sceneId);
+    const asset = selectedAssetForShot(project, shot.id);
+    const report = asset?.kind === 'video' ? qcReportFor(project, asset.id) : undefined;
+    const status = !asset ? '待选素材' : asset.kind === 'video' && report?.status !== 'approved' ? '待 QC' : '已就绪';
+    return <button key={shot.id} className={`shot-queue-item ${activeShot === shot.id ? 'active' : ''}`} onClick={() => onSelectShot(shot.id)}><span className="queue-index">{String(index + 1).padStart(2, '0')}</span><span className="queue-copy"><b>镜头 {String(shot.number).padStart(2, '0')}</b><small>{scene?.heading?.split('/').slice(-1)[0]?.trim() ?? shot.framing}</small><em className={!asset ? 'queue-warning' : report?.status === 'approved' ? 'queue-ready' : ''}>{status}</em></span><span className="queue-duration">{shot.duration}s</span></button>;
+  })}</div> : <div className="queue-empty"><Clapperboard size={17} /><span>还没有镜头</span></div>}<div className="shot-queue-foot"><span>点击镜头切换上下文</span><span>{project.aspectRatio}</span></div></aside>;
+}
+
+function AssetsStage({ project, activeShot, onSelectShot, prompt, selectedAsset, candidateCount, setCandidateCount, selectCandidate, generateCards, assetMode, setAssetMode, generateNativeAudio, setGenerateNativeAudio, frameRole, setFrameRole, videoProvider, setVideoProvider, generateVideoCards, provider, editingPrompt, setEditingPrompt, revisePrompt, qcBusyAssetId, onRunQc, onSetQcStatus, onSetStoryboard }: { project: Project; activeShot: string; onSelectShot: (shotId: string) => void; prompt?: Project['prompts'][number]; selectedAsset?: CandidateAsset; candidateCount: number; setCandidateCount: (value: number) => void; selectCandidate: (id: string) => void; generateCards: () => void; assetMode: 'image' | 'video'; setAssetMode: (mode: 'image' | 'video') => void; generateNativeAudio: boolean; setGenerateNativeAudio: (value: boolean) => void; frameRole: 'start' | 'end' | 'middle'; setFrameRole: (role: 'start' | 'end' | 'middle') => void; videoProvider: ProviderProfile; setVideoProvider: (provider: ProviderProfile) => void; generateVideoCards: () => void; provider: ProviderProfile; editingPrompt: boolean; setEditingPrompt: (value: boolean) => void; revisePrompt: (promptId: string, text: string, negativeText: string) => void; qcBusyAssetId: string | null; onRunQc: (asset: CandidateAsset) => void; onSetQcStatus: (assetId: string, status: 'approved' | 'rejected') => void; onSetStoryboard: (asset: CandidateAsset) => void }) {
+  const shot = project.shots.find((item) => item.id === activeShot && !item.archived);
+  const visibleAssets = prompt ? project.candidates.filter((asset) => asset.kind === assetMode && asset.promptId === prompt.id && (assetMode === 'video' || !asset.metadata.frameRole || asset.metadata.frameRole === frameRole)) : [];
   const activeProvider = assetMode === 'image' ? provider : videoProvider;
-  return <><SectionTitle eyebrow="ASSET LAB" title={`镜头 ${String(shot?.number ?? 1).padStart(2, '0')} · ${assetMode === 'image' ? '图片抽卡' : '视频抽卡'}`}><div className="section-controls"><button className={`segmented ${assetMode === 'image' ? 'active' : ''}`} onClick={() => setAssetMode('image')}><ImagePlus size={15} />图片帧</button><button className={`segmented ${assetMode === 'video' ? 'active' : ''}`} onClick={() => setAssetMode('video')}><Video size={15} />视频</button></div></SectionTitle>
-    {assetMode === 'image' && <div className="frame-role-tabs"><button className={frameRole === 'start' ? 'active' : ''} onClick={() => setFrameRole('start')}>起始帧</button><button className={frameRole === 'end' ? 'active' : ''} onClick={() => setFrameRole('end')}>末帧</button><button className={frameRole === 'middle' ? 'active' : ''} onClick={() => setFrameRole('middle')}>中间帧</button></div>}
-    <div className="prompt-box"><div className="prompt-top"><span className="provider-dot"></span><b>{activeProvider.name} / {activeProvider.model}</b>{assetMode === 'image' ? <span className="reference-tag"><ScanFace size={13} />角色参考图已绑定</span> : <span className="reference-tag"><ImagePlus size={13} />起始帧与角色参考将随任务传入</span>}</div><p>{assetMode === 'image' ? prompt.text : `根据镜头动作生成连续视频：${prompt.text}`}</p><div className="prompt-foot"><button className="text-button" onClick={() => setEditingPrompt(!editingPrompt)}><SlidersHorizontal size={15} />{editingPrompt ? '收起编辑' : '编辑提示词'}</button>{assetMode === 'video' && <select value={videoProvider.id} onChange={(event) => { const next = providers.find((item) => item.id === event.target.value); if (next) setVideoProvider(next); }}><option value="bytedance-video">字节视频</option><option value="grok-video">Grok Video</option><option value="gemini-video">Gemini / Veo</option></select>}{assetMode === 'video' && <label className="inline-toggle"><input type="checkbox" checked={generateNativeAudio} onChange={(event) => setGenerateNativeAudio(event.target.checked)} /><Volume2 size={13} />原生音频</label>}<span>负面约束已应用</span></div></div>
-    {editingPrompt && <PromptEditor key={prompt.id} prompt={prompt} onCancel={() => setEditingPrompt(false)} onSave={revisePrompt} />}
-    <div className="generation-bar"><div><span>候选数量</span><div className="stepper"><button onClick={() => setCandidateCount(Math.max(1, candidateCount - 1))}>−</button><b>{candidateCount}</b><button onClick={() => setCandidateCount(Math.min(activeProvider.capabilities.maxCandidates, candidateCount + 1))}>+</button></div><span className="muted">可随时追加</span></div><button className="primary-button" onClick={assetMode === 'image' ? generateCards : generateVideoCards}><Sparkles size={16} />生成 {candidateCount} 个候选</button></div>
-    <div className="candidate-grid">{visibleAssets.map((asset, index) => {
-      const report = qcReportFor(project, asset.id);
-      const qcLabel = report?.status === 'approved' ? '质检通过' : report?.status === 'rejected' ? '已驳回' : report?.status === 'processing' ? '质检中' : report?.status === 'ready' ? '待人工确认' : report?.status === 'failed' ? '质检失败' : '未质检';
-      return <article key={asset.id} className={`candidate-card ${asset.selected ? 'selected' : ''}`}><button className="candidate-image" onClick={() => selectCandidate(asset.id)}>{asset.kind === 'video' ? <video src={mediaDisplayUrl(asset.url)} muted playsInline preload="metadata" aria-label={`${asset.label}视频预览`} /> : <img src={mediaDisplayUrl(asset.url)} alt={`${asset.label}候选`} />}{asset.kind === 'video' && <span className="video-mark"><Play size={16} fill="currentColor" /></span>}<span className="candidate-index">0{index + 1}</span>{asset.selected && <span className="selected-mark"><Check size={16} />已选</span>}</button><div className="candidate-details"><div><b>{asset.label}</b><span>{asset.kind === 'video' ? `${asset.metadata.duration ?? 5}s · ${asset.provider}` : `种子 ${asset.metadata.seed ?? 'provider'}`}</span></div><button className="select-button" onClick={() => selectCandidate(asset.id)}>{asset.selected ? '当前首选' : '选用此张'}</button></div><div className={`qc-strip qc-${report?.status ?? 'not-run'}`}><span className="qc-label">{asset.kind === 'video' && report?.status !== 'approved' && <AlertTriangle size={12} />}{qcLabel}</span>{report?.contactSheetUrl && <img src={mediaDisplayUrl(report.contactSheetUrl)} alt={`${asset.label}抽帧接触表`} />}{report && <small>{report.width && report.height ? `${report.width} × ${report.height}` : ''}{report.hasAudio ? ' · 原生音频' : asset.kind === 'video' ? ' · 无原生音频' : ''}{report.errors.length ? ` · ${report.errors.length} 个问题` : report.warnings.length ? ` · ${report.warnings.length} 个提醒` : ''}</small>}<div className="qc-actions"><button className="text-button" disabled={qcBusyAssetId === asset.id} onClick={() => onRunQc(asset)}><RefreshCw size={13} />{qcBusyAssetId === asset.id ? '质检中' : report ? '重新质检' : '质检'}</button>{asset.kind === 'video' && report?.status === 'ready' && <><button className="text-button qc-approve" onClick={() => onSetQcStatus(asset.id, 'approved')}><Check size={13} />通过</button><button className="text-button qc-reject" onClick={() => onSetQcStatus(asset.id, 'rejected')}>驳回</button></>}{asset.kind === 'image' && <button className="text-button" onClick={() => onSetStoryboard(asset)}>故事板</button>}</div></div></article>;
-    })}</div>
-    {!visibleAssets.length && <div className="inline-empty"><Video size={20} /><span>{assetMode === 'video' ? '尚无视频候选。选择图片帧后即可生成。' : '尚无图片候选。'}</span></div>}
-    <div className="lineage"><Layers3 size={16} /><span>素材血缘：镜头 {String(shot?.number ?? 1).padStart(2, '0')}</span><ChevronRight size={14} /><span>提示词 {prompt.id.slice(-6)}</span><ChevronRight size={14} /><span>{assetMode === 'video' ? '首尾帧约束' : '角色造型参考'}</span><ChevronRight size={14} /><span>{selectedAsset?.label ?? '未选择'}</span><button className="text-button">查看全部记录</button></div>
+  const bindings = shot && prompt ? referenceBindingsFor(project, shot, prompt.id, assetMode === 'image' ? frameRole : undefined) : [];
+  const frameLabel = frameRole === 'start' ? '起始帧' : frameRole === 'end' ? '末帧' : '中间帧';
+
+  if (!prompt) {
+    return <><SectionTitle eyebrow="素材工作台" title="画面生成与审核" /><div className="empty-stage asset-empty"><ImagePlus size={28} /><h3>等待当前镜头的提示词</h3><p>请先在分镜阶段完成镜头确认，再为起始帧、末帧和中间帧生成候选。</p></div></>;
+  }
+
+  return <>
+    <SectionTitle eyebrow="素材工作台" title={assetMode === 'image' ? '画面生成与审核' : '视频生成与审核'}>
+      <div className="section-controls">
+        <button className={`segmented ${assetMode === 'image' ? 'active' : ''}`} onClick={() => setAssetMode('image')}><ImagePlus size={15} />图片帧</button>
+        <button className={`segmented ${assetMode === 'video' ? 'active' : ''}`} onClick={() => setAssetMode('video')}><Video size={15} />视频</button>
+      </div>
+    </SectionTitle>
+    <div className="asset-workspace">
+      <ShotQueue project={project} activeShot={activeShot} onSelectShot={onSelectShot} />
+      <div className="asset-main">
+        {shot && <div className="asset-context"><div><span className="eyebrow">镜头 {String(shot.number).padStart(2, '0')} · {shot.framing}</span><h3>{shot.action}</h3><p>{shot.cameraMotion ?? '镜头运动待补充'} <i>·</i> {shot.audioCue}</p></div><div className="asset-facts"><span><b>画幅</b>{shot.aspectRatio}</span><span><b>时长</b>{shot.duration}s</span><span><b>出镜</b>{shot.characters.length} 人</span></div></div>}
+        {assetMode === 'image' && <div className="frame-role-tabs"><button className={frameRole === 'start' ? 'active' : ''} onClick={() => setFrameRole('start')}>起始帧</button><button className={frameRole === 'end' ? 'active' : ''} onClick={() => setFrameRole('end')}>末帧</button><button className={frameRole === 'middle' ? 'active' : ''} onClick={() => setFrameRole('middle')}>中间帧</button></div>}
+        <div className="prompt-box">
+          <div className="prompt-top"><span className="provider-dot"></span><b>{activeProvider.name}</b><span className="model-name">{activeProvider.model}</span><span className="reference-tag"><ScanFace size={13} />{bindings.length} 个参考输入</span></div>
+          <div className="prompt-summary"><div><span>主体动作</span><b>{shot?.action ?? '待补充'}</b></div><div><span>镜头语言</span><b>{shot?.cameraMotion ?? project.styleGuide.cameraLanguage}</b></div><div><span>连续性</span><b>{bindings.length ? `${bindings.length} 个锁定参考` : '暂无锁定参考'}</b></div></div>
+          <details className="prompt-raw"><summary>查看生成指令与负面约束</summary><p>{assetMode === 'image' ? prompt.text : `根据镜头动作生成连续视频：${prompt.text}`}</p><span>负面约束：{prompt.negativeText || '无'}</span></details>
+          <div className="prompt-foot">
+            <button className="text-button" onClick={() => setEditingPrompt(!editingPrompt)}><SlidersHorizontal size={15} />{editingPrompt ? '收起编辑' : '编辑提示词'}</button>
+            {assetMode === 'video' && <select value={videoProvider.id} onChange={(event) => { const next = providers.find((item) => item.id === event.target.value); if (next) { setVideoProvider(next); if (!next.capabilities.nativeAudio) setGenerateNativeAudio(false); } }} aria-label="选择视频模型"><option value="bytedance-video">字节视频</option><option value="grok-video">Grok Video</option><option value="gemini-video">Gemini / Veo</option></select>}
+            {assetMode === 'video' && activeProvider.capabilities.nativeAudio && <label className="inline-toggle"><input type="checkbox" checked={generateNativeAudio} onChange={(event) => setGenerateNativeAudio(event.target.checked)} /><Volume2 size={13} />生成原生音频</label>}
+            <span>{assetMode === 'image' ? `${frameLabel} · 负面约束已应用` : activeProvider.capabilities.asyncTasks ? '视频任务将异步提交并持续轮询' : '视频任务将提交到当前适配器'}</span>
+          </div>
+        </div>
+        {editingPrompt && <PromptEditor key={prompt.id} prompt={prompt} onCancel={() => setEditingPrompt(false)} onSave={revisePrompt} />}
+        <div className="generation-bar"><div className="generation-copy"><span className="eyebrow">生成任务</span><b>{assetMode === 'image' ? `${frameLabel}候选` : '视频候选'}</b><small>{shot?.status === 'approved' ? `${activeProvider.name} · 可生成` : '镜头尚未确认，生成会被拦截'}</small></div><div className="generation-controls"><span>数量</span><div className="stepper"><button aria-label="减少候选数量" onClick={() => setCandidateCount(Math.max(1, candidateCount - 1))}>−</button><b>{candidateCount}</b><button aria-label="增加候选数量" onClick={() => setCandidateCount(Math.min(activeProvider.capabilities.maxCandidates, candidateCount + 1))}>+</button></div><button className="primary-button" onClick={assetMode === 'image' ? generateCards : generateVideoCards}><Sparkles size={16} />生成 {candidateCount} 个</button></div></div>
+        <div className="candidate-grid">{visibleAssets.map((asset, index) => {
+          const report = qcReportFor(project, asset.id);
+          const qcLabel = report?.status === 'approved' ? '质检通过' : report?.status === 'rejected' ? '已驳回' : report?.status === 'processing' ? '质检中' : report?.status === 'ready' ? '待人工确认' : report?.status === 'failed' ? '质检失败' : '未质检';
+          return <article key={asset.id} className={`candidate-card ${asset.selected ? 'selected' : ''}`}><button className="candidate-image" onClick={() => selectCandidate(asset.id)}>{asset.kind === 'video' ? <video src={mediaDisplayUrl(asset.url)} muted playsInline preload="metadata" aria-label={`${asset.label}视频预览`} /> : <img src={mediaDisplayUrl(asset.url)} alt={`${asset.label}候选`} />}{asset.kind === 'video' && <span className="video-mark"><Play size={16} fill="currentColor" /></span>}<span className="candidate-index">{String(index + 1).padStart(2, '0')}</span>{asset.selected && <span className="selected-mark"><Check size={15} />首选</span>}</button><div className="candidate-details"><div><b>{asset.label}</b><span>{asset.kind === 'video' ? `${asset.metadata.duration ?? 5}s · ${asset.provider}` : `参考 ${bindings.length} 个 · ${asset.provider}`}</span><small>提示词 {asset.promptId.slice(-6)} · {asset.metadata.frameRole ? String(asset.metadata.frameRole) : '主帧'}</small></div><button className="select-button" onClick={() => selectCandidate(asset.id)}>{asset.selected ? '当前首选' : '设为首选'}</button></div><div className={`qc-strip qc-${report?.status ?? 'not-run'}`}><span className="qc-label">{asset.kind === 'video' && report?.status !== 'approved' && <AlertTriangle size={12} />}{qcLabel}</span>{report?.contactSheetUrl && <img src={mediaDisplayUrl(report.contactSheetUrl)} alt={`${asset.label}抽帧接触表`} />}{report && <small>{report.width && report.height ? `${report.width} × ${report.height}` : ''}{report.hasAudio ? ' · 原生音频' : asset.kind === 'video' ? ' · 无原生音频' : ''}{report.errors.length ? ` · ${report.errors.length} 个问题` : report.warnings.length ? ` · ${report.warnings.length} 个提醒` : ''}</small>}<div className="qc-actions"><button className="text-button" disabled={qcBusyAssetId === asset.id} onClick={() => onRunQc(asset)}><RefreshCw size={13} />{qcBusyAssetId === asset.id ? '质检中' : report ? '重新质检' : '运行 QC'}</button>{asset.kind === 'video' && report?.status === 'ready' && <><button className="text-button qc-approve" onClick={() => onSetQcStatus(asset.id, 'approved')}><Check size={13} />通过</button><button className="text-button qc-reject" onClick={() => onSetQcStatus(asset.id, 'rejected')}>驳回</button></>}{asset.kind === 'image' && <button className="text-button" onClick={() => onSetStoryboard(asset)}>故事板</button>}</div></div></article>;
+        })}</div>
+        {!visibleAssets.length && <div className="inline-empty"><Video size={20} /><span>{assetMode === 'video' ? '尚无视频候选。先选定图片帧，再提交视频任务。' : `尚无${frameLabel}候选，点击上方生成按钮开始。`}</span></div>}
+        <div className="lineage"><Layers3 size={16} /><span>镜头 {String(shot?.number ?? 1).padStart(2, '0')}</span><ChevronRight size={14} /><span>提示词 {prompt.id.slice(-6)}</span><ChevronRight size={14} /><span>{bindings.length} 个参考输入</span><ChevronRight size={14} /><span>{selectedAsset?.label ?? '未选择首选素材'}</span><span className="lineage-kept">生成血缘已保留</span></div>
+      </div>
+    </div>
   </>;
 }
 
 function PromptEditor({ prompt, onCancel, onSave }: { prompt: Project['prompts'][number]; onCancel: () => void; onSave: (id: string, text: string, negativeText: string) => void }) {
   const [text, setText] = useState(prompt.text);
   const [negativeText, setNegativeText] = useState(prompt.negativeText);
-  return <section className="prompt-editor"><div><span className="eyebrow">PROMPT REVISION</span><h3>编辑当前镜头提示词</h3></div><label>正向提示词<textarea value={text} onChange={(event) => setText(event.target.value)} /></label><label>负面约束<textarea value={negativeText} onChange={(event) => setNegativeText(event.target.value)} /></label><div className="prompt-editor-actions"><button className="quiet-action" onClick={onCancel}>取消</button><button className="primary-button" onClick={() => onSave(prompt.id, text, negativeText)}><Check size={16} />保存为新版本</button></div></section>;
+  return <section className="prompt-editor"><div><span className="eyebrow">提示词版本</span><h3>编辑当前镜头提示词</h3></div><label>正向提示词<textarea value={text} onChange={(event) => setText(event.target.value)} /></label><label>负面约束<textarea value={negativeText} onChange={(event) => setNegativeText(event.target.value)} /></label><div className="prompt-editor-actions"><button className="quiet-action" onClick={onCancel}>取消</button><button className="primary-button" onClick={() => onSave(prompt.id, text, negativeText)}><Check size={16} />保存为新版本</button></div></section>;
 }
 
 function TimelineEditor({ project, onToggle, onMove, onUpdateDuration, onReset }: { project: Project; onToggle: (shotId: string) => void; onMove: (shotId: string, direction: -1 | 1) => void; onUpdateDuration: (shotId: string, duration: number) => void; onReset: () => void }) {
   const entries = timelineEntries(project);
   const exportableCount = entries.filter((entry) => entry.clip.enabled && entry.asset).length;
-  return <section className="sequence-editor"><div className="sequence-editor-head"><div><span className="eyebrow">SHOT SEQUENCE</span><h3>镜头序列</h3></div><div className="sequence-editor-summary"><b>{exportableCount}</b> 段可导出<span>/</span>{entries.length} 个镜头</div></div>{entries.length ? <div className="sequence-list">{entries.map(({ clip, shot, asset }, index) => <article className={`sequence-item ${clip.enabled ? '' : 'disabled'} ${asset ? '' : 'unready'}`} key={clip.id}><span className="sequence-index">{String(index + 1).padStart(2, '0')}</span><div className="sequence-thumb">{asset?.kind === 'video' ? <video src={mediaDisplayUrl(asset.url)} muted playsInline preload="metadata" aria-label={`${shot.framing}视频预览`} /> : asset ? <img src={mediaDisplayUrl(asset.url)} alt={`${shot.framing}预览`} /> : <Clapperboard size={17} />}</div><div className="sequence-info"><b>{shot.framing}</b><span>镜头 {String(shot.number).padStart(2, '0')} · {asset ? asset.label : '尚未选定素材'}</span><small>{asset ? asset.kind === 'video' ? '视频候选' : '图片帧' : '完成素材选择后才能导出'}</small></div><label className="sequence-duration">时长<input type="number" min="0.5" max="30" step="0.1" value={clip.duration} aria-label={`镜头 ${shot.number} 序列时长`} onChange={(event) => onUpdateDuration(shot.id, Number(event.target.value) || 0.5)} /><span>s</span></label><div className="sequence-actions"><IconButton label="上移镜头" onClick={() => onMove(shot.id, -1)} active={index > 0}><ArrowUp size={14} /></IconButton><IconButton label="下移镜头" onClick={() => onMove(shot.id, 1)} active={index < entries.length - 1}><ArrowDown size={14} /></IconButton><IconButton label={clip.enabled ? '移出导出序列' : '加入导出序列'} onClick={() => onToggle(shot.id)} active={clip.enabled}>{clip.enabled ? <Eye size={14} /> : <EyeOff size={14} />}</IconButton></div></article>)}</div> : <div className="inline-empty"><Clapperboard size={18} /><span>还没有可编排的镜头。</span></div>}<div className="sequence-editor-foot"><span>关闭的镜头、未选素材的镜头不会进入导出；顺序和时长会保存到项目。</span><button className="text-button" onClick={onReset}><RotateCw size={13} />恢复剧本顺序</button></div></section>;
+  return <section className="sequence-editor"><div className="sequence-editor-head"><div><span className="eyebrow">镜头序列</span><h3>剪辑顺序</h3></div><div className="sequence-editor-summary"><b>{exportableCount}</b> 段可导出<span>/</span>{entries.length} 个镜头</div></div>{entries.length ? <div className="sequence-list">{entries.map(({ clip, shot, asset }, index) => <article className={`sequence-item ${clip.enabled ? '' : 'disabled'} ${asset ? '' : 'unready'}`} key={clip.id}><span className="sequence-index">{String(index + 1).padStart(2, '0')}</span><div className="sequence-thumb">{asset?.kind === 'video' ? <video src={mediaDisplayUrl(asset.url)} muted playsInline preload="metadata" aria-label={`${shot.framing}视频预览`} /> : asset ? <img src={mediaDisplayUrl(asset.url)} alt={`${shot.framing}预览`} /> : <Clapperboard size={17} />}</div><div className="sequence-info"><b>{shot.framing}</b><span>镜头 {String(shot.number).padStart(2, '0')} · {asset ? asset.label : '尚未选定素材'}</span><small>{asset ? asset.kind === 'video' ? '视频候选' : '图片帧' : '完成素材选择后才能导出'}</small></div><label className="sequence-duration">时长<input type="number" min="0.5" max="30" step="0.1" value={clip.duration} aria-label={`镜头 ${shot.number} 序列时长`} onChange={(event) => onUpdateDuration(shot.id, Number(event.target.value) || 0.5)} /><span>s</span></label><div className="sequence-actions"><IconButton label="上移镜头" onClick={() => onMove(shot.id, -1)} active={index > 0}><ArrowUp size={14} /></IconButton><IconButton label="下移镜头" onClick={() => onMove(shot.id, 1)} active={index < entries.length - 1}><ArrowDown size={14} /></IconButton><IconButton label={clip.enabled ? '移出导出序列' : '加入导出序列'} onClick={() => onToggle(shot.id)} active={clip.enabled}>{clip.enabled ? <Eye size={14} /> : <EyeOff size={14} />}</IconButton></div></article>)}</div> : <div className="inline-empty"><Clapperboard size={18} /><span>还没有可编排的镜头。</span></div>}<div className="sequence-editor-foot"><span>关闭的镜头、未选素材的镜头不会进入导出；顺序和时长会保存到项目。</span><button className="text-button" onClick={onReset}><RotateCw size={13} />恢复剧本顺序</button></div></section>;
 }
 
-function AssemblyStage({ project, notice, exporting, voiceGenerating, onExport, onGenerateVoice, onImportAudio, onToggleAudio, onUpdateAudio, onToggleTimeline, onMoveTimeline, onUpdateTimelineDuration, onResetTimeline, onGenerateSubtitles, onUpdateSubtitle }: { project: Project; notice: (message: string) => void; exporting: boolean; voiceGenerating: boolean; onExport: (options?: FinalCutExportOptions) => void; onGenerateVoice: () => void; onImportAudio: (kind: Exclude<AudioTrack['kind'], 'subtitle'>) => void; onToggleAudio: (trackId: string) => void; onUpdateAudio: (trackId: string, changes: Partial<AudioTrack>) => void; onToggleTimeline: (shotId: string) => void; onMoveTimeline: (shotId: string, direction: -1 | 1) => void; onUpdateTimelineDuration: (shotId: string, duration: number) => void; onResetTimeline: () => void; onGenerateSubtitles: () => void; onUpdateSubtitle: (subtitleId: string, changes: Partial<SubtitleCue>) => void }) {
+function SequenceCheckPanel({ report }: { report: SequenceCheckReport }) {
+  const errors = report.items.filter((item) => item.level === 'error').length;
+  const warnings = report.items.filter((item) => item.level === 'warning').length;
+  return <section className={`sequence-report ${errors ? 'has-errors' : ''}`}><div className="sequence-report-head"><div><span className="eyebrow">EXPORT GATE</span><h3>序列检查报告</h3></div><div className="sequence-report-counts"><b className="report-pass">{errors ? '未通过' : '可导出'}</b><span>{errors} 个阻断</span><span>{warnings} 个提醒</span></div></div><div className="sequence-report-list">{report.items.map((item, index) => <div className={`sequence-report-item report-${item.level}`} key={`${item.label}-${index}`}>{item.level === 'error' ? <CircleAlert size={15} /> : item.level === 'warning' ? <AlertTriangle size={15} /> : <CheckCircle2 size={15} />}<div><b>{item.label}</b><span>{item.detail}</span></div></div>)}</div></section>;
+}
+
+function AssemblyStage({ project, notice, exporting, voiceGenerating, onExport, onGenerateVoice, onImportAudio, onToggleAudio, onUpdateAudio, onToggleTimeline, onMoveTimeline, onUpdateTimelineDuration, onResetTimeline, onGenerateSubtitles, onUpdateSubtitle, onCheckSequence, sequenceReport }: { project: Project; notice: (message: string) => void; exporting: boolean; voiceGenerating: boolean; onExport: (options?: FinalCutExportOptions) => void; onGenerateVoice: () => void; onImportAudio: (kind: Exclude<AudioTrack['kind'], 'subtitle'>) => void; onToggleAudio: (trackId: string) => void; onUpdateAudio: (trackId: string, changes: Partial<AudioTrack>) => void; onToggleTimeline: (shotId: string) => void; onMoveTimeline: (shotId: string, direction: -1 | 1) => void; onUpdateTimelineDuration: (shotId: string, duration: number) => void; onResetTimeline: () => void; onGenerateSubtitles: () => void; onUpdateSubtitle: (subtitleId: string, changes: Partial<SubtitleCue>) => void; onCheckSequence: () => void; sequenceReport: SequenceCheckReport | null }) {
   const [coverDuration, setCoverDuration] = useState(0.6);
   const [endCardDuration, setEndCardDuration] = useState(0.6);
   const selectedTimeline = selectedTimelineItems(project);
@@ -1283,11 +1517,176 @@ function AssemblyStage({ project, notice, exporting, voiceGenerating, onExport, 
   const exportDuration = totalDuration + coverDuration + endCardDuration;
   const latestExport = project.exports?.[0];
   const timelineEditor = <TimelineEditor project={project} onToggle={onToggleTimeline} onMove={onMoveTimeline} onUpdateDuration={onUpdateTimelineDuration} onReset={onResetTimeline} />;
-  if (!preview) return <><SectionTitle eyebrow="FINAL CUT" title="声音与成片" />{timelineEditor}<div className="empty-stage"><Film size={28} /><h3>尚无可导出的镜头素材</h3><p>在序列中保留至少一个已选视频或图片帧，再继续检查声音和导出设置。</p></div></>;
-  return <><SectionTitle eyebrow="FINAL CUT" title="声音与成片"><div className="section-actions"><button className="quiet-action" disabled={voiceGenerating} onClick={onGenerateVoice}><Mic2 size={15} />{voiceGenerating ? '生成配音中...' : '生成 AI 配音'}</button><button className="quiet-action" onClick={() => onImportAudio('dialogue')}><Mic2 size={15} />导入配音</button><button className="quiet-action" onClick={() => onImportAudio('music')}><Music2 size={15} />导入音乐</button><button className="quiet-action" onClick={() => onImportAudio('sfx')}><Volume2 size={15} />导入音效</button><button className="quiet-action" onClick={onGenerateSubtitles}><Captions size={15} />{project.subtitles?.length ? '重新生成字幕' : '生成字幕草稿'}</button><button className="quiet-action" onClick={() => notice(`当前成片将按 ${selectedTimeline.length} 个已选镜头顺序导出`)}><Play size={15} />检查序列</button><button className="quiet-action" disabled={exporting || selectedTimeline.length < 3} onClick={() => onExport({ kind: 'batch-preview', coverDuration, endCardDuration })}><Layers3 size={15} />批次预览</button><button className="primary-button" disabled={exporting} onClick={() => onExport({ coverDuration, endCardDuration })}><Download size={16} />{exporting ? '正在导出...' : '导出 H.264 MP4'}</button></div></SectionTitle>{timelineEditor}<div className="assembly-preview">{preview.kind === 'video' ? <video src={mediaDisplayUrl(preview.url)} controls playsInline preload="metadata" aria-label="成片首段预览"/> : <img src={mediaDisplayUrl(preview.url)} alt="成片首段预览"/>}<div className="safe-area">{project.aspectRatio} 字幕安全区</div></div><div className="selected-sequence">{selectedTimeline.map(({ shot, clip, asset }) => <div key={shot.id}><span>镜头 {String(shot.number).padStart(2, '0')}</span><b>{asset.label}</b><small>{clip.duration}s · {asset.kind === 'video' ? '视频' : '静帧转场'}</small></div>)}</div><section className="subtitle-editor"><div className="subtitle-editor-head"><div><span className="eyebrow">SUBTITLES</span><h3>字幕时间轴</h3></div><span>{project.subtitles?.length ?? 0} 条</span></div>{project.subtitles?.length ? project.subtitles.map((cue) => <div className="subtitle-row" key={cue.id}><input value={cue.start} type="number" min="0" step="0.1" aria-label="字幕开始时间" onChange={(event) => onUpdateSubtitle(cue.id, { start: Math.max(0, Number(event.target.value) || 0) })} /><span>至</span><input value={cue.end} type="number" min="0.1" step="0.1" aria-label="字幕结束时间" onChange={(event) => onUpdateSubtitle(cue.id, { end: Math.max(0.1, Number(event.target.value) || 0.1) })} /><textarea value={cue.text} aria-label="字幕文本" onChange={(event) => onUpdateSubtitle(cue.id, { text: event.target.value })} /></div>) : <div className="inline-empty"><Captions size={18} /><span>从剧本台词生成字幕草稿，之后可逐条调整。</span></div>}</section><div className="timeline"><div className="timeline-ruler"><span>00:00</span><span>{Math.round(exportDuration / 3)}s</span><span>{Math.round(exportDuration / 3 * 2)}s</span><span>{Math.round(exportDuration)}s</span></div>{project.audioTracks.map((track) => <div className={`track ${track.enabled ? '' : 'disabled'}`} key={track.id}><span>{track.kind === 'dialogue' ? '台词' : track.kind === 'music' ? '配乐' : track.kind === 'sfx' ? '音效' : '字幕'}</span><div className="track-clip"><b>{track.label}</b><small>{track.sourceUrl ? '本机文件' : '待导入'}</small><div className="track-controls"><label>开始<input type="number" min="0" step="0.1" value={track.start ?? 0} onChange={(event) => onUpdateAudio(track.id, { start: Math.max(0, Number(event.target.value) || 0) })} /></label><label>时长<input type="number" min="0.1" step="0.1" value={track.duration} onChange={(event) => onUpdateAudio(track.id, { duration: Math.max(0.1, Number(event.target.value) || 0.1) })} /></label><label>音量<input type="number" min="0" max="4" step="0.05" value={track.volume ?? 1} onChange={(event) => onUpdateAudio(track.id, { volume: Math.min(4, Math.max(0, Number(event.target.value) || 0)) })} /></label></div></div><button aria-label={`${track.enabled ? '静音' : '启用'} ${track.label}`} onClick={() => onToggleAudio(track.id)}>{track.enabled ? <Music2 size={15} /> : <X size={15} />}</button></div>)}</div><div className="export-options"><div><b>导出设置</b><span>H.264 MP4 · {project.aspectRatio === '9:16' ? '1080 × 1920' : '1920 × 1080'} · {selectedTimeline.length} 段镜头 · {exportDuration.toFixed(1)} 秒{latestExport ? ` · 上次导出 ${latestExport.clipCount} 段` : ''}</span><div className="export-controls"><label>封面冻结 <input type="number" min="0" max="10" step="0.1" value={coverDuration} onChange={(event) => setCoverDuration(Math.max(0, Math.min(10, Number(event.target.value) || 0)))} />s</label><label>片尾冻结 <input type="number" min="0" max="10" step="0.1" value={endCardDuration} onChange={(event) => setEndCardDuration(Math.max(0, Math.min(10, Number(event.target.value) || 0)))} />s</label></div></div><button className="quiet-action" disabled={exporting} onClick={() => onExport({ coverDuration, endCardDuration })}><Download size={15} />导出</button></div></>;
+  if (!preview) return <><SectionTitle eyebrow="FINAL CUT" title="声音与成片"><button className="quiet-action" onClick={onCheckSequence}><ListChecks size={15} />检查序列</button></SectionTitle>{timelineEditor}{sequenceReport && <SequenceCheckPanel report={sequenceReport} />}<div className="empty-stage"><Film size={28} /><h3>尚无可导出的镜头素材</h3><p>在序列中保留至少一个已选视频或图片帧，再继续检查声音和导出设置。</p></div></>;
+  return <><SectionTitle eyebrow="FINAL CUT" title="声音与成片"><div className="section-actions"><button className="quiet-action" disabled={voiceGenerating} onClick={onGenerateVoice}><Mic2 size={15} />{voiceGenerating ? '生成配音中...' : '生成 AI 配音'}</button><button className="quiet-action" onClick={() => onImportAudio('dialogue')}><Mic2 size={15} />导入配音</button><button className="quiet-action" onClick={() => onImportAudio('music')}><Music2 size={15} />导入音乐</button><button className="quiet-action" onClick={() => onImportAudio('sfx')}><Volume2 size={15} />导入音效</button><button className="quiet-action" onClick={onGenerateSubtitles}><Captions size={15} />{project.subtitles?.length ? '重新生成字幕' : '生成字幕草稿'}</button><button className="quiet-action" onClick={onCheckSequence}><ListChecks size={15} />检查序列</button><button className="quiet-action" disabled={exporting || selectedTimeline.length < 3} onClick={() => onExport({ kind: 'batch-preview', coverDuration, endCardDuration })}><Layers3 size={15} />批次预览</button><button className="primary-button" disabled={exporting} onClick={() => onExport({ coverDuration, endCardDuration })}><Download size={16} />{exporting ? '正在导出...' : '导出 H.264 MP4'}</button></div></SectionTitle>{timelineEditor}{sequenceReport && <SequenceCheckPanel report={sequenceReport} />}<div className="assembly-preview">{preview.kind === 'video' ? <video src={mediaDisplayUrl(preview.url)} controls playsInline preload="metadata" aria-label="成片首段预览"/> : <img src={mediaDisplayUrl(preview.url)} alt="成片首段预览"/>}<div className="safe-area">{project.aspectRatio} 字幕安全区</div></div><div className="selected-sequence">{selectedTimeline.map(({ shot, clip, asset }) => <div key={shot.id}><span>镜头 {String(shot.number).padStart(2, '0')}</span><b>{asset.label}</b><small>{clip.duration}s · {asset.kind === 'video' ? '视频' : '静帧转场'}</small></div>)}</div><section className="subtitle-editor"><div className="subtitle-editor-head"><div><span className="eyebrow">SUBTITLES</span><h3>字幕时间轴</h3></div><span>{project.subtitles?.length ?? 0} 条</span></div>{project.subtitles?.length ? project.subtitles.map((cue) => <div className="subtitle-row" key={cue.id}><input value={cue.start} type="number" min="0" step="0.1" aria-label="字幕开始时间" onChange={(event) => onUpdateSubtitle(cue.id, { start: Math.max(0, Number(event.target.value) || 0) })} /><span>至</span><input value={cue.end} type="number" min="0.1" step="0.1" aria-label="字幕结束时间" onChange={(event) => onUpdateSubtitle(cue.id, { end: Math.max(0.1, Number(event.target.value) || 0.1) })} /><textarea value={cue.text} aria-label="字幕文本" onChange={(event) => onUpdateSubtitle(cue.id, { text: event.target.value })} /></div>) : <div className="inline-empty"><Captions size={18} /><span>从剧本台词生成字幕草稿，之后可逐条调整。</span></div>}</section><div className="timeline"><div className="timeline-ruler"><span>00:00</span><span>{Math.round(exportDuration / 3)}s</span><span>{Math.round(exportDuration / 3 * 2)}s</span><span>{Math.round(exportDuration)}s</span></div>{project.audioTracks.map((track) => <div className={`track ${track.enabled ? '' : 'disabled'}`} key={track.id}><span>{track.kind === 'dialogue' ? '台词' : track.kind === 'music' ? '配乐' : track.kind === 'sfx' ? '音效' : '字幕'}</span><div className="track-clip"><b>{track.label}</b><small>{track.sourceUrl ? '本机文件' : '待导入'}</small><div className="track-controls"><label>开始<input type="number" min="0" step="0.1" value={track.start ?? 0} onChange={(event) => onUpdateAudio(track.id, { start: Math.max(0, Number(event.target.value) || 0) })} /></label><label>时长<input type="number" min="0.1" step="0.1" value={track.duration} onChange={(event) => onUpdateAudio(track.id, { duration: Math.max(0.1, Number(event.target.value) || 0.1) })} /></label><label>音量<input type="number" min="0" max="4" step="0.05" value={track.volume ?? 1} onChange={(event) => onUpdateAudio(track.id, { volume: Math.min(4, Math.max(0, Number(event.target.value) || 0)) })} /></label></div></div><button aria-label={`${track.enabled ? '静音' : '启用'} ${track.label}`} onClick={() => onToggleAudio(track.id)}>{track.enabled ? <Music2 size={15} /> : <X size={15} />}</button></div>)}</div><div className="export-options"><div><b>导出设置</b><span>H.264 MP4 · {project.aspectRatio === '9:16' ? '1080 × 1920' : '1920 × 1080'} · {selectedTimeline.length} 段镜头 · {exportDuration.toFixed(1)} 秒{latestExport ? ` · 上次导出 ${latestExport.clipCount} 段` : ''}</span><div className="export-controls"><label>封面冻结 <input type="number" min="0" max="10" step="0.1" value={coverDuration} onChange={(event) => setCoverDuration(Math.max(0, Math.min(10, Number(event.target.value) || 0)))} />s</label><label>片尾冻结 <input type="number" min="0" max="10" step="0.1" value={endCardDuration} onChange={(event) => setEndCardDuration(Math.max(0, Math.min(10, Number(event.target.value) || 0)))} />s</label></div></div><button className="quiet-action" disabled={exporting} onClick={() => onExport({ coverDuration, endCardDuration })}><Download size={15} />导出</button></div></>;
 }
 
-function Inspector({ project, stage, activeShot, selectedAsset, setShowSettings, cancelVideoJob, recheckVideoJob }: { project: Project; stage: Stage; activeShot: string; selectedAsset?: CandidateAsset; setShowSettings: (value: boolean) => void; cancelVideoJob: (jobId: string) => void; recheckVideoJob: (jobId: string) => void }) {
+function formatTimelineTime(value: number) {
+  const safe = Math.max(0, value);
+  const minutes = Math.floor(safe / 60).toString().padStart(2, '0');
+  const seconds = Math.floor(safe % 60).toString().padStart(2, '0');
+  const tenths = Math.floor((safe % 1) * 10);
+  return `${minutes}:${seconds}.${tenths}`;
+}
+
+function SequencePreview({ project, onSelectShot }: { project: Project; onSelectShot: (shotId: string) => void }) {
+  const entries = useMemo(() => selectedTimelineItems(project), [project]);
+  const total = entries.reduce((sum, entry) => sum + entry.clip.duration, 0);
+  const offsets = useMemo(() => {
+    let cursor = 0;
+    return entries.map((entry) => {
+      const offset = cursor;
+      cursor += entry.clip.duration;
+      return offset;
+    });
+  }, [entries]);
+  const [playhead, setPlayhead] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const activeIndex = Math.min(entries.length - 1, Math.max(0, entries.findIndex((entry, index) => playhead < offsets[index] + entry.clip.duration) < 0 ? entries.length - 1 : entries.findIndex((entry, index) => playhead < offsets[index] + entry.clip.duration)));
+  const active = entries[activeIndex];
+  const activeOffset = offsets[activeIndex] ?? 0;
+  const activeLocalTime = Math.max(0, playhead - activeOffset);
+
+  useEffect(() => {
+    setPlayhead((current) => Math.min(current, total));
+    if (!entries.length) setPlaying(false);
+  }, [entries.length, total]);
+
+  useEffect(() => {
+    if (!playing || !entries.length || active?.asset.kind === 'video') return undefined;
+    const timer = window.setInterval(() => {
+      setPlayhead((current) => {
+        const next = Math.min(total, Number((current + 0.1).toFixed(2)));
+        if (next >= total) setPlaying(false);
+        return next;
+      });
+    }, 100);
+    return () => window.clearInterval(timer);
+  }, [active?.asset.kind, entries.length, playing, total]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !active || active.asset.kind !== 'video') return;
+    if (!playing) {
+      try { video.currentTime = Math.min(active.clip.duration, activeLocalTime); } catch { /* metadata may not be ready yet */ }
+    }
+    if (playing) void video.play().catch(() => setPlaying(false));
+    else video.pause();
+  }, [active?.asset.id, active?.clip.duration, playing]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !active || active.asset.kind !== 'video' || playing) return;
+    try { video.currentTime = Math.min(active.clip.duration, activeLocalTime); } catch { /* metadata may not be ready yet */ }
+  }, [activeLocalTime, active?.asset.kind, active?.clip.duration, playing]);
+
+  const jumpTo = (index: number) => {
+    if (!entries[index]) return;
+    setPlayhead(offsets[index]);
+    onSelectShot(entries[index].shot.id);
+  };
+  const step = (direction: -1 | 1) => {
+    const nextIndex = Math.min(entries.length - 1, Math.max(0, activeIndex + direction));
+    jumpTo(nextIndex);
+  };
+  const togglePlayback = () => {
+    if (!entries.length) return;
+    if (playhead >= total) setPlayhead(0);
+    setPlaying((current) => !current);
+  };
+  const handleVideoTimeUpdate = () => {
+    if (!videoRef.current || !active || active.asset.kind !== 'video') return;
+    setPlayhead(Math.min(total, activeOffset + Math.min(active.clip.duration, videoRef.current.currentTime)));
+  };
+
+  if (!entries.length) return <div className="sequence-preview empty-preview"><Film size={23} /><span>保留至少一个已选素材后，序列预览会出现在这里。</span></div>;
+  return <section className="sequence-preview" aria-label="序列预览">
+    <div className="sequence-preview-head"><div><span className="eyebrow">序列预览</span><h3>按剪辑顺序检查画面</h3></div><span className="preview-readout">{formatTimelineTime(playhead)} / {formatTimelineTime(total)}</span></div>
+    <div className={`sequence-preview-stage ratio-${project.aspectRatio.replace(':', '-')}`}>
+      {active.asset.kind === 'video' ? <video key={active.asset.id} ref={videoRef} src={mediaDisplayUrl(active.asset.url)} muted playsInline preload="metadata" aria-label={`${active.shot.framing}视频预览`} onTimeUpdate={handleVideoTimeUpdate} onEnded={() => { if (activeIndex >= entries.length - 1) setPlaying(false); else step(1); }} /> : <img src={mediaDisplayUrl(active.asset.url)} alt={`${active.shot.framing}图片帧预览`} />}
+      <div className="sequence-preview-overlay"><span>镜头 {String(active.shot.number).padStart(2, '0')} · {active.shot.framing}</span><b>{active.asset.kind === 'video' ? '视频素材' : '图片帧'}</b></div>
+    </div>
+    <div className="sequence-scrubber"><input type="range" min="0" max={Math.max(0.1, total)} step="0.1" value={Math.min(playhead, total)} onChange={(event) => setPlayhead(Number(event.target.value))} aria-label="序列播放头" /><div className="sequence-scrubber-track">{entries.map((entry, index) => <i key={entry.shot.id} style={{ width: `${Math.max(2, entry.clip.duration / total * 100)}%` }} className={index === activeIndex ? 'active' : ''}></i>)}</div></div>
+    <div className="sequence-preview-controls"><button className="icon-button" onClick={() => step(-1)} aria-label="上一镜" title="上一镜"><SkipBack size={16} /></button><button className="preview-play" onClick={togglePlayback} aria-label={playing ? '暂停预览' : '播放序列'} title={playing ? '暂停预览' : '播放序列'}>{playing ? <Pause size={17} fill="currentColor" /> : <Play size={17} fill="currentColor" />}</button><button className="icon-button" onClick={() => step(1)} aria-label="下一镜" title="下一镜"><SkipForward size={16} /></button><span className="preview-hint">画面预览为静音，声音轨道将在导出时混合</span></div>
+    <div className="sequence-preview-shots">{entries.map((entry, index) => <button key={entry.shot.id} className={index === activeIndex ? 'active' : ''} onClick={() => jumpTo(index)}><span>{String(index + 1).padStart(2, '0')}</span><b>镜头 {String(entry.shot.number).padStart(2, '0')}</b><small>{entry.clip.duration}s · {entry.asset.kind === 'video' ? '视频' : '图片帧'}</small></button>)}</div>
+  </section>;
+}
+
+function SequenceCheckPanelV2({ report, onNavigate }: { report: SequenceCheckReport; onNavigate: (item: SequenceCheckItem) => void }) {
+  const errors = report.items.filter((item) => item.level === 'error').length;
+  const warnings = report.items.filter((item) => item.level === 'warning').length;
+  return <section className={`sequence-report ${errors ? 'has-errors' : ''}`}><div className="sequence-report-head"><div><span className="eyebrow">导出门禁</span><h3>序列检查报告</h3></div><div className="sequence-report-counts"><b className="report-pass">{errors ? '未通过' : '可导出'}</b><span>{errors} 个阻断</span><span>{warnings} 个提醒</span></div></div><div className="sequence-report-list">{report.items.map((item, index) => <button className={`sequence-report-item report-${item.level} ${item.shotId || item.assetId || item.trackId || item.subtitleId ? 'is-link' : ''}`} key={`${item.label}-${index}`} onClick={() => onNavigate(item)} disabled={!item.shotId && !item.assetId && !item.trackId && !item.subtitleId}>{item.level === 'error' ? <CircleAlert size={15} /> : item.level === 'warning' ? <AlertTriangle size={15} /> : <CheckCircle2 size={15} />}<span className="sequence-report-copy"><b>{item.label}</b><span>{item.detail}</span></span>{(item.shotId || item.assetId || item.trackId || item.subtitleId) && <ArrowUpRight size={14} />}</button>)}</div></section>;
+}
+
+type ProfessionalAssemblyProps = {
+  project: Project;
+  onSelectShot: (shotId: string) => void;
+  exporting: boolean;
+  voiceGenerating: boolean;
+  onExport: (options?: FinalCutExportOptions) => void;
+  onGenerateVoice: () => void;
+  onImportAudio: (kind: Exclude<AudioTrack['kind'], 'subtitle'>) => void;
+  onToggleAudio: (trackId: string) => void;
+  onUpdateAudio: (trackId: string, changes: Partial<AudioTrack>) => void;
+  onDeleteAudio: (trackId: string) => void;
+  onToggleTimeline: (shotId: string) => void;
+  onMoveTimeline: (shotId: string, direction: -1 | 1) => void;
+  onUpdateTimelineDuration: (shotId: string, duration: number) => void;
+  onResetTimeline: () => void;
+  onGenerateSubtitles: () => void;
+  onAddSubtitle: () => void;
+  onUpdateSubtitle: (subtitleId: string, changes: Partial<SubtitleCue>) => void;
+  onDeleteSubtitle: (subtitleId: string) => void;
+  onCheckSequence: () => void;
+  sequenceReport: SequenceCheckReport | null;
+  onNavigateSequenceItem: (item: SequenceCheckItem) => void;
+  focusTarget: SequenceFocus | null;
+  onFocusHandled: () => void;
+};
+
+function ProfessionalAssemblyStage({ project, exporting, voiceGenerating, onExport, onGenerateVoice, onImportAudio, onToggleAudio, onUpdateAudio, onDeleteAudio, onToggleTimeline, onMoveTimeline, onUpdateTimelineDuration, onResetTimeline, onGenerateSubtitles, onAddSubtitle, onUpdateSubtitle, onDeleteSubtitle, onCheckSequence, sequenceReport, onNavigateSequenceItem, onSelectShot, focusTarget, onFocusHandled }: ProfessionalAssemblyProps) {
+  const [coverDuration, setCoverDuration] = useState(0.6);
+  const [endCardDuration, setEndCardDuration] = useState(0.6);
+  const selectedTimeline = selectedTimelineItems(project);
+  const sequenceDuration = selectedTimeline.reduce((total, item) => total + item.clip.duration, 0);
+  const transitionDuration = selectedTimeline.length > 1 ? 0.35 : 0;
+  const totalDuration = Math.max(0.1, sequenceDuration - transitionDuration * Math.max(0, selectedTimeline.length - 1));
+  const exportDuration = totalDuration + coverDuration + endCardDuration;
+  const latestExport = project.exports?.[0];
+  const subtitles = project.subtitles ?? [];
+  const audioTracks = project.audioTracks.filter((track) => track.kind !== 'subtitle');
+  const timelineEditor = <TimelineEditor project={project} onToggle={onToggleTimeline} onMove={onMoveTimeline} onUpdateDuration={onUpdateTimelineDuration} onReset={onResetTimeline} />;
+  useEffect(() => {
+    if (!focusTarget) return undefined;
+    const elementId = focusTarget.kind === 'track' ? `audio-track-${focusTarget.id}` : `subtitle-${focusTarget.id}`;
+    const element = document.getElementById(elementId);
+    if (!element) return undefined;
+    element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    element.classList.add('is-focus-target');
+    const timeout = window.setTimeout(() => {
+      element.classList.remove('is-focus-target');
+      onFocusHandled();
+    }, 1800);
+    return () => {
+      window.clearTimeout(timeout);
+      element.classList.remove('is-focus-target');
+    };
+  }, [focusTarget, onFocusHandled]);
+  return <>
+    <SectionTitle eyebrow="剪辑与输出" title="声音与成片"><div className="section-actions"><button className="quiet-action" disabled={voiceGenerating} onClick={onGenerateVoice}><Mic2 size={15} />{voiceGenerating ? '生成配音中...' : '生成 AI 配音'}</button><button className="quiet-action" onClick={() => onImportAudio('dialogue')}><Mic2 size={15} />导入配音</button><button className="quiet-action" onClick={() => onImportAudio('music')}><Music2 size={15} />导入音乐</button><button className="quiet-action" onClick={() => onImportAudio('sfx')}><Volume2 size={15} />导入音效</button><button className="quiet-action" onClick={onGenerateSubtitles}><Captions size={15} />{subtitles.length ? '重新生成字幕' : '生成字幕草稿'}</button><button className="quiet-action" onClick={onCheckSequence}><ListChecks size={15} />检查序列</button><button className="quiet-action" disabled={exporting || selectedTimeline.length < 3} onClick={() => onExport({ kind: 'batch-preview', coverDuration, endCardDuration })}><Layers3 size={15} />批次预览</button><button className="primary-button" disabled={exporting || !selectedTimeline.length} onClick={() => onExport({ coverDuration, endCardDuration })}><Download size={16} />{exporting ? '正在导出...' : '导出 H.264 MP4'}</button></div></SectionTitle>
+    {timelineEditor}
+    {sequenceReport && <SequenceCheckPanelV2 report={sequenceReport} onNavigate={onNavigateSequenceItem} />}
+    {!selectedTimeline.length ? <div className="empty-stage"><Film size={28} /><h3>尚无可导出的镜头素材</h3><p>在序列中保留至少一个已选视频或图片帧，再继续检查声音和导出设置。</p></div> : <>
+      <SequencePreview project={project} onSelectShot={onSelectShot} />
+      <section className="subtitle-editor"><div className="subtitle-editor-head"><div><span className="eyebrow">字幕编辑</span><h3>字幕时间轴</h3></div><div className="subtitle-editor-tools"><span>{subtitles.length} 条</span><button className="text-button" onClick={onAddSubtitle}><Plus size={14} />新增字幕</button></div></div>{subtitles.length ? subtitles.map((cue) => <div className="subtitle-row" id={`subtitle-${cue.id}`} key={cue.id}><input value={cue.start} type="number" min="0" step="0.1" aria-label="字幕开始时间" onChange={(event) => onUpdateSubtitle(cue.id, { start: Math.max(0, Number(event.target.value) || 0) })} /><span>至</span><input value={cue.end} type="number" min="0.1" step="0.1" aria-label="字幕结束时间" onChange={(event) => onUpdateSubtitle(cue.id, { end: Math.max(0.1, Number(event.target.value) || 0.1) })} /><textarea value={cue.text} aria-label="字幕文本" onChange={(event) => onUpdateSubtitle(cue.id, { text: event.target.value })} /><button className="icon-button subtitle-delete" onClick={() => onDeleteSubtitle(cue.id)} aria-label={`删除字幕 ${cue.text}`} title="删除字幕"><Trash2 size={14} /></button></div>) : <div className="inline-empty"><Captions size={18} /><span>从剧本台词生成字幕草稿，之后可逐条调整。</span></div>}</section>
+      <section className="timeline"><div className="timeline-section-head"><div><span className="eyebrow">音频轨道</span><h3>声音层</h3></div><span>{audioTracks.length} 条轨道</span></div><div className="timeline-ruler"><span>00:00</span><span>{formatTimelineTime(exportDuration / 3)}</span><span>{formatTimelineTime(exportDuration / 3 * 2)}</span><span>{formatTimelineTime(exportDuration)}</span></div>{audioTracks.length ? audioTracks.map((track) => { const left = Math.min(90, Math.max(0, ((track.start ?? 0) / Math.max(1, exportDuration)) * 100)); const width = Math.min(Math.max(10, (track.duration / Math.max(1, exportDuration)) * 100), Math.max(10, 100 - left)); return <div className={`track ${track.enabled ? '' : 'disabled'}`} id={`audio-track-${track.id}`} key={track.id}><span>{track.kind === 'dialogue' ? '台词' : track.kind === 'music' ? '配乐' : '音效'}</span><div className="track-lane"><div className="track-clip" style={{ width: `${width}%`, marginLeft: `${left}%` }}><b>{track.label}</b><small>{track.sourceUrl ? '本机文件' : '待导入'}</small><div className="track-controls"><label>开始<input type="number" min="0" step="0.1" value={track.start ?? 0} onChange={(event) => onUpdateAudio(track.id, { start: Math.max(0, Number(event.target.value) || 0) })} /></label><label>时长<input type="number" min="0.1" step="0.1" value={track.duration} onChange={(event) => onUpdateAudio(track.id, { duration: Math.max(0.1, Number(event.target.value) || 0.1) })} /></label><label>音量<input type="number" min="0" max="4" step="0.05" value={track.volume ?? 1} onChange={(event) => onUpdateAudio(track.id, { volume: Math.min(4, Math.max(0, Number(event.target.value) || 0)) })} /></label></div></div></div><button className="track-toggle" aria-label={`${track.enabled ? '静音' : '启用'} ${track.label}`} onClick={() => onToggleAudio(track.id)}>{track.enabled ? <Volume2 size={15} /> : <X size={15} />}</button><button className="track-delete" aria-label={`删除 ${track.label}`} title="删除音频轨道" onClick={() => onDeleteAudio(track.id)}><Trash2 size={14} /></button></div>; }) : <div className="inline-empty audio-empty"><Volume2 size={17} /><span>还没有声音轨道。可以导入配音、音乐或音效。</span></div>}</section>
+      <div className="export-options"><div><b>导出设置</b><span>H.264 MP4 · {project.aspectRatio === '9:16' ? '1080 × 1920' : '1920 × 1080'} · {selectedTimeline.length} 段镜头 · {exportDuration.toFixed(1)} 秒{latestExport ? ` · 上次导出 ${latestExport.clipCount} 段` : ''}</span><div className="export-controls"><label>封面冻结 <input type="number" min="0" max="10" step="0.1" value={coverDuration} onChange={(event) => setCoverDuration(Math.max(0, Math.min(10, Number(event.target.value) || 0)))} />s</label><label>片尾冻结 <input type="number" min="0" max="10" step="0.1" value={endCardDuration} onChange={(event) => setEndCardDuration(Math.max(0, Math.min(10, Number(event.target.value) || 0)))} />s</label></div></div><button className="quiet-action" disabled={exporting} onClick={() => onExport({ coverDuration, endCardDuration })}><Download size={15} />导出</button></div>
+    </>}
+  </>;
+}
+
+function Inspector({ project, stage, activeShot, selectedAsset, setShowSettings, cancelVideoJob, recheckVideoJob, collapsed, onToggle, onAspectRatioChange }: { project: Project; stage: Stage; activeShot: string; selectedAsset?: CandidateAsset; setShowSettings: (value: boolean) => void; cancelVideoJob: (jobId: string) => void; recheckVideoJob: (jobId: string) => void; collapsed: boolean; onToggle: () => void; onAspectRatioChange: (aspectRatio: Project['aspectRatio']) => void }) {
   const recentJobs = project.jobs.slice(0, 6);
   const jobStatusLabel = (status: Project['jobs'][number]['status']) => status === 'succeeded' ? '已完成' : status === 'cancelled' ? '已取消' : status === 'failed' ? '失败' : status === 'unknown' ? '提交结果待确认' : '进行中';
   const adaptedEpisodes = project.episodes?.filter((episode) => episode.status !== 'draft').length ?? project.scenes.filter((scene) => scene.status !== 'draft').length;
@@ -1297,11 +1696,16 @@ function Inspector({ project, stage, activeShot, selectedAsset, setShowSettings,
   const activeShotRecord = project.shots.find((shot) => shot.id === activeShot && !shot.archived);
   const activePrompt = activeShotRecord ? [...project.prompts].reverse().find((prompt) => prompt.assetId === activeShotRecord.id) : undefined;
   const continuityBindings = activeShotRecord ? referenceBindingsFor(project, activeShotRecord, activePrompt?.id ?? '') : [];
-  return <aside className="inspector"><div className="inspector-header"><span>检查器</span><IconButton label="收起检查器"><PanelLeftClose size={16} /></IconButton></div>{stage === '素材' && <><div className="inspect-section"><h3>生成设置</h3><label>画幅 <select defaultValue={project.aspectRatio}><option>9:16</option><option>16:9</option></select></label><label>分辨率 <select defaultValue="1024 × 1536"><option>1024 × 1536</option><option>1536 × 1024</option></select></label><label>角色一致性 <div className="toggle on"><span></span>绑定参考图</div></label></div><div className="inspect-section"><h3>当前选择</h3>{selectedAsset ? <img className="inspect-image" src={mediaDisplayUrl(selectedAsset.url)} alt="当前选择"/> : <div className="inspect-image empty-preview">未选择素材</div>}<div className="metadata"><span>供应商<b>{selectedAsset?.provider ?? '—'}</b></span><span>模型<b>{selectedAsset?.model ?? '—'}</b></span><span>版本<b>{activePrompt ? `提示词 ${activePrompt.id.slice(-6)}` : '—'}</b></span>{selectedAsset?.kind === 'video' && <span>质检<b>{selectedQc?.status === 'approved' ? '通过' : selectedQc?.status === 'ready' ? '待确认' : '未通过'}</b></span>}</div>{selectedQc?.contactSheetUrl && <img className="qc-inspect-sheet" src={mediaDisplayUrl(selectedQc.contactSheetUrl)} alt="当前视频接触表" />}</div></>}<div className="inspect-section continuity-section"><h3>当前镜头约束</h3>{activeShotRecord ? <><p className="muted">{activeShotRecord.framing} · {activeShotRecord.action}</p><div className="continuity-tags">{continuityBindings.length ? continuityBindings.map((binding) => <span className="continuity-tag" key={binding.id}>{binding.role === 'character' ? '角色' : binding.role === 'scene' ? '场景' : binding.role === 'prop' ? '道具' : '帧'} · {binding.label}</span>) : <span className="muted">尚未绑定角色或参考帧</span>}</div><p className="muted">项目约束：{project.styleGuide.constraints}</p></> : <p className="muted">选择一个镜头后显示引用和连续性约束。</p>}</div>{stage !== '素材' && <><div className="inspect-section"><h3>项目风格</h3><p className="readable">{project.styleGuide.visualStyle}</p><p className="muted">{project.styleGuide.constraints}</p></div><div className="inspect-section"><h3>创作进度</h3><div className="progress-list"><span>章节改编 <b>{adaptedEpisodes}/{project.episodes?.length ?? project.chapters.length}</b></span><span>角色确认 <b>{approvedCharacters}/{project.characters.length}</b></span><span>镜头确认 <b>{approvedShots}/{project.shots.filter((shot) => !shot.archived).length}</b></span></div></div></>}<div className="inspect-section jobs"><h3>生成队列</h3>{recentJobs.length ? <div className="job-list">{recentJobs.map((queuedJob) => <div className="job" key={queuedJob.id}><span className={`job-state ${queuedJob.status}`}></span><div><b>{queuedJob.title}</b><small>{queuedJob.provider} · {jobStatusLabel(queuedJob.status)}</small>{queuedJob.error && <small className="job-error">{queuedJob.error}</small>}</div>{queuedJob.kind === 'video' && ['queued', 'generating', 'polling'].includes(queuedJob.status) ? <button className="cancel-job" onClick={() => cancelVideoJob(queuedJob.id)} title="取消视频任务"><X size={15} /></button> : queuedJob.kind === 'video' && queuedJob.status === 'unknown' ? <button className="cancel-job recheck-job" onClick={() => recheckVideoJob(queuedJob.id)} title="重新轮询远端任务"><RefreshCw size={15} /></button> : <MoreHorizontal size={16} />}</div>)}</div> : <p className="muted">暂无生成任务</p>}</div><button className="provider-link" onClick={() => setShowSettings(true)}><Settings2 size={15} />管理模型连接<ArrowUpRight size={14} /></button></aside>;
+  if (collapsed) return <aside className="inspector is-collapsed"><div className="inspector-header"><span>检查器</span><IconButton label="展开检查器" onClick={onToggle}><PanelLeftClose size={16} /></IconButton></div></aside>;
+  return <aside className="inspector"><div className="inspector-header"><span>检查器</span><IconButton label="收起检查器" onClick={onToggle}><PanelLeftClose size={16} /></IconButton></div>{stage === '素材' && <><div className="inspect-section"><h3>生成设置</h3><label>画幅 <select value={project.aspectRatio} onChange={(event) => onAspectRatioChange(event.target.value as Project['aspectRatio'])}><option value="9:16">9:16 竖屏</option><option value="16:9">16:9 横屏</option></select></label><div className="inspector-readout"><span>输出尺寸</span><b>{project.aspectRatio === '9:16' ? '1080 × 1920' : '1920 × 1080'}</b></div><div className="inspector-readout"><span>参考输入</span><b>{continuityBindings.length ? `${continuityBindings.length} 个已锁定` : '待绑定'}</b></div></div><div className="inspect-section"><h3>当前选择</h3>{selectedAsset ? selectedAsset.kind === 'video' ? <video className="inspect-image" src={mediaDisplayUrl(selectedAsset.url)} controls muted playsInline preload="metadata" aria-label="当前选择" /> : <img className="inspect-image" src={mediaDisplayUrl(selectedAsset.url)} alt="当前选择"/> : <div className="inspect-image empty-preview">未选择素材</div>}<div className="metadata"><span>供应商<b>{selectedAsset?.provider ?? '—'}</b></span><span>模型<b>{selectedAsset?.model ?? '—'}</b></span><span>版本<b>{activePrompt ? `提示词 ${activePrompt.id.slice(-6)}` : '—'}</b></span>{selectedAsset?.kind === 'video' && <span>质检<b>{selectedQc?.status === 'approved' ? '通过' : selectedQc?.status === 'ready' ? '待确认' : '未通过'}</b></span>}</div>{selectedQc?.contactSheetUrl && <img className="qc-inspect-sheet" src={mediaDisplayUrl(selectedQc.contactSheetUrl)} alt="当前视频接触表" />}</div></>}<div className="inspect-section continuity-section"><h3>当前镜头约束</h3>{activeShotRecord ? <><p className="muted">{activeShotRecord.framing} · {activeShotRecord.action}</p><div className="continuity-tags">{continuityBindings.length ? continuityBindings.map((binding) => <span className="continuity-tag" key={binding.id}>{binding.role === 'character' ? '角色' : binding.role === 'scene' ? '场景' : binding.role === 'prop' ? '道具' : '帧'} · {binding.label}</span>) : <span className="muted">尚未绑定角色或参考帧</span>}</div><p className="muted">项目约束：{project.styleGuide.constraints}</p></> : <p className="muted">选择一个镜头后显示引用和连续性约束。</p>}</div>{stage !== '素材' && <><div className="inspect-section"><h3>项目风格</h3><p className="readable">{project.styleGuide.visualStyle}</p><p className="muted">{project.styleGuide.constraints}</p></div><div className="inspect-section"><h3>创作进度</h3><div className="progress-list"><span>章节改编 <b>{adaptedEpisodes}/{project.episodes?.length ?? project.chapters.length}</b></span><span>角色确认 <b>{approvedCharacters}/{project.characters.length}</b></span><span>镜头确认 <b>{approvedShots}/{project.shots.filter((shot) => !shot.archived).length}</b></span></div></div></>}<div className="inspect-section jobs"><h3>生成队列</h3>{recentJobs.length ? <div className="job-list">{recentJobs.map((queuedJob) => <div className="job" key={queuedJob.id}><span className={`job-state ${queuedJob.status}`}></span><div><b>{queuedJob.title}</b><small>{queuedJob.provider} · {jobStatusLabel(queuedJob.status)}</small>{queuedJob.error && <small className="job-error">{queuedJob.error}</small>}</div>{queuedJob.kind === 'video' && ['queued', 'generating', 'polling'].includes(queuedJob.status) ? <button className="cancel-job" onClick={() => cancelVideoJob(queuedJob.id)} title="取消视频任务"><X size={15} /></button> : queuedJob.kind === 'video' && queuedJob.status === 'unknown' ? <button className="cancel-job recheck-job" onClick={() => recheckVideoJob(queuedJob.id)} title="重新轮询远端任务"><RefreshCw size={15} /></button> : <MoreHorizontal size={16} />}</div>)}</div> : <p className="muted">暂无生成任务</p>}</div><button className="provider-link" onClick={() => setShowSettings(true)}><Settings2 size={15} />管理模型连接<ArrowUpRight size={14} /></button></aside>;
 }
 
 type WorkspaceNode = { id: string; type: 'project' | 'scene' | 'shot' | 'prompt' | 'asset' | 'qc' | 'export'; title: string; meta: string; x: number; y: number; shotId?: string; status?: string };
 type WorkspaceEdge = { from: string; to: string; tone?: string };
+type WorkspaceView = { x: number; y: number; zoom: number };
+
+const CANVAS_MIN_ZOOM = 0.35;
+const CANVAS_MAX_ZOOM = 1.5;
 
 function workspaceStatusLabel(status?: string) {
   switch (status) {
@@ -1321,7 +1725,28 @@ function workspaceStatusLabel(status?: string) {
 }
 
 function WorkspaceCanvas({ project, activeShot, onSelectShot }: { project: Project; activeShot: string; onSelectShot: (shotId: string) => void }) {
-  const [zoom, setZoom] = useState(0.82);
+  const viewStorageKey = `frameforge:canvas-view:${project.id}`;
+  const [view, setView] = useState<WorkspaceView>(() => {
+    if (typeof window === 'undefined') return { x: 24, y: 24, zoom: 0.82 };
+    try {
+      const stored = JSON.parse(window.localStorage.getItem(viewStorageKey) ?? 'null') as Partial<WorkspaceView> | null;
+      if (stored && typeof stored.x === 'number' && Number.isFinite(stored.x) && typeof stored.y === 'number' && Number.isFinite(stored.y) && typeof stored.zoom === 'number' && Number.isFinite(stored.zoom)) {
+        return { x: stored.x, y: stored.y, zoom: Math.min(CANVAS_MAX_ZOOM, Math.max(CANVAS_MIN_ZOOM, stored.zoom)) };
+      }
+    } catch {
+      // View persistence is best effort in restricted webviews.
+    }
+    return { x: 24, y: 24, zoom: 0.82 };
+  });
+  const shouldAutoFocus = useState(() => {
+    if (typeof window === 'undefined') return true;
+    try {
+      return !window.localStorage.getItem(viewStorageKey);
+    } catch {
+      return true;
+    }
+  })[0];
+  const viewportRef = useRef<HTMLDivElement>(null);
   const [offsets, setOffsets] = useState<Record<string, { x: number; y: number }>>(() => {
     if (typeof window === 'undefined') return {};
     try {
@@ -1336,6 +1761,7 @@ function WorkspaceCanvas({ project, activeShot, onSelectShot }: { project: Proje
     }
   });
   const dragRef = useRef<{ id: string; x: number; y: number; originX: number; originY: number } | null>(null);
+  const panRef = useRef<{ x: number; y: number; originX: number; originY: number } | null>(null);
   useEffect(() => {
     try {
       window.localStorage.setItem(`frameforge:canvas-layout:${project.id}`, JSON.stringify(offsets));
@@ -1343,6 +1769,13 @@ function WorkspaceCanvas({ project, activeShot, onSelectShot }: { project: Proje
       // Local layout persistence is best effort in restricted webviews.
     }
   }, [offsets, project.id]);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(viewStorageKey, JSON.stringify(view));
+    } catch {
+      // View persistence is best effort in restricted webviews.
+    }
+  }, [view, viewStorageKey]);
   const { nodes, edges, width, height } = useMemo(() => {
     const nodes: WorkspaceNode[] = [{ id: 'project', type: 'project', title: project.name, meta: '项目根节点', x: 28, y: 28 }];
     const edges: WorkspaceEdge[] = [];
@@ -1395,6 +1828,59 @@ function WorkspaceCanvas({ project, activeShot, onSelectShot }: { project: Proje
     const offset = offsets[node.id] ?? { x: 0, y: 0 };
     return { x: node.x + offset.x, y: node.y + offset.y };
   };
+  const fitView = () => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const availableWidth = Math.max(320, viewport.clientWidth - 48);
+    const availableHeight = Math.max(280, viewport.clientHeight - 48);
+    const bounds = nodes.reduce((current, node) => {
+      const position = nodePosition(node);
+      return {
+        minX: Math.min(current.minX, position.x),
+        minY: Math.min(current.minY, position.y),
+        maxX: Math.max(current.maxX, position.x + 210),
+        maxY: Math.max(current.maxY, position.y + 110),
+      };
+    }, { minX: Number.POSITIVE_INFINITY, minY: Number.POSITIVE_INFINITY, maxX: Number.NEGATIVE_INFINITY, maxY: Number.NEGATIVE_INFINITY });
+    const contentWidth = Math.max(1, bounds.maxX - bounds.minX + 48);
+    const contentHeight = Math.max(1, bounds.maxY - bounds.minY + 48);
+    const nextZoom = Math.min(CANVAS_MAX_ZOOM, Math.max(CANVAS_MIN_ZOOM, Math.min(availableWidth / contentWidth, availableHeight / contentHeight)));
+    setView({
+      zoom: Number(nextZoom.toFixed(2)),
+      x: (viewport.clientWidth - contentWidth * nextZoom) / 2 - (bounds.minX - 24) * nextZoom,
+      y: (viewport.clientHeight - contentHeight * nextZoom) / 2 - (bounds.minY - 24) * nextZoom,
+    });
+  };
+  const focusActive = () => {
+    const viewport = viewportRef.current;
+    const target = nodes.find((node) => node.shotId === activeShot) ?? nodes.find((node) => node.type === 'scene') ?? nodes[0];
+    if (!viewport || !target) return;
+    const nextZoom = Math.min(0.72, Math.max(0.55, viewport.clientWidth / 980));
+    const position = nodePosition(target);
+    setView({
+      zoom: Number(nextZoom.toFixed(2)),
+      x: viewport.clientWidth / 2 - (position.x + 105) * nextZoom,
+      y: viewport.clientHeight / 2 - (position.y + 55) * nextZoom,
+    });
+  };
+  useEffect(() => {
+    if (!shouldAutoFocus) return undefined;
+    const frame = window.requestAnimationFrame(focusActive);
+    return () => window.cancelAnimationFrame(frame);
+  }, [shouldAutoFocus, width, height]);
+  const zoomAt = (nextZoom: number, clientX?: number, clientY?: number) => {
+    const viewport = viewportRef.current;
+    const clampedZoom = Math.min(CANVAS_MAX_ZOOM, Math.max(CANVAS_MIN_ZOOM, nextZoom));
+    setView((current) => {
+      if (!viewport || clientX === undefined || clientY === undefined) return { ...current, zoom: clampedZoom };
+      const rect = viewport.getBoundingClientRect();
+      const pointX = clientX - rect.left;
+      const pointY = clientY - rect.top;
+      const boardX = (pointX - current.x) / current.zoom;
+      const boardY = (pointY - current.y) / current.zoom;
+      return { zoom: clampedZoom, x: pointX - boardX * clampedZoom, y: pointY - boardY * clampedZoom };
+    });
+  };
   const startDrag = (event: React.PointerEvent<HTMLDivElement>, node: WorkspaceNode) => {
     event.preventDefault();
     event.stopPropagation();
@@ -1404,11 +1890,75 @@ function WorkspaceCanvas({ project, activeShot, onSelectShot }: { project: Proje
   };
   const moveDrag = (event: React.PointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current;
-    if (!drag) return;
-    setOffsets((current) => ({ ...current, [drag.id]: { x: drag.originX - nodeMap.get(drag.id)!.x + (event.clientX - drag.x) / zoom, y: drag.originY - nodeMap.get(drag.id)!.y + (event.clientY - drag.y) / zoom } }));
+    if (drag) {
+      setOffsets((current) => ({ ...current, [drag.id]: { x: drag.originX - nodeMap.get(drag.id)!.x + (event.clientX - drag.x) / view.zoom, y: drag.originY - nodeMap.get(drag.id)!.y + (event.clientY - drag.y) / view.zoom } }));
+      return;
+    }
+    const pan = panRef.current;
+    if (!pan) return;
+    setView((current) => ({ ...current, x: pan.originX + event.clientX - pan.x, y: pan.originY + event.clientY - pan.y }));
   };
-  const stopDrag = () => { dragRef.current = null; };
-  return <section className="workspace-canvas-panel"><SectionTitle eyebrow="WORK CANVAS" title="连线工作画布"><div className="canvas-toolbar"><button className="icon-button" onClick={() => setZoom((value) => Math.min(1.3, value + 0.1))} aria-label="放大画布" title="放大画布"><ZoomIn size={16} /></button><span>{Math.round(zoom * 100)}%</span><button className="icon-button" onClick={() => setZoom((value) => Math.max(0.55, value - 0.1))} aria-label="缩小画布" title="缩小画布"><ZoomOut size={16} /></button><button className="icon-button" onClick={() => { setZoom(0.82); setOffsets({}); }} aria-label="重置画布" title="重置画布"><Maximize2 size={16} /></button></div></SectionTitle><div className="canvas-legend"><span><i className="legend-dot scene"></i>剧情</span><span><i className="legend-dot asset"></i>素材</span><span><i className="legend-dot qc"></i>质检</span><span><i className="legend-dot export"></i>输出</span><small>{nodes.length} 个节点 · {edges.length} 条连接 · 点击镜头节点进入素材</small></div><div className="workspace-canvas-viewport" onPointerMove={moveDrag} onPointerUp={stopDrag} onPointerCancel={stopDrag}><div className="workspace-board" style={{ width, height, transform: `scale(${zoom})` }}><svg className="workspace-edges" width={width} height={height} aria-hidden="true"><defs><marker id="canvas-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#9bb2d1" /></marker></defs>{edges.map((edge, index) => { const from = nodeMap.get(edge.from); const to = nodeMap.get(edge.to); if (!from || !to) return null; const start = nodePosition(from); const end = nodePosition(to); const x1 = start.x + 210; const y1 = start.y + 55; const x2 = end.x; const y2 = end.y + 55; const curve = Math.max(50, (x2 - x1) * 0.45); return <path key={`${edge.from}-${edge.to}-${index}`} className={`canvas-edge ${edge.tone ?? ''}`} d={`M ${x1} ${y1} C ${x1 + curve} ${y1}, ${x2 - curve} ${y2}, ${x2} ${y2}`} markerEnd="url(#canvas-arrow)" />; })}</svg>{nodes.map((node) => { const position = nodePosition(node); const nodeLabel = `${node.type === 'project' ? '项目' : node.type === 'scene' ? '场景' : node.type === 'shot' ? '镜头' : node.type === 'prompt' ? '提示词' : node.type === 'asset' ? '素材' : node.type === 'qc' ? 'QC' : '导出'}：${node.title}`; return <div key={node.id} className={`workspace-node node-${node.type} ${node.shotId === activeShot ? 'is-active' : ''}`} style={{ left: position.x, top: position.y }} role={node.shotId ? 'button' : undefined} tabIndex={node.shotId ? 0 : undefined} aria-label={node.shotId ? nodeLabel : undefined} onPointerDown={(event) => startDrag(event, node)} onClick={() => node.shotId && onSelectShot(node.shotId)} onKeyDown={(event) => { if (event.key === 'Enter' && node.shotId) onSelectShot(node.shotId); }}><div className="workspace-node-head"><span>{node.type === 'project' ? '项目' : node.type === 'scene' ? '场景' : node.type === 'shot' ? '镜头' : node.type === 'prompt' ? '提示词' : node.type === 'asset' ? '素材' : node.type === 'qc' ? 'QC' : '导出'}</span>{node.status && <b>{node.status === 'approved' || node.status === 'exported' ? <Check size={12} /> : workspaceStatusLabel(node.status)}</b>}</div><strong>{node.title}</strong><p>{node.meta}</p></div>; })}</div></div></section>;
+  const startPan = (event: React.PointerEvent<HTMLDivElement>) => {
+    if ((event.target as HTMLElement).closest('.workspace-node')) return;
+    event.preventDefault();
+    panRef.current = { x: event.clientX, y: event.clientY, originX: view.x, originY: view.y };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+  const handleWheel = (event: React.WheelEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const direction = event.deltaY > 0 ? -1 : 1;
+    zoomAt(view.zoom + direction * 0.08, event.clientX, event.clientY);
+  };
+  const stopDrag = () => { dragRef.current = null; panRef.current = null; };
+  return (
+    <section className="workspace-canvas-panel">
+      <SectionTitle eyebrow="制作关系图" title="连线工作画布">
+        <div className="canvas-toolbar">
+          <button className="icon-button" onClick={() => zoomAt(view.zoom + 0.1)} aria-label="放大画布" title="放大画布"><ZoomIn size={16} /></button>
+          <span>{Math.round(view.zoom * 100)}%</span>
+          <button className="icon-button" onClick={() => zoomAt(view.zoom - 0.1)} aria-label="缩小画布" title="缩小画布"><ZoomOut size={16} /></button>
+          <button className="icon-button" onClick={fitView} aria-label="适应视图" title="适应视图"><Maximize2 size={16} /></button>
+          <button className="icon-button" onClick={() => { setOffsets({}); fitView(); }} aria-label="重置节点布局" title="重置节点布局"><RotateCw size={16} /></button>
+        </div>
+      </SectionTitle>
+      <div className="canvas-legend">
+        <span><i className="legend-dot scene"></i>剧情</span>
+        <span><i className="legend-dot asset"></i>素材</span>
+        <span><i className="legend-dot qc"></i>质检</span>
+        <span><i className="legend-dot export"></i>输出</span>
+        <small>{nodes.length} 个节点 · {edges.length} 条连接 · 点击节点进入镜头</small>
+      </div>
+      <div ref={viewportRef} className="workspace-canvas-viewport" aria-label="制作关系画布" onPointerDown={startPan} onPointerMove={moveDrag} onPointerUp={stopDrag} onPointerCancel={stopDrag} onWheel={handleWheel}>
+        <div className="workspace-board" style={{ width, height, transform: `translate(${view.x}px, ${view.y}px) scale(${view.zoom})` }}>
+          <svg className="workspace-edges" width={width} height={height} aria-hidden="true">
+            <defs><marker id="canvas-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#9bb2d1" /></marker></defs>
+            {edges.map((edge, index) => {
+              const from = nodeMap.get(edge.from);
+              const to = nodeMap.get(edge.to);
+              if (!from || !to) return null;
+              const start = nodePosition(from);
+              const end = nodePosition(to);
+              const x1 = start.x + 210;
+              const y1 = start.y + 55;
+              const x2 = end.x;
+              const y2 = end.y + 55;
+              const curve = Math.max(50, (x2 - x1) * 0.45);
+              return <path key={`${edge.from}-${edge.to}-${index}`} className={`canvas-edge ${edge.tone ?? ''}`} d={`M ${x1} ${y1} C ${x1 + curve} ${y1}, ${x2 - curve} ${y2}, ${x2} ${y2}`} markerEnd="url(#canvas-arrow)" />;
+            })}
+          </svg>
+          {nodes.map((node) => {
+            const position = nodePosition(node);
+            const nodeLabel = `${node.type === 'project' ? '项目' : node.type === 'scene' ? '场景' : node.type === 'shot' ? '镜头' : node.type === 'prompt' ? '提示词' : node.type === 'asset' ? '素材' : node.type === 'qc' ? 'QC' : '导出'}：${node.title}`;
+            return <div key={node.id} className={`workspace-node node-${node.type} ${node.shotId === activeShot ? 'is-active' : ''}`} style={{ left: position.x, top: position.y }} role={node.shotId ? 'button' : undefined} tabIndex={node.shotId ? 0 : undefined} aria-label={node.shotId ? nodeLabel : undefined} onPointerDown={(event) => startDrag(event, node)} onClick={() => node.shotId && onSelectShot(node.shotId)} onKeyDown={(event) => { if (event.key === 'Enter' && node.shotId) onSelectShot(node.shotId); }}>
+              <div className="workspace-node-head"><span>{node.type === 'project' ? '项目' : node.type === 'scene' ? '场景' : node.type === 'shot' ? '镜头' : node.type === 'prompt' ? '提示词' : node.type === 'asset' ? '素材' : node.type === 'qc' ? 'QC' : '导出'}</span>{node.status && <b>{node.status === 'approved' || node.status === 'exported' ? <Check size={12} /> : workspaceStatusLabel(node.status)}</b>}</div>
+              <strong>{node.title}</strong>
+              <p>{node.meta}</p>
+            </div>;
+          })}
+        </div>
+      </div>
+    </section>
+  );
 }
 
 function AssetLibrary({ project, close, onOpenAsset }: { project: Project; close: () => void; onOpenAsset: (asset: CandidateAsset) => void }) {
@@ -1423,6 +1973,36 @@ function AssetLibrary({ project, close, onOpenAsset }: { project: Project; close
   });
   const kindLabel = (value: CandidateAsset['kind']) => value === 'video' ? '视频' : value === 'audio' ? '音频' : '图片';
   return <div className="modal-backdrop" role="presentation"><section className="asset-library-modal" role="dialog" aria-modal="true" aria-labelledby="asset-library-title"><div className="modal-header"><div><span className="eyebrow">PROJECT ASSETS</span><h2 id="asset-library-title">素材库</h2></div><IconButton label="关闭素材库" onClick={close}><X size={19} /></IconButton></div><div className="asset-library-toolbar"><label className="asset-library-search"><span>搜索</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="按素材、供应商或镜头搜索" /></label><label className="asset-library-kind"><span>类型</span><select value={kind} onChange={(event) => setKind(event.target.value as 'all' | CandidateAsset['kind'])}><option value="all">全部</option><option value="image">图片</option><option value="video">视频</option><option value="audio">音频</option></select></label><span className="asset-library-count">{assets.length} 项</span></div>{assets.length ? <div className="asset-library-grid">{assets.map((asset) => { const report = qcReportFor(project, asset.id); const prompt = project.prompts.find((item) => item.id === asset.promptId); const shot = project.shots.find((item) => item.id === prompt?.assetId); return <button className="asset-library-item" key={asset.id} onClick={() => onOpenAsset(asset)}><div className="asset-library-thumb">{asset.kind === 'video' ? <video src={mediaDisplayUrl(asset.url)} muted playsInline preload="metadata" aria-label={`${asset.label}视频`} /> : asset.kind === 'audio' ? <Volume2 size={24} /> : <img src={mediaDisplayUrl(asset.url)} alt={`${asset.label}素材`} />}{asset.selected && <span className="asset-library-selected"><Check size={12} /></span>}</div><div className="asset-library-details"><b>{asset.label}</b><span>{kindLabel(asset.kind)} · {asset.provider}</span><small>{shot ? `镜头 ${String(shot.number).padStart(2, '0')} · ${shot.framing}` : '未关联镜头'}</small><small>{asset.kind === 'video' ? report?.status === 'approved' ? '质检通过' : report?.status === 'ready' ? '待人工确认' : '未质检' : asset.selected ? '当前首选' : '候选素材'}</small></div></button>; })}</div> : <div className="inline-empty"><FolderOpen size={20} /><span>没有匹配的素材。</span></div>}<div className="asset-library-foot"><span>点击素材会回到它所属的镜头和生成记录。</span><button className="quiet-action" onClick={close}>关闭</button></div></section></div>;
+}
+
+function ProfessionalProviderSettings({ task, setTask, provider, setProvider, connection, setConnections, close, notice }: { task: ModelTask; setTask: (task: ModelTask) => void; provider: ProviderProfile; setProvider: (provider: ProviderProfile) => void; connection: ModelConnection; setConnections: React.Dispatch<React.SetStateAction<ProviderConnections>>; close: () => void; notice: (message: string) => void }) {
+  const [baseUrl, setBaseUrl] = useState(connection.baseUrl);
+  const [key, setKey] = useState(connection.apiKey);
+  const [model, setModel] = useState(task === 'text' && provider.id === 'gpt-image' ? (connection.textModel ?? connection.model) : connection.model);
+  const [textModel, setTextModel] = useState(connection.textModel ?? 'gpt-4.1-mini');
+  const [voice, setVoice] = useState(connection.voice ?? 'alloy');
+  const endpointPlaceholder = provider.id === 'gpt-image' || provider.id === 'openai-voice' ? 'https://api.openai.com/v1' : provider.id === 'bytedance-video' ? 'https://ark.cn-beijing.volces.com/api/v3' : provider.id === 'gemini-video' ? 'https://generativelanguage.googleapis.com/v1beta' : 'https://api.x.ai/v1';
+  const providerNote = provider.id === 'gpt-image' ? 'OpenAI 兼容端点，可同时承载文本改编和图片生成。密钥只保存在本机钥匙串。' : provider.id === 'openai-voice' ? '使用 Speech 接口生成台词音频，音频会保存到本机素材目录。' : provider.id === 'bytedance-video' ? '字节使用 Ark 异步任务接口，提交后会持续轮询并保留远端任务 ID。' : provider.id === 'gemini-video' ? 'Gemini / Veo 使用 Google 长任务接口，生成结果会先经过媒体质检。' : 'Grok 使用视频任务接口，生成结果会先经过媒体质检。';
+  const save = async () => {
+    if (!key.trim()) { notice('请输入 API key 后再保存'); return; }
+    const primaryModel = task === 'text' && provider.id === 'gpt-image' ? connection.model : model;
+    const nextConnection: ModelConnection = { baseUrl, apiKey: key, model: primaryModel, ...(provider.id === 'gpt-image' ? { textModel: task === 'text' ? model : textModel } : {}), ...(provider.id === 'openai-voice' ? { voice } : {}) };
+    try {
+      await saveProviderCredential(provider.id, key);
+      await saveProviderSettings({ providerId: provider.id, baseUrl, model: primaryModel, ...(provider.id === 'gpt-image' ? { textModel: nextConnection.textModel } : {}), ...(provider.id === 'openai-voice' ? { voice } : {}) });
+      setConnections((current) => ({ ...current, [provider.id]: nextConnection }));
+      notice(`${modelTaskMeta[task].label}连接已保存`);
+      close();
+    } catch (error) {
+      notice(error instanceof Error ? error.message : '模型连接保存失败');
+    }
+  };
+  const chooseTask = (nextTask: ModelTask) => {
+    setTask(nextTask);
+    const nextProvider = providers.find((item) => providerSupportsTask(item, nextTask));
+    if (nextProvider && !providerSupportsTask(provider, nextTask)) setProvider(nextProvider);
+  };
+  return <div className="modal-backdrop" role="presentation"><section className="settings-modal settings-modal-pro" role="dialog" aria-modal="true" aria-labelledby="settings-title"><div className="modal-header"><div><span className="eyebrow">模型连接</span><h2 id="settings-title">连接你的制作模型</h2><p className="settings-subtitle">按任务选择供应商，配置一次后可在生成、合成和项目恢复时复用。</p></div><IconButton label="关闭模型设置" onClick={close}><X size={19} /></IconButton></div><div className="model-task-tabs" role="tablist" aria-label="模型任务类型">{(Object.keys(modelTaskMeta) as ModelTask[]).map((item) => <button key={item} className={task === item ? 'active' : ''} onClick={() => chooseTask(item)} role="tab" aria-selected={task === item}><span>{modelTaskMeta[item].label}</span><small>{modelTaskMeta[item].detail}</small></button>)}</div><div className="provider-matrix"><div className="provider-matrix-head"><b>能力矩阵</b><span>当前任务：{modelTaskMeta[task].label}</span></div><div className="provider-matrix-table"><div className="provider-matrix-row provider-matrix-labels"><span>供应商</span>{(Object.keys(modelTaskMeta) as ModelTask[]).map((taskKey) => <span key={taskKey}>{modelTaskMeta[taskKey].label.replace('与', '/')}</span>)}</div>{providers.map((providerRow) => <button key={providerRow.id} className={`provider-matrix-row ${providerRow.id === provider.id ? 'active' : ''}`} onClick={() => providerSupportsTask(providerRow, task) && setProvider(providerRow)}><strong><i className={`provider-tab-dot ${providerRow.mode}`}></i>{providerRow.name}</strong>{(Object.keys(modelTaskMeta) as ModelTask[]).map((taskKey) => <span key={taskKey} className={providerSupportsTask(providerRow, taskKey) ? 'supported' : 'unsupported'}>{providerSupportsTask(providerRow, taskKey) ? taskCapabilityLabel(providerRow, taskKey) : '—'}</span>)}</button>)}</div></div><div className="provider-config"><div className="provider-config-head"><div><span className="eyebrow">当前连接</span><h3>{provider.name}</h3></div><span className={`connection-state ${key.trim() ? 'configured' : ''}`}>{key.trim() ? '已配置密钥' : '待配置'}</span></div><div className="config-note"><LockKeyhole size={17} /><div><b>{modelTaskMeta[task].label} · {taskCapabilityLabel(provider, task)}</b><span>{providerNote}</span></div></div><div className="provider-config-grid"><label>Base URL<input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder={endpointPlaceholder} /></label><label>API Key<input value={key} type="password" onChange={(event) => setKey(event.target.value)} placeholder="仅保存在本机钥匙串" /></label><label>{task === 'text' ? '文本模型' : task === 'image' ? '图片模型' : task === 'video' ? '视频模型' : '语音模型'}<input value={model} onChange={(event) => setModel(event.target.value)} /></label>{provider.id === 'gpt-image' && task !== 'text' && <label>文本模型<input value={textModel} onChange={(event) => setTextModel(event.target.value)} /></label>}{provider.id === 'openai-voice' && <label>声音<input value={voice} onChange={(event) => setVoice(event.target.value)} placeholder="alloy" /></label>}</div><div className="capability-summary"><span>当前能力</span><b>{provider.capabilities.referenceImages ? '参考图' : '无参考图'}</b>{provider.capabilities.supportedRatios.length > 0 && <b>{provider.capabilities.supportedRatios.join(' / ')}</b>}<b>最多 {provider.capabilities.maxCandidates} 个候选</b>{task === 'video' && provider.capabilities.asyncTasks && <b>异步任务</b>}{task === 'video' && provider.capabilities.firstLastFrames && <b>首尾帧</b>}{task === 'video' && provider.capabilities.nativeAudio && <b>原生音频</b>}{task === 'voice' && <b>音频落盘</b>}</div></div><div className="modal-actions"><button className="quiet-action" onClick={close}>取消</button><button className="primary-button" onClick={() => void save()}><Check size={16} />保存连接</button></div></section></div>;
 }
 
 function ProviderSettings({ provider, setProvider, connection, setConnections, close, notice }: { provider: ProviderProfile; setProvider: (provider: ProviderProfile) => void; connection: ModelConnection; setConnections: React.Dispatch<React.SetStateAction<ProviderConnections>>; close: () => void; notice: (message: string) => void }) {

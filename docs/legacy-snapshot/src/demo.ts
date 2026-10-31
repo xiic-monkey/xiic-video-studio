@@ -1,18 +1,18 @@
 import type { Project, ProviderProfile } from './types';
 
-const portraitA = 'https://images.unsplash.com/photo-1592621385612-4d7129426394?auto=format&fit=crop&w=720&q=86';
-const portraitB = 'https://images.unsplash.com/photo-1517841905240-472988babdf9?auto=format&fit=crop&w=720&q=86';
-const scene1 = 'https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?auto=format&fit=crop&w=1000&q=86';
-const scene2 = 'https://images.unsplash.com/photo-1516321318423-f06f85e504b3?auto=format&fit=crop&w=1000&q=86';
-const scene3 = 'https://images.unsplash.com/photo-1531058020387-3be344556be6?auto=format&fit=crop&w=1000&q=86';
-const scene4 = 'https://images.unsplash.com/photo-1500534314209-a25ddb2bd429?auto=format&fit=crop&w=1000&q=86';
+const portraitA = 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=720&q=86';
+const portraitB = 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=720&q=86';
+const scene1 = 'https://images.unsplash.com/photo-1514565131-fce0801e5785?auto=format&fit=crop&w=1000&q=86';
+const scene2 = 'https://images.unsplash.com/photo-1500375592092-40eb2168fd21?auto=format&fit=crop&w=1000&q=86';
+const scene3 = 'https://images.unsplash.com/photo-1513836279014-a89f7a76ae86?auto=format&fit=crop&w=1000&q=86';
+const scene4 = 'https://images.unsplash.com/photo-1500534623283-312aade485b7?auto=format&fit=crop&w=1000&q=86';
 
 export const providers: ProviderProfile[] = [
-  { id: 'gpt-image', name: 'GPT Image', model: 'gpt-image-2', mode: 'ready', capabilities: { text: false, image: true, video: false, voice: false, music: false, soundEffect: false, referenceImages: true, supportedRatios: ['16:9', '9:16'], maxCandidates: 4 } },
-  { id: 'openai-voice', name: 'OpenAI 配音', model: 'gpt-4o-mini-tts', mode: 'configure', capabilities: { text: false, image: false, video: false, voice: true, music: false, soundEffect: false, referenceImages: false, supportedRatios: ['16:9', '9:16'], maxCandidates: 1 } },
-  { id: 'bytedance-video', name: '字节视频', model: 'Seedance', mode: 'configure', capabilities: { text: false, image: false, video: true, voice: false, music: false, soundEffect: false, referenceImages: true, supportedRatios: ['16:9', '9:16'], maxCandidates: 4 } },
-  { id: 'grok-video', name: 'Grok Video', model: 'grok-imagine-video', mode: 'configure', capabilities: { text: false, image: false, video: true, voice: false, music: false, soundEffect: false, referenceImages: true, supportedRatios: ['16:9', '9:16'], maxCandidates: 4 } },
-  { id: 'gemini-video', name: 'Gemini / Veo', model: 'veo-3.1-generate-preview', mode: 'configure', capabilities: { text: false, image: false, video: true, voice: false, music: false, soundEffect: false, referenceImages: true, supportedRatios: ['16:9', '9:16'], maxCandidates: 4 } },
+  { id: 'gpt-image', name: 'OpenAI 文本/图像', model: 'gpt-image-2', mode: 'ready', capabilities: { text: true, image: true, video: false, voice: false, music: false, soundEffect: false, referenceImages: true, supportedRatios: ['16:9', '9:16'], maxCandidates: 4, asyncTasks: false, firstLastFrames: false, nativeAudio: false } },
+  { id: 'openai-voice', name: 'OpenAI 配音', model: 'gpt-4o-mini-tts', mode: 'configure', capabilities: { text: false, image: false, video: false, voice: true, music: false, soundEffect: false, referenceImages: false, supportedRatios: [], maxCandidates: 1, asyncTasks: false, firstLastFrames: false, nativeAudio: false } },
+  { id: 'bytedance-video', name: '字节视频', model: 'Seedance', mode: 'configure', capabilities: { text: false, image: false, video: true, voice: false, music: false, soundEffect: false, referenceImages: true, supportedRatios: ['16:9', '9:16'], maxCandidates: 4, asyncTasks: true, firstLastFrames: true, nativeAudio: true } },
+  { id: 'grok-video', name: 'Grok Video', model: 'grok-imagine-video', mode: 'configure', capabilities: { text: false, image: false, video: true, voice: false, music: false, soundEffect: false, referenceImages: true, supportedRatios: ['16:9', '9:16'], maxCandidates: 4, asyncTasks: true, firstLastFrames: false, nativeAudio: false } },
+  { id: 'gemini-video', name: 'Gemini / Veo', model: 'veo-3.1-generate-preview', mode: 'configure', capabilities: { text: false, image: false, video: true, voice: false, music: false, soundEffect: false, referenceImages: true, supportedRatios: ['16:9', '9:16'], maxCandidates: 4, asyncTasks: true, firstLastFrames: true, nativeAudio: true } },
 ];
 
 export const demoProject: Project = {
