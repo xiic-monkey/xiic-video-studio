@@ -2251,6 +2251,8 @@ pub fn extension_for(mime: &str, kind: &str) -> &'static str {
         "audio/ogg" => "ogg",
         "text/plain" | "text/markdown" => "txt",
         "application/json" => "json",
+        // octet-stream 意味着「格式未知」，不能按 kind 猜成 png/mp4。
+        "application/octet-stream" => "bin",
         _ => match kind {
             "image" => "png",
             "video" => "mp4",

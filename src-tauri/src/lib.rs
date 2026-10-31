@@ -15,6 +15,7 @@ use std::{
 };
 use tauri::{Manager, State};
 
+mod assets;
 mod db;
 
 struct AppState {
@@ -649,7 +650,7 @@ fn parse_media_probe(value: &Value, kind: &str) -> Result<MediaProbeSummary, Str
     })
 }
 
-fn probe_media(path: &Path, kind: &str) -> Result<MediaProbeSummary, String> {
+pub(crate) fn probe_media(path: &Path, kind: &str) -> Result<MediaProbeSummary, String> {
     let output = Command::new("ffprobe")
         .args([
             OsString::from("-v"),
