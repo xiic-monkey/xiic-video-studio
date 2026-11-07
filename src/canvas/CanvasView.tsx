@@ -222,9 +222,10 @@ function CanvasInner() {
         panOnScroll
         deleteKeyCode={null}
         fitView={false}
-        minZoom={0.2}
+        minZoom={0.12}
         maxZoom={2.5}
         nodeDragThreshold={0}
+        elevateNodesOnSelect={false}
       >
         <Background color="#26302f" gap={24} size={1} />
         <Controls showInteractive={false} />

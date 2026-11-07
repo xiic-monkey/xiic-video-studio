@@ -10,6 +10,7 @@ import { RunConfirmDialog } from '../run/RunConfirmDialog';
 import { useStudioStore } from '../stores/studioStore';
 import { useBoardStore } from '../stores/boardStore';
 import { useProviderStore } from '../stores/providerStore';
+import { useRunStore } from '../stores/runStore';
 
 export function StudioApp() {
   const boot = useStudioStore((state) => state.boot);
@@ -31,6 +32,10 @@ export function StudioApp() {
   const lastSavedAt = useBoardStore((state) => state.lastSavedAt);
   const bootProviders = useProviderStore((state) => state.boot);
   const openSettings = useProviderStore((state) => state.openSettings);
+  // selector 返回数字，按值比较，不会因为别的运行状态变化而多渲染一次。
+  const activeRuns = useRunStore((state) =>
+    Object.values(state.runs).filter((item) => item.status === 'queued' || item.status === 'running').length,
+  );
   const [newBoardName, setNewBoardName] = useState('');
 
   useEffect(() => {
@@ -168,6 +173,7 @@ export function StudioApp() {
         <span>{board ? `board ${board.id.slice(-8)}` : 'no-board'}</span>
         <span>{Object.keys(board?.nodes ?? {}).length} nodes</span>
         <span>{Object.keys(board?.edges ?? {}).length} edges</span>
+        {activeRuns > 0 && <span className="busy">{activeRuns} 个任务进行中</span>}
         {error && <span className="error">{error}</span>}
       </footer>
     </div>

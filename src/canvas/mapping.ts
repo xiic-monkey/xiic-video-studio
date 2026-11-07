@@ -23,6 +23,27 @@ const ROLE_COLOR: Record<EdgeRole, string> = {
   timeline: '#e4ecea',
 };
 
+/**
+ * 节点 `data` 的身份缓存。
+ *
+ * `data` 里只有两样东西：领域节点本身与 stale 标记。领域节点是不可变的
+ * （applyGraphCommand 改一个节点时新建对象，没改的保持原引用），
+ * 所以拿节点对象当 WeakMap 键是安全的：没动过的节点复用同一个 `data`，
+ * 动过的节点自然换键。
+ *
+ * 这是 `memo` 生效的前提——`data` 每次都新建的话，节点卡片每次都会被
+ * 判成「props 变了」，改一个节点就会重渲染整板。
+ */
+const dataCache = new WeakMap<BoardNode, { stale: boolean; data: StudioNodeData }>();
+
+function nodeData(node: BoardNode, stale: boolean): StudioNodeData {
+  const cached = dataCache.get(node);
+  if (cached && cached.stale === stale) return cached.data;
+  const data: StudioNodeData = { domain: node, stale };
+  dataCache.set(node, { stale, data });
+  return data;
+}
+
 export function toFlowNodes(doc: BoardDoc, selectedIds: string[] = [], stale?: Set<string>): Node<StudioNodeData>[] {
   const selected = new Set(selectedIds);
   return Object.values(doc.nodes)
@@ -32,7 +53,7 @@ export function toFlowNodes(doc: BoardDoc, selectedIds: string[] = [], stale?: S
       id: node.id,
       type: node.type,
       position: node.position,
-      data: { domain: node, stale: stale?.has(node.id) ?? false },
+      data: nodeData(node, stale?.has(node.id) ?? false),
       parentId: node.parentId,
       zIndex: node.z,
       style: node.size ? { width: node.size.width, height: node.size.height } : undefined,

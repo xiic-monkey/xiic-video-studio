@@ -1,6 +1,37 @@
 import { describe, expect, it } from 'vitest';
+import type { RunRecord } from '../domain/types';
+import { computeStaleSet } from '../domain/graph/stale';
+import type { CacheContext } from '../domain/graph/cacheKey';
 import { edge, makeDoc, node } from '../domain/graph/testFixtures';
+import { topoSort } from '../domain/graph/topo';
+import { validateBoard } from '../domain/graph/validate';
 import { danglingEdgeCount, toFlowEdges, toFlowNodes } from './mapping';
+
+function run(nodeId: string, id: string): RunRecord {
+  return {
+    id, projectId: 'project_test', boardId: 'board_test', nodeId,
+    action: 'generate', cacheKey: 'stale-on-purpose', status: 'succeeded',
+    promptSnapshot: { text: '', segments: [], hash: 'h', locked: false },
+    params: {}, inputAssetIds: [], outputAssetIds: ['asset_1'], selectedAssetId: 'asset_1',
+    startedAt: '2026-10-31T00:00:00.000Z',
+  };
+}
+
+function wideBoard(count: number) {
+  const nodes = Array.from({ length: count }, (_, index) => {
+    const type = index % 3 === 0 ? 'text' : index % 3 === 1 ? 'image' : 'video';
+    const col = Math.floor(index / 25);
+    return { ...node(`n${index}`, type, { prompt: `提示 ${index}` }), position: { x: col * 320, y: (index % 25) * 220 } };
+  });
+  const links = nodes.slice(1).map((item, index) => edge(`e${index}`, `n${index}`, item.id));
+  const doc = makeDoc(nodes, links);
+  const ctx: CacheContext = {
+    runs: nodes.map((item, index) => run(item.id, `run_${index}`)),
+    runtime: Object.fromEntries(nodes.map((item) => [item.id, { providerId: 'openai-compatible', model: 'm', params: {} }])),
+    promptHashes: Object.fromEntries(nodes.map((item) => [item.id, `hash-${item.id}`])),
+  };
+  return { doc, ctx };
+}
 
 describe('canvas mapping', () => {
   it('maps domain nodes to React Flow nodes with parent and size', () => {
@@ -28,5 +59,41 @@ describe('canvas mapping', () => {
     const doc = makeDoc([node('t', 'text')], [edge('e1', 't', 'missing')]);
     expect(toFlowEdges(doc)).toEqual([]);
     expect(danglingEdgeCount(doc)).toBe(1);
+  });
+});
+
+describe('toFlowNodes 的 data 身份缓存', () => {
+  it('reuses the same data object for unchanged nodes', () => {
+    const { doc } = wideBoard(3);
+    const first = toFlowNodes(doc);
+    const second = toFlowNodes(doc);
+    expect(second[0].data).toBe(first[0].data);
+  });
+
+  it('only replaces the data object of nodes whose stale flag changed', () => {
+    const { doc } = wideBoard(3);
+    const before = toFlowNodes(doc, [], new Set());
+    const after = toFlowNodes(doc, [], new Set(['n1']));
+    expect(after[0].data).toBe(before[0].data);
+    expect(after[1].data).not.toBe(before[1].data);
+    expect(after[1].data.stale).toBe(true);
+    expect(after[1].data.domain).toBe(before[1].data.domain);
+  });
+
+  it('maps a 500 node board inside the regression budget', () => {
+    const { doc, ctx } = wideBoard(500);
+    const started = performance.now();
+    const order = topoSort(doc);
+    const issues = validateBoard(doc, { providers: [] });
+    const stale = computeStaleSet(doc, ctx, new Set());
+    const flow = toFlowNodes(doc, [], stale);
+    const elapsed = performance.now() - started;
+
+    expect(order.order).toHaveLength(500);
+    expect(flow).toHaveLength(500);
+    expect(stale.size).toBe(500);
+    expect(Array.isArray(issues)).toBe(true);
+    // 这是「别再退化成 O(n²)」的绊线，不是性能基准；真机手感在 Step 12 手工验收。
+    expect(elapsed).toBeLessThan(1500);
   });
 });
