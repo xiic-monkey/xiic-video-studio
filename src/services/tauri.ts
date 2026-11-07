@@ -1,4 +1,5 @@
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
+import { save } from '@tauri-apps/plugin-dialog';
 import type {
   AssetRef,
   BoardDoc,
@@ -164,6 +165,34 @@ export interface LegacyImportResult {
 export async function importLegacyProject(path: string): Promise<LegacyImportResult> {
   if (!isTauri()) throw new Error('旧项目导入只能在桌面应用中运行');
   return invoke<LegacyImportResult>('import_legacy_project', { path });
+}
+
+/** 导出结果：字段名与 Rust 侧 `#[serde(rename_all = "camelCase")]` 一致。 */
+export interface ExportSummary {
+  path: string;
+  projectId: string;
+  boards: number;
+  runs: number;
+  assets: number;
+}
+
+/**
+ * 导出项目元数据包。
+ *
+ * 打包、路径校验与文件写入都在 Rust 侧：渲染进程只给目标路径，不能决定写到哪。
+ */
+export async function exportProject(projectId: string, path: string): Promise<ExportSummary> {
+  if (!isTauri()) throw new Error('导出只能在桌面应用中运行');
+  return invoke<ExportSummary>('export_project', { projectId, path });
+}
+
+/** 弹出保存对话框。取消时返回 null。 */
+export async function pickExportPath(defaultName: string): Promise<string | null> {
+  if (!isTauri()) return null;
+  return save({
+    defaultPath: defaultName,
+    filters: [{ name: 'Frameforge 项目', extensions: ['json'] }],
+  });
 }
 
 export type { AssetRef };

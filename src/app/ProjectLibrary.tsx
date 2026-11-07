@@ -1,7 +1,9 @@
 import { useState } from 'react';
-import { FileInput, FolderKanban, LayoutGrid, Plus } from 'lucide-react';
+import { Download, FileInput, FolderKanban, LayoutGrid, Plus } from 'lucide-react';
 import type { StudioProject } from '../domain/types';
+import { exportProject, pickExportPath } from '../services/tauri';
 import { useStudioStore } from '../stores/studioStore';
+import { safeExportName } from './exportName';
 
 interface Props {
   onOpenBoard(boardId: string): void;
@@ -18,6 +20,7 @@ export function ProjectLibrary({ onOpenBoard }: Props) {
   const [ratio, setRatio] = useState<StudioProject['aspectRatio']>('9:16');
   const [boardName, setBoardName] = useState('');
   const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState('');
 
   const current = projects.find((project) => project.id === currentProjectId);
 
@@ -41,6 +44,22 @@ export function ProjectLibrary({ onOpenBoard }: Props) {
       const board = await createBoard(boardName);
       setBoardName('');
       if (board) onOpenBoard(board.id);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function exportCurrent() {
+    if (!current || busy) return;
+    setBusy(true);
+    setNotice('');
+    try {
+      const target = await pickExportPath(safeExportName(current));
+      if (!target) return;
+      const summary = await exportProject(current.id, target);
+      setNotice(`已导出 ${summary.boards} 张画布 / ${summary.runs} 次运行 / ${summary.assets} 个资产索引；包内不含密钥与素材文件本体。`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
     } finally {
       setBusy(false);
     }
@@ -84,7 +103,12 @@ export function ProjectLibrary({ onOpenBoard }: Props) {
           <h1>{current.name}</h1>
           <p>{current.aspectRatio} · {boards.length} 张画布 · 画布优先工作台</p>
         </div>
-        <span className="studio-badge mint">项目 {current.id.slice(-6)}</span>
+        <div className="studio-library-head-actions">
+          <span className="studio-badge mint">项目 {current.id.slice(-6)}</span>
+          <button type="button" className="studio-button secondary" disabled={busy} onClick={() => { void exportCurrent(); }}>
+            <Download size={13} /> 导出项目
+          </button>
+        </div>
       </div>
       <div className="studio-board-grid">
         {boards.map((board) => (
@@ -113,6 +137,7 @@ export function ProjectLibrary({ onOpenBoard }: Props) {
           <FileInput size={13} /> 导入旧项目
         </button>
       </div>
+      {notice && <p className="studio-notice">{notice}</p>}
     </div>
   );
 }
