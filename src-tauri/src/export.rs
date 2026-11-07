@@ -358,6 +358,62 @@ mod tests {
         let text = std::fs::read_to_string(&summary.path).unwrap();
         assert!(!text.contains("sk-leak"));
         serde_json::from_str::<serde_json::Value>(&text).unwrap();
+
+        // 退出标准第 3 条：导出到同一个文件名 → 覆盖成功，且文件仍是合法 JSON。
+        let again = export_project(&state, "p1", &out_dir.path().join("project.json")).unwrap();
+        assert_eq!(again.path, summary.path);
+        let overwritten = std::fs::read_to_string(&again.path).unwrap();
+        serde_json::from_str::<serde_json::Value>(&overwritten).unwrap();
+
+        // 退出标准第 3 条：目标是软链接时必须被拒绝，不能顺着链接写到别处。
+        #[cfg(unix)]
+        {
+            let link = out_dir.path().join("link.json");
+            std::os::unix::fs::symlink(out_dir.path().join("project.json"), &link).unwrap();
+            let error = export_project(&state, "p1", &link).expect_err("软链接必须被拒绝");
+            assert!(error.contains("不是普通文件"), "实际错误：{error}");
+        }
+    }
+
+    /// P0 退出标准第 3 条的自动化版本：对**真实写出的文件**做 key 名扫描与密钥前缀扫描。
+    ///
+    /// 手工验收时用 grep 跑的是：
+    ///   grep -Eio '"(api[_]?key|secret[_]?key|access[_]?key|token|password)"' 验收-*.json
+    ///   grep -c 'sk-' 验收-*.json
+    /// 这里用同样的判据把「导出文件里没有任何密钥字段、也没有任何密钥值」钉死。
+    #[test]
+    fn written_export_file_carries_no_key_fields_and_keeps_cache_keys() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let state = crate::AppState {
+            db_path: std::sync::Mutex::new(data_dir.path().join("db.sqlite3")),
+            data_dir: data_dir.path().to_path_buf(),
+        };
+        {
+            let connection = crate::db::open(&data_dir.path().join("db.sqlite3")).unwrap();
+            seed(&connection);
+        }
+
+        let summary = export_project(&state, "p1", &out_dir.path().join("验收.json")).unwrap();
+        let text = std::fs::read_to_string(&summary.path).unwrap();
+
+        // 第一条：不能出现任何密钥字段名（大小写不敏感）。
+        for field in [
+            "\"apiKey\"", "\"api_key\"", "\"secretKey\"", "\"secret_key\"", "\"accessKey\"",
+            "\"access_key\"", "\"token\"", "\"password\"", "\"credential\"", "\"secret\"",
+        ] {
+            let lower = text.to_ascii_lowercase();
+            assert!(
+                !lower.contains(&field.to_ascii_lowercase()),
+                "导出文件里出现了密钥字段 {field}：{text}"
+            );
+        }
+        // 第二条：不能出现任何密钥值形态。
+        assert!(!text.contains("sk-"), "导出文件里出现了密钥值：{text}");
+        // 第三条：cacheKey 必须还在——导出→导入后缓存语义不能被破坏。
+        assert!(text.contains("\"cacheKey\""), "cacheKey 被误伤了：{text}");
+        assert!(text.contains("board-cache-key-stays"));
+        assert!(text.contains("ck1"));
     }
 
     /// 旧项目导入的素材会把「导入前的原始地址」记进 provenance.legacy.source，
