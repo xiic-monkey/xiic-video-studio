@@ -130,6 +130,21 @@ pub(crate) fn provider_credential(provider_id: &str) -> Result<Option<String>, S
     }
 }
 
+/// 素材外链的访问密钥与密钥（存在钥匙串里）。
+///
+/// 供导出时精确抹除残留的密钥值用：钥匙串读不到就返回空，不让导出失败。
+pub(crate) fn asset_host_secrets(state: &AppState) -> Vec<String> {
+    let Ok(config) = asset_host_internal(state) else {
+        return Vec::new();
+    };
+    config
+        .access_key
+        .into_iter()
+        .chain(config.secret_key)
+        .filter(|value| value.trim().len() >= 8)
+        .collect()
+}
+
 #[tauri::command]
 fn list_studio_projects(state: State<'_, AppState>) -> Result<Vec<Value>, String> {
     let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();

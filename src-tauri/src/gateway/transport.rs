@@ -191,7 +191,12 @@ async fn s3_put(
     if !response.status().is_success() {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
-        return Err(super::map_http_status(status, &text, "资产桶上传"));
+        let error = super::map_http_status(status, &text, "资产桶上传");
+        // 存储桶的错误体同样可能回显签名用的密钥，出网关前按值脱敏。
+        return Err(super::redact_secrets(error, &[
+            host.access_key.as_deref().unwrap_or_default(),
+            host.secret_key.as_deref().unwrap_or_default(),
+        ]));
     }
     let public = format!(
         "{}/{}",

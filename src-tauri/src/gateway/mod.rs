@@ -210,7 +210,7 @@ pub async fn execute(
     runtime: &ProviderRuntime,
     request: &CapabilityRequest,
 ) -> Result<AdapterResult, AppError> {
-    match runtime.profile.adapter.as_str() {
+    let result = match runtime.profile.adapter.as_str() {
         "openai-compatible" => openai::execute(client, runtime, request).await,
         "minimax-h3" => minimax::execute(client, runtime, request).await,
         other => Err(AppError::new(
@@ -218,7 +218,62 @@ pub async fn execute(
             format!("P0 未实现适配器 {other}"),
             false,
         )),
+    };
+    // 供应商的错误响应体可能把用户自己的 Key 原样回显（401 的
+    // "Incorrect API key provided: sk-xxxx" 是常见写法）。错误会落进运行记录、
+    // 事件与导出包，所以离开网关前必须按**值**脱敏——按字段名脱敏抓不到内嵌值。
+    result.map_err(|error| redact_secrets(error, &[runtime.api_key.as_str()]))
+}
+
+/// 脱敏后的密钥占位符。
+pub const REDACTED_SECRET: &str = "***";
+
+/// 短于此长度的「密钥」不参与脱敏：短串会误伤正常文案。
+const MIN_REDACTABLE_LEN: usize = 8;
+
+/// 把字符串里出现的密钥值替换掉。
+pub fn redact_secret(text: &str, secret: &str) -> String {
+    let secret = secret.trim();
+    if secret.len() < MIN_REDACTABLE_LEN {
+        return text.to_string();
     }
+    text.replace(secret, REDACTED_SECRET)
+}
+
+/// 递归替换 JSON 里的字符串值。
+fn redact_secret_in_value(value: &mut Value, secret: &str) {
+    match value {
+        Value::String(text) => *text = redact_secret(text, secret),
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                redact_secret_in_value(item, secret);
+            }
+        }
+        Value::Object(map) => {
+            for nested in map.values_mut() {
+                redact_secret_in_value(nested, secret);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 把错误里的密钥值脱敏掉。
+///
+/// 覆盖 message / provider_raw / details 三处：错误正文、供应商原始响应体、
+/// 以及结构化细节里都可能内嵌密钥值。
+pub fn redact_secrets(mut error: AppError, secrets: &[&str]) -> AppError {
+    for secret in secrets {
+        error.message = redact_secret(&error.message, secret);
+        error.provider_raw = error
+            .provider_raw
+            .as_ref()
+            .map(|raw| redact_secret(raw, secret));
+        if let Some(details) = error.details.as_mut() {
+            redact_secret_in_value(details, secret);
+        }
+    }
+    error
 }
 
 #[cfg(test)]
@@ -242,5 +297,52 @@ pub fn test_profile(adapter: &str, base_url: &str) -> ProviderProfile {
             defaults: Value::Null,
         }],
         enabled: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 供应商的 401 错误体常把用户自己的 Key 原样回显。
+    /// 这条错误会落进运行记录、事件与导出包，所以必须按值脱敏。
+    #[test]
+    fn provider_errors_never_carry_the_api_key_value() {
+        let key = "sk-live-abcdef0123456789";
+        let error = AppError::new("AUTH_UNAUTHORIZED", "鉴权失败", false)
+            .with_raw(format!("{{\"error\":{{\"message\":\"Incorrect API key provided: {key}\"}}}}"));
+        let mut error = error;
+        error.details = Some(json!({ "echo": key, "nested": [{ "value": key }] }));
+
+        let redacted = redact_secrets(error, &[key]);
+        assert!(!redacted.message.contains(key));
+        let raw = redacted.provider_raw.as_deref().unwrap_or("");
+        assert!(!raw.contains(key), "供应商原始响应体里还留着密钥：{raw}");
+        assert!(raw.contains(REDACTED_SECRET));
+        let details = redacted.details.unwrap();
+        assert!(!details.to_string().contains(key), "结构化细节里还留着密钥");
+    }
+
+    /// 脱敏不能把正常文案改成乱码：太短的串不参与替换。
+    #[test]
+    fn short_values_are_left_alone() {
+        assert_eq!(redact_secret("模型 abc 不可用", "abc"), "模型 abc 不可用");
+        assert_eq!(
+            redact_secret("模型 sk-live-0123456789 不可用", "sk-live-0123456789"),
+            format!("模型 {REDACTED_SECRET} 不可用")
+        );
+    }
+
+    /// 多个密钥一起脱敏：素材外链的 access key 与 secret key 都在同一批里。
+    #[test]
+    fn multiple_secrets_are_redacted() {
+        let error = AppError::new("STORAGE_UPLOAD_FAILED", "上传失败 ak-0123456789", true)
+            .with_raw("sk-9876543210 / ak-0123456789".to_string());
+        let redacted = redact_secrets(error, &["sk-9876543210", "ak-0123456789"]);
+        assert!(!redacted.message.contains("ak-0123456789"));
+        let raw = redacted.provider_raw.as_deref().unwrap_or("");
+        assert!(!raw.contains("sk-9876543210"));
+        assert!(!raw.contains("ak-0123456789"));
     }
 }

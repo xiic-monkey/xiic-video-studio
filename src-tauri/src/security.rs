@@ -6,6 +6,11 @@ pub fn validate_remote_url(value: &str) -> Result<reqwest::Url, AppError> {
     if url.scheme() != "https" {
         return Err(AppError::new("PARAM_URL_INSECURE", "只允许 https 远端地址", false));
     }
+    // URL 里带 userinfo（https://user:pass@host/）会把密码带进请求错误的文案里，
+    // 而错误文案会落库并出现在界面上。密钥只应该走请求头或钥匙串。
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(AppError::new("PARAM_URL_INVALID", "远端 URL 不允许携带用户名或密码", false));
+    }
     let host = url.host_str().unwrap_or("").to_ascii_lowercase();
     if host == "localhost" || host.ends_with(".localhost") {
         return Err(AppError::new("PARAM_URL_PRIVATE", "禁止访问 localhost", false));
@@ -38,6 +43,15 @@ mod tests {
 
     #[test]
     fn accepts_public_https() {
+        assert!(validate_remote_url("https://cdn.example.com/a.png").is_ok());
+    }
+
+    /// URL 里带 userinfo 会把密码带进请求错误的文案（错误文案会落库并显示在界面上）。
+    #[test]
+    fn rejects_urls_carrying_credentials() {
+        let error = validate_remote_url("https://user:pass@cdn.example.com/a.png")
+            .expect_err("带 userinfo 的 URL 必须拒绝");
+        assert_eq!(error.code, "PARAM_URL_INVALID");
         assert!(validate_remote_url("https://cdn.example.com/a.png").is_ok());
     }
 }

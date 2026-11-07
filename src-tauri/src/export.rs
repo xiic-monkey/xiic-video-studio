@@ -143,6 +143,72 @@ fn scrub_local_paths(value: &mut Value) {
     }
 }
 
+/// 导出包里残留的密钥值占位符。
+const REDACTED_SECRET_VALUE: &str = "<已脱敏的密钥>";
+
+/// 把包里出现的**真实密钥值**逐字抹掉。
+///
+/// 精确抹除，不靠形态猜测：直接用钥匙串里的真实值去替换，所以不会误伤用户正文。
+fn redact_secret_values(value: &mut Value, secrets: &[String]) {
+    match value {
+        Value::String(text) => {
+            for secret in secrets {
+                // 短串不参与替换：否则正常文案会被改得面目全非。
+                if secret.trim().len() < 8 {
+                    continue;
+                }
+                if text.contains(secret.as_str()) {
+                    *text = text.replace(secret.as_str(), REDACTED_SECRET_VALUE);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for nested in items.iter_mut() {
+                redact_secret_values(nested, secrets);
+            }
+        }
+        Value::Object(map) => {
+            for nested in map.values_mut() {
+                redact_secret_values(nested, secrets);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 收集钥匙串里所有可能残留在导出包中的密钥值。
+///
+/// 读不到就跳过：钥匙串不可用不该让导出失败。
+fn secret_values(connection: &Connection, state: &AppState) -> Vec<String> {
+    let mut secrets: Vec<String> = Vec::new();
+    let provider_ids: Vec<String> = {
+        let Ok(mut statement) = connection.prepare("SELECT payload FROM provider_profiles") else {
+            return Vec::new();
+        };
+        let rows = match statement.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(rows) => rows,
+            Err(_) => return Vec::new(),
+        };
+        rows.filter_map(|row| row.ok())
+            .filter_map(|payload| serde_json::from_str::<Value>(&payload).ok())
+            .filter_map(|profile| {
+                profile
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
+    };
+    for provider_id in provider_ids {
+        if let Ok(Some(key)) = crate::provider_credential(&provider_id) {
+            secrets.push(key);
+        }
+    }
+    secrets.extend(crate::asset_host_secrets(state));
+    secrets.retain(|value| value.trim().len() >= 8);
+    secrets
+}
+
 // 导出规模是「数百资产」量级，线性去重足够；不要为它引入 IndexSet 之类新依赖。
 fn push_asset_id(id: &str, sink: &mut Vec<String>) {
     if id.is_empty() || sink.iter().any(|existing| existing == id) {
@@ -236,7 +302,12 @@ pub fn export_project(state: &AppState, project_id: &str, dest: &Path) -> Result
         .clone();
     let package = {
         let connection = db::open(&db_path)?;
-        build_package(&connection, project_id)?
+        let mut package = build_package(&connection, project_id)?;
+        // 精确抹掉钥匙串里的真实密钥值：修复前落库的供应商错误体可能还带着
+        // 用户自己的 Key（供应商的 401 响应常把 Key 原样回显）。
+        let secrets = secret_values(&connection, state);
+        redact_secret_values(&mut package, &secrets);
+        package
     };
     let raw = serde_json::to_string_pretty(&package).map_err(|error| error.to_string())?;
     std::fs::write(&resolved, raw.as_bytes()).map_err(|error| error.to_string())?;
@@ -446,5 +517,44 @@ mod tests {
         assert!(raw.contains("1/2 构图，仰角 45°"), "提示词正文不能被路径脱敏误伤");
         assert!(raw.contains("assets/cd/cd34.png"), "CAS 相对路径要保留");
         assert!(raw.contains("ck2"), "cacheKey 不能被误伤");
+    }
+
+    /// 精确脱敏：把包里出现的**真实密钥值**逐字抹掉。
+    ///
+    /// 这里不走钥匙串（单测环境没有钥匙串），直接喂已知密钥值，
+    /// 验证替换发生在所有字符串值上，且不误伤无关文案。
+    #[test]
+    fn real_secret_values_are_redacted_from_every_string() {
+        let mut package = json!({
+            "runs": [{
+                "error": {
+                    "message": "Incorrect API key provided: sk-live-abcdef0123456789",
+                    "providerRaw": "{\"error\":\"sk-live-abcdef0123456789\"}",
+                    "details": { "echo": ["sk-live-abcdef0123456789", "无关文案"] },
+                },
+            }],
+            "prompt": "提示词里提到 sk-live-abcdef0123456789 这个串也要被抹掉",
+        });
+
+        redact_secret_values(
+            &mut package,
+            &["sk-live-abcdef0123456789".to_string()],
+        );
+
+        let raw = serde_json::to_string(&package).unwrap();
+        assert!(
+            !raw.contains("sk-live-abcdef0123456789"),
+            "导出包里还留着密钥值：{raw}"
+        );
+        assert!(raw.contains(REDACTED_SECRET_VALUE));
+        assert!(raw.contains("无关文案"), "无关文案不能被误伤");
+    }
+
+    /// 短密钥不参与替换：否则正常文案会被改得面目全非。
+    #[test]
+    fn short_secret_values_are_ignored() {
+        let mut package = json!({ "message": "模型 abc 不可用" });
+        redact_secret_values(&mut package, &["abc".to_string()]);
+        assert_eq!(package["message"], json!("模型 abc 不可用"));
     }
 }
