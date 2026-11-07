@@ -8,6 +8,8 @@ use tauri::{AppHandle, Manager, State};
 
 mod assets;
 mod db;
+// 项目导出：打包项目元数据（不含素材二进制与密钥），文件写入与路径校验都在 Rust 侧。
+mod export;
 mod gateway;
 // 旧项目导入：素材下载、落 CAS 与落库都在这个模块里。
 mod import;
@@ -605,6 +607,18 @@ async fn import_legacy_project(
         .map_err(|error| error.message)
 }
 
+/// 导出项目元数据包（不含素材二进制、不含密钥、不含绝对路径）。
+///
+/// 路径校验与文件写入都在 Rust 侧完成：渲染进程只能给一个目标路径，不能决定写到哪。
+#[tauri::command]
+fn export_project(
+    project_id: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<export::ExportSummary, String> {
+    export::export_project(&state, &project_id, std::path::Path::new(&path))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -656,7 +670,8 @@ pub fn run() {
             resume_jobs,
             asset_file_path,
             read_asset_text,
-            import_legacy_project
+            import_legacy_project,
+            export_project
         ])
         .run(tauri::generate_context!())
         .expect("error while running Frameforge");
