@@ -4,6 +4,7 @@ src-tauri/target/
 
 .DS_Store
 .idea/
+.workbuddy/
 
 .env
 .env.*
