@@ -16,6 +16,8 @@ mod import;
 mod jobs;
 mod runs;
 mod security;
+mod sheet;
+mod mask;
 
 const CREDENTIAL_ACCOUNT_PREFIX: &str = "provider/";
 const KEYCHAIN_SERVICE: &str = "com.frameforge.studio";
@@ -128,6 +130,46 @@ pub(crate) fn provider_credential(provider_id: &str) -> Result<Option<String>, S
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(error) => Err(error.to_string()),
     }
+}
+
+/// 按 key_ref 读取钥匙串里的密钥（多 Key 场景用）。
+pub(crate) fn provider_key_secret(key_ref: &str) -> Option<String> {
+    if key_ref.trim().is_empty() {
+        return None;
+    }
+    Entry::new(KEYCHAIN_SERVICE, key_ref)
+        .ok()
+        .and_then(|entry| entry.get_password().ok())
+}
+
+/// 保存某个 Key。同一供应商可以有多个 Key，账户名按 key_id 区分。
+#[tauri::command]
+fn save_provider_key(provider_id: String, key_id: String, api_key: String) -> Result<(), String> {
+    if api_key.trim().is_empty() {
+        return Err("API key cannot be empty".to_string());
+    }
+    if provider_id.trim().is_empty() || key_id.trim().is_empty() {
+        return Err("Provider id and key id cannot be empty".to_string());
+    }
+    let account = format!("{CREDENTIAL_ACCOUNT_PREFIX}{provider_id}/key/{key_id}");
+    Entry::new(KEYCHAIN_SERVICE, &account)
+        .map_err(|error| error.to_string())?
+        .set_password(api_key.trim())
+        .map_err(|error| error.to_string())
+}
+
+/// 删除某个 Key（钥匙串与配置里的状态一起清掉）。
+#[tauri::command]
+fn delete_provider_key(provider_id: String, key_id: String) -> Result<(), String> {
+    let account = format!("{CREDENTIAL_ACCOUNT_PREFIX}{provider_id}/key/{key_id}");
+    if let Ok(entry) = Entry::new(KEYCHAIN_SERVICE, &account) {
+        match entry.delete_credential() {
+            Ok(()) => {}
+            Err(keyring::Error::NoEntry) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(())
 }
 
 /// 素材外链的访问密钥与密钥（存在钥匙串里）。
@@ -275,11 +317,35 @@ fn list_provider_profiles(state: State<'_, AppState>) -> Result<Vec<Value>, Stri
     let rows = statement
         .query_map([], |row| row.get::<_, String>(0))
         .map_err(|error| error.to_string())?;
-    rows.map(|row| {
-        serde_json::from_str(&row.map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())
-    })
-    .collect()
+    let mut profiles: Vec<gateway::ProviderProfile> = rows
+        .map(|row| {
+            let payload = row.map_err(|error| error.to_string())?;
+            serde_json::from_str(&payload).map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // 注入每个 Key 的「钥匙串里是否真的有密钥」，前端据此显示状态。
+    for profile in profiles.iter_mut() {
+        for key in profile.keys.iter_mut() {
+            let key_ref = if key.key_ref.trim().is_empty() {
+                format!("{CREDENTIAL_ACCOUNT_PREFIX}{}/key/{}", profile.id, key.id)
+            } else {
+                key.key_ref.clone()
+            };
+            key.has_secret = provider_key_secret(&key_ref).is_some();
+        }
+        profile.has_key = if profile.keys.is_empty() {
+            provider_key_secret(&profile.auth.key_ref).is_some()
+        } else {
+            profile
+                .keys
+                .iter()
+                .any(|key| key.enabled && key.status != "invalid" && key.has_secret)
+        };
+    }
+    profiles
+        .into_iter()
+        .map(|profile| serde_json::to_value(profile).map_err(|error| error.to_string()))
+        .collect()
 }
 
 /// 远端地址校验失败时保留错误码，方便前端提示与日志排查区分具体原因。
@@ -491,30 +557,18 @@ async fn start_run(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<runs::RunRecord, String> {
-    let profile = runs::load_provider_profile(&state, &request.provider_id)?
-        .ok_or_else(|| "Provider 未配置".to_string())?;
-    if !profile.enabled {
-        return Err("Provider 已禁用".to_string());
+    // 候选展开：自动路由时按模型下各供应商的顺序展开（供应商 × Key）。
+    let candidates = runs::expand_candidates(&state, &request)?;
+    if candidates.is_empty() {
+        return Err("没有可用供应商：请检查该模型的供应商配置、协议与 API Key".to_string());
     }
     if let Some(asset_id) = request.cached_asset_id.clone() {
         return runs::finish_cached(&state, &request, &asset_id);
     }
-    let key = provider_credential(&request.provider_id)?
-        .ok_or_else(|| "尚未保存该 Provider 的 API Key".to_string())?;
-    let runtime = gateway::ProviderRuntime {
-        profile: profile.clone(),
-        api_key: key,
-    };
     let run = runs::create_run(&state, &request)?;
     let job_id = format!("job_{}", uuid::Uuid::new_v4());
     // 同步能力不建 job 行：否则下次启动的恢复扫描会把它当成「提交阶段被中断」。
-    let is_async = profile
-        .models
-        .iter()
-        .find(|model| model.id == request.model)
-        .and_then(|model| model.capability(&request.capability))
-        .map(|capability| capability.async_job)
-        .unwrap_or(false);
+    let is_async = runs::request_is_async(&state, &request, &candidates);
     let db_path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
     if is_async {
         db::open(&db_path)?
@@ -531,7 +585,7 @@ async fn start_run(
     let app_clone = app.clone();
     let run_clone = run.clone();
     tauri::async_runtime::spawn(async move {
-        runs::execute_run(app_clone, state_owned, run_clone, job_id, request, runtime).await;
+        runs::execute_run(app_clone, state_owned, run_clone, job_id, request, candidates).await;
     });
     Ok(run)
 }
@@ -561,6 +615,129 @@ fn resume_jobs(app: AppHandle, state: State<'_, AppState>) -> Result<usize, Stri
     Ok(jobs::resume_pending_on_start(app, &state))
 }
 
+/// 拆帧：把一张设定图按版式切成各视角，分别落库。
+#[tauri::command]
+fn split_sheet(
+    asset_id: String,
+    layout: String,
+    node_id: String,
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<Value>, String> {
+    let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
+    let connection = db::open(&path)?;
+    let payload: String = connection
+        .query_row("SELECT payload FROM assets WHERE id=?1", [&asset_id], |row| row.get(0))
+        .map_err(|_| "素材不存在".to_string())?;
+    let source: assets::AssetRef =
+        serde_json::from_str(&payload).map_err(|error| error.to_string())?;
+    let absolute = assets::absolute_path(&state.data_dir, &source.path)?;
+    let bytes = std::fs::read(&absolute).map_err(|error| error.to_string())?;
+    let provenance = json!({
+        "projectId": project_id,
+        "nodeId": node_id,
+        "sourceAssetId": asset_id,
+        "kind": "sheet-view",
+    });
+    let pieces = sheet::split_sheet(&bytes, sheet::SheetLayout::parse(&layout))?;
+    let views = sheet::store_views(&state.data_dir, pieces, provenance)?;
+    let mut out = Vec::new();
+    for view in views {
+        runs::save_asset(&state, &view.asset).map_err(|error| error.message)?;
+        out.push(json!({
+            "view": view.view,
+            "label": view.label,
+            "assetId": view.asset.id,
+            "mime": view.asset.mime,
+            "path": view.asset.path,
+        }));
+    }
+    Ok(out)
+}
+
+/// 局部重绘：保存画好的蒙版。
+///
+/// 渲染进程只给 data URL；尺寸校验、灰度归一化与落库都在后端完成。
+#[tauri::command]
+fn save_mask(
+    mask_data_url: String,
+    source_asset_id: String,
+    node_id: String,
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<Value, String> {
+    let (mime, raw) = assets::decode_data_url(&mask_data_url)
+        .ok_or_else(|| "蒙版数据格式无效".to_string())?;
+    if mime != "image/png" {
+        return Err("蒙版必须是 PNG 图片".to_string());
+    }
+    let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
+    let connection = db::open(&path)?;
+    let payload: String = connection
+        .query_row("SELECT payload FROM assets WHERE id=?1", [&source_asset_id], |row| row.get(0))
+        .map_err(|_| "源图素材不存在".to_string())?;
+    let source: assets::AssetRef =
+        serde_json::from_str(&payload).map_err(|error| error.to_string())?;
+    let source_path = assets::absolute_path(&state.data_dir, &source.path)?;
+    let source_bytes = std::fs::read(&source_path).map_err(|error| error.to_string())?;
+    let (width, height) = mask::ensure_same_size(&source_bytes, &raw)?;
+    let png = mask::normalize_mask(&raw)?;
+    let provenance = json!({
+        "projectId": project_id,
+        "nodeId": node_id,
+        "sourceAssetId": source_asset_id,
+        "kind": "mask",
+    });
+    let mut asset = assets::store_bytes(&state.data_dir, &png, "image", "image/png", provenance)?;
+    asset.width = Some(width);
+    asset.height = Some(height);
+    if let Ok(thumb) = sheet::thumbnail(&png, 512) {
+        let relative = format!("thumbs/{}/{}.png", &asset.id[0..2], asset.id);
+        if let Ok(thumb_path) = assets::write_derived(&state.data_dir, &relative, &thumb) {
+            asset.thumb_path = Some(thumb_path);
+        }
+    }
+    runs::save_asset(&state, &asset).map_err(|error| error.message)?;
+    Ok(json!({
+        "assetId": asset.id,
+        "mime": asset.mime,
+        "path": asset.path,
+        "width": width,
+        "height": height,
+    }))
+}
+
+/// 资产库：按类型列出资产（可选按项目过滤）。
+#[tauri::command]
+fn list_assets(project_id: Option<String>, state: State<'_, AppState>) -> Result<Vec<Value>, String> {
+    let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
+    let connection = db::open(&path)?;
+    let mut statement = connection
+        .prepare("SELECT payload FROM assets ORDER BY created_at DESC LIMIT 500")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    let mut assets: Vec<Value> = Vec::new();
+    for row in rows {
+        let payload = row.map_err(|error| error.to_string())?;
+        let value: Value = serde_json::from_str(&payload).map_err(|error| error.to_string())?;
+        if let Some(project) = project_id.as_ref().filter(|item| !item.trim().is_empty()) {
+            let belongs = value
+                .get("provenance")
+                .and_then(|item| item.get("projectId"))
+                .and_then(Value::as_str)
+                .map(|owner| owner == project)
+                .unwrap_or(false);
+            if !belongs {
+                continue;
+            }
+        }
+        assets.push(value);
+    }
+    Ok(assets)
+}
+
 #[tauri::command]
 fn asset_file_path(asset_id: String, state: State<'_, AppState>) -> Result<String, String> {
     let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
@@ -571,6 +748,20 @@ fn asset_file_path(asset_id: String, state: State<'_, AppState>) -> Result<Strin
     let asset: assets::AssetRef =
         serde_json::from_str(&payload).map_err(|error| error.to_string())?;
     Ok(assets::absolute_path(&state.data_dir, &asset.path)?.to_string_lossy().to_string())
+}
+
+/// 缩略图路径：有缩略图用缩略图，没有就退回原文件。
+#[tauri::command]
+fn asset_thumb_file_path(asset_id: String, state: State<'_, AppState>) -> Result<String, String> {
+    let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
+    let connection = db::open(&path)?;
+    let payload: String = connection
+        .query_row("SELECT payload FROM assets WHERE id=?1", [&asset_id], |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    let asset: assets::AssetRef =
+        serde_json::from_str(&payload).map_err(|error| error.to_string())?;
+    let relative = asset.thumb_path.clone().unwrap_or(asset.path.clone());
+    Ok(assets::absolute_path(&state.data_dir, &relative)?.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -666,6 +857,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             save_provider_credential,
+            save_provider_key,
+            delete_provider_key,
             list_studio_projects,
             save_studio_project,
             list_boards,
@@ -683,7 +876,11 @@ pub fn run() {
             list_runs,
             select_run_candidate,
             resume_jobs,
+            list_assets,
+            split_sheet,
+            save_mask,
             asset_file_path,
+            asset_thumb_file_path,
             read_asset_text,
             import_legacy_project,
             export_project

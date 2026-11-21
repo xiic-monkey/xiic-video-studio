@@ -25,6 +25,12 @@ pub fn should_resume(status: &str, remote_task_id: Option<&str>) -> bool {
     matches!(status, "submitted" | "polling") && remote_task_id.is_some()
 }
 
+/// 运行是否已经到终态：到终态就不该再恢复轮询，
+/// 更不能把它当成「提交中断」改判成失败。
+pub fn run_is_terminal(status: &str) -> bool {
+    matches!(status, "succeeded" | "failed" | "cancelled")
+}
+
 fn db_connection(state: &AppState) -> Result<rusqlite::Connection, String> {
     let path = runs::db_path(state)?;
     db::open(&path)
@@ -96,7 +102,7 @@ async fn poll_loop(
     loop {
         tokio::time::sleep(poll_delay(attempt)).await;
         if is_cancelled(&db_path, &run.id) {
-            let _ = gateway::minimax::cancel(&client, &runtime, &model, &task_id).await;
+            let _ = gateway::cancel(&client, &runtime, &model, &task_id).await;
             finish_cancelled(&app, &db_path, &run);
             set_job_values(&db_path, &job_id, "cancelled", attempt);
             return;
@@ -111,7 +117,7 @@ async fn poll_loop(
             set_job_values(&db_path, &job_id, "failed", attempt);
             return;
         }
-        match gateway::minimax::poll(&client, &runtime, &model, &task_id).await {
+        match gateway::poll(&client, &runtime, &model, &task_id).await {
             Ok(status) if status.status == "succeeded" => {
                 match runs::store_outputs_for_poll(&app, &db_path, &data_dir, &run, status.outputs).await
                 {
@@ -255,33 +261,49 @@ pub fn resume_pending_on_start(app: AppHandle, state: &AppState) -> usize {
     };
     let mut resumed = 0usize;
     for (job_id, run_id, provider_id, status, remote_task_id, payload) in rows {
+        // 运行已经到终态（例如同步候选先跑成功了）：不要复活它，
+        // 更不能当成「提交中断」把它改判成失败。
+        let run = match runs::load_run(state, &run_id) {
+            Ok(run) => run,
+            Err(_) => continue,
+        };
+        if run_is_terminal(&run.status) {
+            set_job_values(&path, &job_id, &run.status, 0);
+            continue;
+        }
         let request: StartRunRequest = match serde_json::from_str(&payload) {
             Ok(request) => request,
             Err(_) => continue,
         };
         if !should_resume(&status, remote_task_id.as_deref()) {
-            if let Ok(run) = runs::load_run(state, &run_id) {
-                finish_failed(
-                    &app,
-                    &path,
-                    &run,
-                    gateway::AppError::new(
-                        "TASK_INTERRUPTED",
-                        "任务在提交阶段被中断，请重新运行",
-                        true,
-                    ),
-                );
-                set_job_values(&path, &job_id, "failed", 0);
-            }
+            finish_failed(
+                &app,
+                &path,
+                &run,
+                gateway::AppError::new(
+                    "TASK_INTERRUPTED",
+                    "任务在提交阶段被中断，请重新运行",
+                    true,
+                ),
+            );
+            set_job_values(&path, &job_id, "failed", 0);
             continue;
         }
         let task_id = match remote_task_id {
             Some(task_id) => task_id,
             None => continue,
         };
-        let key = match crate::provider_credential(&provider_id) {
-            Ok(Some(key)) => key,
-            _ => continue,
+        let key_ref = match request.route.as_ref() {
+            Some(route) => route.key_ref.clone(),
+            // 老任务没有路由信息：回落到供应商默认 Key。
+            None => match crate::provider_credential(&provider_id) {
+                Ok(Some(key)) => key,
+                _ => continue,
+            },
+        };
+        let key = match crate::provider_key_secret(&key_ref) {
+            Some(key) => key,
+            None => continue,
         };
         let profile = match runs::load_provider_profile(state, &provider_id) {
             Ok(Some(profile)) => profile,
@@ -291,11 +313,11 @@ pub fn resume_pending_on_start(app: AppHandle, state: &AppState) -> usize {
             Some(model) => model.clone(),
             None => continue,
         };
-        let run = match runs::load_run(state, &run_id) {
-            Ok(run) => run,
-            Err(_) => continue,
+        let protocol = match request.route.as_ref() {
+            Some(route) => route.protocol.clone(),
+            None => gateway::protocol_for(&profile, &request.model, &request.capability),
         };
-        let runtime = ProviderRuntime { profile, api_key: key };
+        let runtime = ProviderRuntime { profile, api_key: key, protocol };
         let handle = app.clone();
         let db_path = path.clone();
         let data_dir = state.data_dir.clone();
@@ -325,5 +347,15 @@ mod tests {
         assert!(should_resume("submitted", Some("task_1")));
         assert!(should_resume("polling", Some("task_1")));
         assert!(!should_resume("succeeded", Some("task_1")));
+    }
+
+    /// 已经成功的运行不再恢复：恢复扫描不能把它改判成失败。
+    #[test]
+    fn terminal_runs_are_never_resumed() {
+        assert!(run_is_terminal("succeeded"));
+        assert!(run_is_terminal("failed"));
+        assert!(run_is_terminal("cancelled"));
+        assert!(!run_is_terminal("running"));
+        assert!(!run_is_terminal("queued"));
     }
 }

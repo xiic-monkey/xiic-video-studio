@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { FolderKanban, Plus, Save, Settings } from 'lucide-react';
 import { ProjectLibrary } from './ProjectLibrary';
+import { AssetLibrary } from './AssetLibrary';
 import { CanvasView } from '../canvas/CanvasView';
 import { Inspector } from '../inspector/Inspector';
 import { SettingsDialog } from '../settings/SettingsDialog';
@@ -144,6 +145,7 @@ export function StudioApp() {
               <button className="studio-button secondary" type="submit" aria-label="新建画布"><Plus size={14} /></button>
             </form>
           </section>
+          <AssetLibrary projectId={currentProjectId ?? undefined} />
           <div className="studio-rail-foot">
             <button className="studio-button secondary" onClick={() => { void useBoardStore.getState().flush(); }}>
               <Save size={13} /> 立即保存

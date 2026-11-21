@@ -102,6 +102,16 @@ pub fn absolute_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
     area_path(root, relative)
 }
 
+/// 写派生产物（例如缩略图）：不进资产表，只落文件。
+pub fn write_derived(root: &Path, relative: &str, bytes: &[u8]) -> Result<String, String> {
+    let absolute = area_path(root, relative)?;
+    if let Some(parent) = absolute.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(&absolute, bytes).map_err(|error| error.to_string())?;
+    Ok(relative.to_string())
+}
+
 pub fn decode_data_url(value: &str) -> Option<(String, Vec<u8>)> {
     let rest = value.strip_prefix("data:")?;
     let (meta, payload) = rest.split_once(',')?;

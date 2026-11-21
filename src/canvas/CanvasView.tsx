@@ -189,7 +189,11 @@ function CanvasInner() {
     <div className="studio-canvas" ref={wrapper}>
       <div className="canvas-toolbar" role="toolbar" aria-label="添加节点">
         <span className="canvas-toolbar-label">添加</span>
-        {['text', 'image', 'video', 'audio', 'script', 'note', 'group'].map((type) => (
+        {[
+          'text', 'image', 'video', 'audio', 'script',
+          'character', 'storyboard', 'expression', 'variant', 'turnaround', 'coverage', 'continuity', 'redraw', 'inpaint',
+          'note', 'group',
+        ].map((type) => (
           <button key={type} className="canvas-tool" onClick={() => addAtCenter(type)}>
             {getNodeDefinition(type)?.title ?? type}
           </button>

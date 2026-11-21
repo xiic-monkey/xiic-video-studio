@@ -1,5 +1,6 @@
 import type { GraphCommand } from '../domain/graph/commands';
 import { compilePrompt } from '../domain/prompts/compile';
+import { effectiveCapability } from '../domain/providers/routing';
 import type { BoardDoc, BoardNode, PromptSnapshot, ProviderProfile, StyleGuide } from '../domain/types';
 
 export type CandidateKind = 'image' | 'video' | 'audio' | 'text';
@@ -59,7 +60,8 @@ export function modelOptions(profiles: ProviderProfile[], capability: string): M
   for (const profile of profiles) {
     if (!profile.enabled) continue;
     for (const model of profile.models) {
-      if (!model.capabilities.some((item) => item.capability === capability)) continue;
+      if (model.enabled === false) continue;
+      if (!effectiveCapability(model.id, model, capability)) continue;
       options.push({
         providerId: profile.id,
         providerName: profile.name,
@@ -69,4 +71,33 @@ export function modelOptions(profiles: ProviderProfile[], capability: string): M
     }
   }
   return options;
+}
+
+export interface ModelChoice {
+  modelId: string;
+  modelName: string;
+  /** 提供这个模型的供应商（按路由顺序）。 */
+  providers: Array<{ providerId: string; providerName: string }>;
+}
+
+/**
+ * 按规范模型聚合的可选项。
+ *
+ * 节点只记「模型 + 可选供应商」：供应商为空就是自动路由。
+ */
+export function modelChoices(profiles: ProviderProfile[], capability: string): ModelChoice[] {
+  const byModel = new Map<string, ModelChoice>();
+  for (const option of modelOptions(profiles, capability)) {
+    const existing = byModel.get(option.modelId);
+    if (existing) {
+      existing.providers.push({ providerId: option.providerId, providerName: option.providerName });
+      continue;
+    }
+    byModel.set(option.modelId, {
+      modelId: option.modelId,
+      modelName: option.modelName,
+      providers: [{ providerId: option.providerId, providerName: option.providerName }],
+    });
+  }
+  return [...byModel.values()].sort((left, right) => left.modelName.localeCompare(right.modelName));
 }

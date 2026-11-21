@@ -122,7 +122,8 @@ describe('run controller', () => {
 
     const [call] = startCalls();
     expect(call[1].request.schemaVersion).toBe(1);
-    expect(call[1].request.providerId).toBe('openai-compatible');
+    // 自动路由：providerId 留空，后端按候选顺序回退。
+    expect(call[1].request.providerId).toBe('');
     expect(call[1].request.model).toBe('gpt-image-1');
     expect(call[1].request.cachedAssetId).toBeUndefined();
     expect(useRunController.getState().pending).toBeUndefined();

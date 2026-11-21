@@ -5,25 +5,39 @@ use super::{
 use base64::Engine;
 use serde_json::{json, Value};
 
-pub async fn execute(
-    client: &reqwest::Client,
-    runtime: &ProviderRuntime,
-    request: &CapabilityRequest,
-) -> Result<AdapterResult, AppError> {
-    match request.capability.as_str() {
-        "text.chat" => chat(client, runtime, request).await,
-        "image.generate" => image_generate(client, runtime, request).await,
-        "image.edit" => image_edit(client, runtime, request).await,
-        "audio.tts" => speech(client, runtime, request).await,
-        other => Err(AppError::new(
-            "CAP_UNSUPPORTED_CAPABILITY",
-            format!("OpenAI 兼容适配器不支持 {other}"),
-            false,
-        )),
-    }
+/// gpt-image 系列用 `output_format` / `quality`，不认识 `response_format`。
+///
+/// 同一套协议还服务 dall-e-3 与火山方舟 seedream，它们仍然要 `response_format`，
+/// 所以按模型名分流，而不是整个适配器改口径。
+fn is_gpt_image(model: &str) -> bool {
+    model.starts_with("gpt-image")
 }
 
-async fn chat(
+/// 质量档位：auto 走服务端默认，不必发出去。
+fn quality_of(request: &CapabilityRequest) -> Option<String> {
+    let quality = request.params.get("quality").and_then(Value::as_str)?.trim();
+    if quality.is_empty() || quality == "auto" {
+        return None;
+    }
+    Some(quality.to_string())
+}
+
+/// 随模型变化的图片接口附加字段。
+///
+/// gpt-image 系列用 `output_format` / `quality`（不认识 `response_format`），
+/// dall-e-3 与火山方舟 seedream 仍然要 `response_format`。
+fn image_extra_fields(request: &CapabilityRequest) -> Vec<(String, String)> {
+    if is_gpt_image(&request.model) {
+        let mut fields = vec![("output_format".to_string(), "png".to_string())];
+        if let Some(quality) = quality_of(request) {
+            fields.push(("quality".to_string(), quality));
+        }
+        return fields;
+    }
+    vec![("response_format".to_string(), "b64_json".to_string())]
+}
+
+pub async fn chat(
     client: &reqwest::Client,
     runtime: &ProviderRuntime,
     request: &CapabilityRequest,
@@ -55,23 +69,26 @@ async fn chat(
     })
 }
 
-async fn image_generate(
+pub async fn image_generate(
     client: &reqwest::Client,
     runtime: &ProviderRuntime,
     request: &CapabilityRequest,
 ) -> Result<AdapterResult, AppError> {
     let count = request.params.get("count").and_then(Value::as_u64).unwrap_or(1).clamp(1, 4);
     let size = request.params.get("size").and_then(Value::as_str).unwrap_or("1024x1536");
+    let mut payload = json!({
+        "model": request.model,
+        "prompt": request.prompt,
+        "n": count,
+        "size": size
+    });
+    for (key, value) in image_extra_fields(request) {
+        payload[key] = json!(value);
+    }
     let response = client
         .post(api_url(&runtime.profile.base_url, "images/generations"))
         .bearer_auth(&runtime.api_key)
-        .json(&json!({
-            "model": request.model,
-            "prompt": request.prompt,
-            "n": count,
-            "size": size,
-            "response_format": "b64_json"
-        }))
+        .json(&payload)
         .send()
         .await
         .map_err(|error| map_reqwest(error, "OpenAI 兼容图片"))?;
@@ -80,25 +97,37 @@ async fn image_generate(
     Ok(AdapterResult { status: "succeeded".to_string(), outputs, task_id: None, raw: Some(value) })
 }
 
-async fn image_edit(
+pub async fn image_edit(
     client: &reqwest::Client,
     runtime: &ProviderRuntime,
     request: &CapabilityRequest,
 ) -> Result<AdapterResult, AppError> {
-    let first = request.inputs.iter().find(|input| input.kind == "image")
+    let first = request.inputs.iter().find(|input| input.kind == "image" && input.role != "mask")
         .ok_or_else(|| AppError::new("CAP_UNSUPPORTED_INPUT", "图片编辑需要至少一张参考图", false))?;
     let (mime, bytes) = decode_data_input(&first.value)?;
     let part = reqwest::multipart::Part::bytes(bytes)
         .file_name("image.png")
         .mime_str(&mime)
         .map_err(|error| AppError::new("PARAM_INVALID", format!("图片 MIME 无效：{error}"), false))?;
-    let form = reqwest::multipart::Form::new()
+    let mut form = reqwest::multipart::Form::new()
         .text("model", request.model.clone())
         .text("prompt", request.prompt.clone())
         .text("n", request.params.get("count").and_then(Value::as_u64).unwrap_or(1).to_string())
-        .text("size", request.params.get("size").and_then(Value::as_str).unwrap_or("1024x1536").to_string())
-        .text("response_format", "b64_json")
-        .part("image", part);
+        .text("size", request.params.get("size").and_then(Value::as_str).unwrap_or("1024x1536").to_string());
+    for (key, value) in image_extra_fields(request) {
+        form = form.text(key, value);
+    }
+    let mut form = form.part("image", part);
+    // 局部重绘：蒙版作为独立 multipart 字段发出。
+    // 蒙版按 OpenAI 约定是「透明处=重绘」（后端归一化时已把 alpha 反相）。
+    if let Some(mask) = request.inputs.iter().find(|input| input.role == "mask" && input.kind == "image") {
+        let (mask_mime, mask_bytes) = decode_data_input(&mask.value)?;
+        let mask_part = reqwest::multipart::Part::bytes(mask_bytes)
+            .file_name("mask.png")
+            .mime_str(&mask_mime)
+            .map_err(|error| AppError::new("PARAM_INVALID", format!("蒙版 MIME 无效：{error}"), false))?;
+        form = form.part("mask", mask_part);
+    }
     let response = client
         .post(api_url(&runtime.profile.base_url, "images/edits"))
         .bearer_auth(&runtime.api_key)
@@ -111,7 +140,7 @@ async fn image_edit(
     Ok(AdapterResult { status: "succeeded".to_string(), outputs, task_id: None, raw: Some(value) })
 }
 
-async fn speech(
+pub async fn speech(
     client: &reqwest::Client,
     runtime: &ProviderRuntime,
     request: &CapabilityRequest,
@@ -184,13 +213,14 @@ mod tests {
     use super::*;
     use crate::gateway::{CapabilityRequest, ProviderRuntime};
     use serde_json::json;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn runtime(base_url: &str) -> ProviderRuntime {
         ProviderRuntime {
             profile: crate::gateway::test_profile("openai-compatible", base_url),
             api_key: "test-key".to_string(),
+            protocol: "openai-chat".to_string(),
         }
     }
 
@@ -217,7 +247,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let result = execute(&reqwest::Client::new(), &runtime(&server.uri()), &request("text.chat"))
+        let result = chat(&reqwest::Client::new(), &runtime(&server.uri()), &request("text.chat"))
             .await
             .expect("chat");
         assert_eq!(result.status, "succeeded");
@@ -235,7 +265,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let result = execute(&reqwest::Client::new(), &runtime(&server.uri()), &request("image.generate"))
+        let result = image_generate(&reqwest::Client::new(), &runtime(&server.uri()), &request("image.generate"))
             .await
             .expect("image");
         assert_eq!(result.outputs.len(), 2);
@@ -244,14 +274,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unauthorized_maps_to_auth_error() {
+    async fn image_edit_sends_the_mask_as_a_multipart_field() {
         let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/edits"))
+            .and(body_string_contains("name=\"mask\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "b64_json": "aGVsbG8=" }]
+            })))
+            .mount(&server)
+            .await;
+        let mut edit = request("image.edit");
+        edit.inputs = vec![
+            crate::gateway::PreparedInput {
+                role: "source_image".to_string(), kind: "image".to_string(),
+                mime: "image/png".to_string(), value: "data:image/png;base64,aGVsbG8=".to_string(),
+            },
+            crate::gateway::PreparedInput {
+                role: "mask".to_string(), kind: "image".to_string(),
+                mime: "image/png".to_string(), value: "data:image/png;base64,bWFzaw==".to_string(),
+            },
+        ];
+        let result = image_edit(&reqwest::Client::new(), &runtime(&server.uri()), &edit)
+            .await
+            .expect("edit");
+        assert_eq!(result.outputs.len(), 1);
+    }
+
+    /// gpt-image 系列不认识 response_format：只发 output_format + quality。
+    #[test]
+    fn gpt_image_uses_output_format_instead_of_response_format() {
+        let mut request = request("image.generate");
+        request.model = "gpt-image-1".to_string();
+        request.params["quality"] = json!("high");
+        let fields = image_extra_fields(&request);
+        assert!(fields.contains(&("output_format".to_string(), "png".to_string())));
+        assert!(fields.contains(&("quality".to_string(), "high".to_string())));
+        assert!(!fields.iter().any(|(key, _)| key == "response_format"));
+    }
+
+    /// auto 档位交给服务端默认，不必发出去。
+    #[test]
+    fn auto_quality_is_left_to_the_provider() {
+        let mut request = request("image.generate");
+        request.model = "gpt-image-1".to_string();
+        request.params["quality"] = json!("auto");
+        let fields = image_extra_fields(&request);
+        assert!(!fields.iter().any(|(key, _)| key == "quality"));
+    }
+
+    /// dall-e-3 / seedream 仍走 response_format。
+    #[test]
+    fn other_image_models_keep_response_format() {
+        let mut request = request("image.generate");
+        request.model = "dall-e-3".to_string();
+        let fields = image_extra_fields(&request);
+        assert_eq!(fields, vec![("response_format".to_string(), "b64_json".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn gpt_image_generation_posts_output_format() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/generations"))
+            .and(body_string_contains("\"output_format\":\"png\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{ "b64_json": "aGVsbG8=" }]
+            })))
+            .mount(&server)
+            .await;
+        let mut req = request("image.generate");
+        req.model = "gpt-image-1".to_string();
+        let result = image_generate(&reqwest::Client::new(), &runtime(&server.uri()), &req)
+            .await
+            .expect("image");
+        assert_eq!(result.outputs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_maps_to_auth_error() {        let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
             .mount(&server)
             .await;
-        let error = execute(&reqwest::Client::new(), &runtime(&server.uri()), &request("text.chat"))
+        let error = chat(&reqwest::Client::new(), &runtime(&server.uri()), &request("text.chat"))
             .await
             .expect_err("auth");
         assert_eq!(error.code, "AUTH_UNAUTHORIZED");
@@ -266,7 +373,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
             .mount(&server)
             .await;
-        let error = execute(&reqwest::Client::new(), &runtime(&server.uri()), &request("text.chat"))
+        let error = chat(&reqwest::Client::new(), &runtime(&server.uri()), &request("text.chat"))
             .await
             .expect_err("rate");
         assert_eq!(error.code, "RATE_LIMIT");
@@ -281,7 +388,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"mp3-bytes".to_vec()))
             .mount(&server)
             .await;
-        let result = execute(&reqwest::Client::new(), &runtime(&server.uri()), &request("audio.tts"))
+        let result = speech(&reqwest::Client::new(), &runtime(&server.uri()), &request("audio.tts"))
             .await
             .expect("tts");
         assert_eq!(result.outputs[0].kind, "audio");

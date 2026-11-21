@@ -97,6 +97,56 @@ export interface ScriptNodeData {
   body: string;
 }
 
+/** 角色三视图（业内通行版式：横版「面部特写 + 正/侧/背」，竖版 2×2 四视图）。 */
+export interface CharacterNodeData {
+  prompt: string;
+  negative: string;
+  layout: 'landscape' | 'portrait';
+  background: 'white' | 'gray';
+  model?: string;
+  providerId?: string;
+}
+
+/** 分镜九宫格：一张图里排 9 个连续镜头。 */
+export interface StoryboardNodeData {
+  prompt: string;
+  negative: string;
+  grid: '3x3' | '4x4';
+  model?: string;
+  providerId?: string;
+}
+
+/**
+ * 业务化节点共用数据形状。
+ *
+ * 这些节点都是「通用能力 + 固定版式约束」的组合：
+ * variant 决定变体/方向类选项，note 是补充要求，grid/steps 是版式参数。
+ */
+export interface BusinessNodeData {
+  prompt: string;
+  negative: string;
+  variant?: string;
+  note?: string;
+  grid?: string;
+  steps?: number;
+  layout?: string;
+  background?: string;
+  model?: string;
+  providerId?: string;
+  /** 节点级参考图（拆帧出来的视角等），运行时会作为额外参考注入。 */
+  referenceAssetIds?: string[];
+}
+
+/** 局部重绘：源图连线进来，蒙版作为节点级资产保存（白=重绘，黑=保留）。 */
+export interface InpaintNodeData {
+  prompt: string;
+  negative: string;
+  note?: string;
+  maskAssetId?: string;
+  model?: string;
+  providerId?: string;
+}
+
 export interface NoteNodeData {
   text: string;
   color: string;

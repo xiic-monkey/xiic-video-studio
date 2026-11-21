@@ -16,6 +16,8 @@ tauri-build = { version = "2", features = [] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
+# 拆帧 / 缩略图：只开用得到的格式，控制构建体积。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 hmac = "0.12"
 keyring = { version = "3", features = ["apple-native"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }

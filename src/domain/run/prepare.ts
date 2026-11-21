@@ -1,5 +1,7 @@
 import { computeCacheKey, latestSucceededRun, selectedAssetOf } from '../graph/cacheKey';
 import { getNodeDefinition } from '../nodes/definitions';
+import { isMaskNode, maskAssetIdOf } from '../nodes/mask';
+import { instructionFor } from '../nodes/templates';
 import type { Issue, NodeContext } from '../nodes/types';
 import { capabilityOf, estimateCost } from '../providers/capabilities';
 import { compilePrompt } from '../prompts/compile';
@@ -24,12 +26,16 @@ export interface RunRequestDraft {
   capability: string;
   providerId: string;
   model: string;
+  /** 前端按目录解析出的协议；后端候选优先采用它。 */
+  protocol: string;
   promptSnapshot: PromptSnapshot;
   params: Record<string, unknown>;
   inputs: Array<{ role: string; assetId: string; kind: string; mime: string }>;
   inputAssetIds: string[];
   cacheKey: string;
   cachedAssetId?: string;
+  /** 节点级参考图（拆帧出来的视角）。 */
+  referenceAssetIds?: string[];
 }
 
 export interface RunLabel {
@@ -129,7 +135,7 @@ export function prepareRun(doc: BoardDoc, nodeId: string, deps: PrepareDeps): Pr
   const model = resolveModel(deps.profiles, deps.hasKeys, node, capability);
   if (!model.ok) return { ok: false, issues: [model.issue] };
   const { resolved } = model;
-  const limit = capabilityOf(resolved.config, capability);
+  const limit = resolved.capability ?? capabilityOf(resolved.config, capability);
 
   const issues: Issue[] = [];
   const items = inboundAssets(doc, nodeId, deps.runs, deps.assets);
@@ -151,6 +157,18 @@ export function prepareRun(doc: BoardDoc, nodeId: string, deps: PrepareDeps): Pr
       continue;
     }
     mediaInputs.push({ role: item.edge.role, assetId: item.assetId, kind: item.kind, mime: item.mime });
+  }
+
+  // 局部重绘：蒙版是节点级资产，不混进连线输入；模型必须支持蒙版。
+  const maskAssetId = isMaskNode(node) ? maskAssetIdOf(node) : undefined;
+  if (isMaskNode(node)) {
+    if (!maskAssetId) issues.push(error('RUN_MASK_MISSING', '请先在 Inspector 绘制并保存蒙版'));
+    if (limit && !limit.supportsMask) {
+      issues.push(error('CAP_MASK_UNSUPPORTED', `${resolved.modelName} 不支持蒙版局部重绘`));
+    }
+    if (maskAssetId) {
+      mediaInputs.push({ role: 'mask', assetId: maskAssetId, kind: 'image', mime: 'image/png' });
+    }
   }
 
   for (const edge of Object.values(doc.edges)) {
@@ -176,7 +194,10 @@ export function prepareRun(doc: BoardDoc, nodeId: string, deps: PrepareDeps): Pr
     template = template0.trim() ? `${template0}\n\n${suffix}` : suffix;
   }
 
-  const snapshot = compilePrompt(template, {
+  const instruction = instructionFor(node);
+  const finalTemplate = instruction ? `${template}\n\n${instruction}` : template;
+
+  const snapshot = compilePrompt(finalTemplate, {
     variables,
     styleGuide: deps.project?.styleGuide,
     negative: String(node.data.negative ?? ''),
@@ -193,7 +214,10 @@ export function prepareRun(doc: BoardDoc, nodeId: string, deps: PrepareDeps): Pr
     issues.push(error('PARAM_PROMPT_TOO_LONG', `提示词 ${chars} 字符，超过模型上限 ${limit.maxPromptChars}`));
   }
 
-  const params = nodeParams(node, capability);
+  const params = nodeParams(node, capability, {
+    id: resolved.modelId,
+    capability: resolved.capability,
+  });
   // 节点里写的系统提示在前，上游带来的系统提示在后（不再整段覆盖本地的）。
   const localSystem = String(params.system ?? '').trim();
   const upstreamSystem = String(variables.system ?? '').trim();
@@ -221,10 +245,21 @@ export function prepareRun(doc: BoardDoc, nodeId: string, deps: PrepareDeps): Pr
     }
   }
 
-  const overflow = referenceOverflow(mediaInputs, limit);
+  // 节点级参考图也要算进模型的上限。
+  const referenceAssetIds = Array.isArray(node.data.referenceAssetIds)
+    ? node.data.referenceAssetIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
+    : [];
+  const overflow = referenceOverflow(
+    [
+      ...mediaInputs,
+      ...referenceAssetIds.map((assetId) => ({ role: 'reference_image', assetId, kind: 'image', mime: '' })),
+    ],
+    limit,
+  );
   if (overflow) issues.push(error('PARAM_REFERENCE_LIMIT', overflow));
 
-  const needsPublicUrl = mediaInputs.length > 0 && limit
+  // 节点级参考图也要走同样的传输方式：只看 mediaInputs 会漏掉「仅用拆帧参考图」的情况。
+  const needsPublicUrl = (mediaInputs.length + referenceAssetIds.length) > 0 && limit
     && limit.inputTransport.includes('publicUrl')
     && !limit.inputTransport.includes('dataUrl');
   if (needsPublicUrl && !(deps.assetHost?.strategy === 's3' && deps.assetHost.publicBaseUrl)) {
@@ -255,12 +290,14 @@ export function prepareRun(doc: BoardDoc, nodeId: string, deps: PrepareDeps): Pr
     capability,
     providerId: resolved.providerId,
     model: resolved.modelId,
+    protocol: resolved.protocol,
     promptSnapshot: snapshot,
     params,
     inputs: mediaInputs,
     inputAssetIds: items.map((item) => item.assetId),
     cacheKey,
     cachedAssetId,
+    referenceAssetIds,
   };
 
   return {

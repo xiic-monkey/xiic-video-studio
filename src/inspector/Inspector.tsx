@@ -1,9 +1,13 @@
 import { useEffect, useMemo, useState } from 'react';
-import { CircleSlash, Copy, Lock, Pin, Play, Trash2, Unlock } from 'lucide-react';
+import { Brush, CircleSlash, Copy, Lock, Pin, Play, Trash2, Unlock } from 'lucide-react';
 import { createNode, getNodeDefinition } from '../domain/nodes/definitions';
+import { isMaskNode, maskAssetIdOf, sourceAssetIdOf } from '../domain/nodes/mask';
+import { referenceIdsOf, splitLayoutFor, SPLITTABLE_NODES, viewsOf } from '../domain/nodes/sheet';
+import { fieldDefsFor } from '../domain/providers/routing';
 import type { FieldDef } from '../domain/nodes/types';
 import { nodeIssues } from '../domain/graph/validate';
-import { selectRunCandidate } from '../services/tauri';
+import { selectedAssetOf } from '../domain/graph/cacheKey';
+import { assetThumbUrl, selectRunCandidate, splitSheet } from '../services/tauri';
 import { useBoardStore } from '../stores/boardStore';
 import { useProviderStore } from '../stores/providerStore';
 import { useRunStore } from '../stores/runStore';
@@ -13,12 +17,14 @@ import { useStaleNodeIds } from '../run/useStaleNodeIds';
 import { statusOf } from '../nodes/summary';
 import { CandidateList } from './CandidateList';
 import { FieldEditor, type FieldChangeOptions } from './FieldEditor';
+import { MaskEditor } from './MaskEditor';
+import { ReferencePicker } from './ReferencePicker';
 import { RunHistory } from './RunHistory';
 import {
   candidateKind,
   capabilityForNode,
   capabilityLabel,
-  modelOptions,
+  modelChoices,
   promptPreview,
   pruneCommandsForMode,
 } from './model';
@@ -30,6 +36,10 @@ export function Inspector() {
   const project = useStudioStore((state) => state.projects.find((item) => item.id === state.currentProjectId));
   const runs = useRunStore((state) => state.runs);
   const [busy, setBusy] = useState(false);
+  const [splitting, setSplitting] = useState(false);
+  const [viewThumbs, setViewThumbs] = useState<Record<string, string>>({});
+  const [maskEditorOpen, setMaskEditorOpen] = useState(false);
+  const [maskUrl, setMaskUrl] = useState('');
   const requestRun = useRunController((state) => state.requestRun);
   const cancelActiveRun = useRunController((state) => state.cancelRun);
   const runBusy = useRunController((state) => Boolean(nodeId && state.busy[nodeId]));
@@ -58,10 +68,26 @@ export function Inspector() {
   const hasKeys = useProviderStore((state) => state.hasKeys);
   const openSettings = useProviderStore((state) => state.openSettings);
   const capability = board && node ? capabilityForNode(board, node) : undefined;
-  const options = useMemo(
-    () => (capability ? modelOptions(profiles, capability) : []),
+  const choices = useMemo(
+    () => (capability ? modelChoices(profiles, capability) : []),
     [profiles, capability],
   );
+  const selectedChoice = useMemo(
+    () => choices.find((choice) => choice.modelId === String(node?.data.model ?? '')),
+    [choices, node?.data.model],
+  );
+
+  // 参数表跟着所选模型走：目录里定义了什么就渲染什么，没选模型时用节点自带字段。
+  const fields = useMemo(() => {
+    if (!def) return [];
+    if (!capability || !selectedChoice) return def.fields;
+    const dynamic = fieldDefsFor(selectedChoice.modelId, capability);
+    if (!dynamic.length) return def.fields;
+    const dynamicKeys = new Set(dynamic.map((field) => field.key));
+    // 节点自带字段保留，只有与目录参数同名的那些（时长、尺寸、画质…）让位给模型定义。
+    const kept = def.fields.filter((field) => !dynamicKeys.has(field.key));
+    return [...kept, ...dynamic];
+  }, [capability, selectedChoice, def]);
 
   useEffect(() => {
     setBusy(false);
@@ -119,6 +145,85 @@ export function Inspector() {
     });
   }
 
+  const splitSource = latestRun ? selectedAssetOf(latestRun) : undefined;
+  const splitLayout = node ? splitLayoutFor(node) : undefined;
+  const views = node ? viewsOf(node) : [];
+  const referenceIds = node ? referenceIdsOf(node) : [];
+  const maskNode = Boolean(node && isMaskNode(node));
+  const maskSourceId = board && nodeId ? sourceAssetIdOf(board, nodeId, Object.values(runs)) : undefined;
+  const maskAssetId = node ? maskAssetIdOf(node) : undefined;
+
+  useEffect(() => {
+    let alive = true;
+    if (!maskAssetId) {
+      setMaskUrl('');
+      return;
+    }
+    void assetThumbUrl(maskAssetId).then((url) => {
+      if (alive) setMaskUrl(url);
+    }).catch(() => undefined);
+    return () => { alive = false; };
+  }, [maskAssetId]);
+
+  useEffect(() => {
+    let alive = true;
+    const missing = views.filter((view) => !viewThumbs[view.assetId]);
+    if (!missing.length) return;
+    void Promise.all(missing.map(async (view) => {
+      const url = await assetThumbUrl(view.assetId);
+      return [view.assetId, url] as const;
+    })).then((entries) => {
+      if (alive) setViewThumbs((items) => ({ ...items, ...Object.fromEntries(entries) }));
+    }).catch(() => undefined);
+    return () => { alive = false; };
+  }, [views, viewThumbs]);
+
+  async function runSplit() {
+    if (!node || !splitSource || !splitLayout) return;
+    setSplitting(true);
+    try {
+      const result = await splitSheet(
+        splitSource,
+        splitLayout as 'landscape' | 'portrait',
+        node.id,
+        project?.id ?? '',
+      );
+      useBoardStore.getState().apply({
+        type: 'setNodeData',
+        nodeId: node.id,
+        patch: { views: result },
+      });
+      useBoardStore.getState().notify(`已拆出 ${result.length} 个视角`);
+    } catch (error) {
+      useBoardStore.getState().notify(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSplitting(false);
+    }
+  }
+
+  function toggleReference(assetId: string) {
+    if (!node) return;
+    const next = referenceIds.includes(assetId)
+      ? referenceIds.filter((id) => id !== assetId)
+      : [...referenceIds, assetId];
+    useBoardStore.getState().apply({
+      type: 'setNodeData',
+      nodeId: node.id,
+      patch: { referenceAssetIds: next },
+    });
+  }
+
+  function onMaskSaved(assetId: string) {
+    if (!nodeId) return;
+    useBoardStore.getState().apply({
+      type: 'setNodeData',
+      nodeId,
+      patch: { maskAssetId: assetId },
+    });
+    useBoardStore.getState().notify('蒙版已保存');
+    setMaskEditorOpen(false);
+  }
+
   async function chooseCandidate(assetId: string) {
     if (!latestRun) return;
     setBusy(true);
@@ -147,39 +252,53 @@ export function Inspector() {
 
       <section className="inspector-section">
         <h3>字段</h3>
-        {def.fields.map((field) => (
+        {fields.map((field) => (
           <FieldEditor key={field.key} field={field} value={node.data[field.key]} onChange={updateField} />
         ))}
-        {!def.fields.length && <p className="inspector-note">该节点没有可编辑字段。</p>}
+        {!fields.length && <p className="inspector-note">该节点没有可编辑字段。</p>}
       </section>
 
       {capability && (
         <section className="inspector-section">
           <h3>模型</h3>
           <div className="inspector-field">
-            <span>运行模型</span>
+            <span>模型</span>
             <select
-              value={(() => {
-                const providerId = String(node.data.providerId ?? '');
-                const modelId = String(node.data.model ?? '');
-                return options.some((option) => option.providerId === providerId && option.modelId === modelId)
-                  ? `${providerId}|${modelId}`
-                  : '';
-              })()}
+              value={String(node.data.model ?? '')}
               onChange={(event) => {
-                const [providerId, modelId] = event.target.value.split('|');
+                const modelId = event.target.value;
+                const providerId = String(node.data.providerId ?? '');
+                const stillValid = choices.some((choice) => choice.modelId === modelId
+                  && choice.providers.some((provider) => provider.providerId === providerId));
                 useBoardStore.getState().apply({
                   type: 'setNodeData',
                   nodeId: node.id,
-                  patch: { providerId: providerId ?? '', model: modelId ?? '' },
+                  patch: { model: modelId, providerId: stillValid ? providerId : '' },
                 });
               }}
             >
-              <option value="">自动选择</option>
-              {options.map((option) => (
-                <option key={`${option.providerId}|${option.modelId}`} value={`${option.providerId}|${option.modelId}`}>
-                  {option.providerName} · {option.modelName}
-                </option>
+              <option value="">请选择模型</option>
+              {choices.map((choice) => (
+                <option key={choice.modelId} value={choice.modelId}>{choice.modelName}</option>
+              ))}
+            </select>
+          </div>
+          <div className="inspector-field">
+            <span>供应商</span>
+            <select
+              value={String(node.data.providerId ?? '')}
+              disabled={!selectedChoice}
+              onChange={(event) => {
+                useBoardStore.getState().apply({
+                  type: 'setNodeData',
+                  nodeId: node.id,
+                  patch: { providerId: event.target.value },
+                });
+              }}
+            >
+              <option value="">自动（按顺序回退）</option>
+              {selectedChoice?.providers.map((provider) => (
+                <option key={provider.providerId} value={provider.providerId}>{provider.providerName}</option>
               ))}
             </select>
           </div>
@@ -187,7 +306,12 @@ export function Inspector() {
             <span className="inspector-note">能力：{capabilityLabel(capability)}</span>
             <button type="button" className="inspector-link" onClick={openSettings}>打开设置</button>
           </div>
-          {!options.length && <p className="inspector-warning">没有可用模型，请先在设置中添加模型并保存 Key。</p>}
+          {!choices.length && <p className="inspector-warning">没有可用模型，请先在设置中添加模型并保存 Key。</p>}
+          {selectedChoice && (
+            <p className="inspector-note">
+              候选顺序：{selectedChoice.providers.map((provider) => provider.providerName).join(' → ')}
+            </p>
+          )}
           {String(node.data.providerId ?? '') && hasKeys[String(node.data.providerId)] === false && (
             <p className="inspector-warning">所选 Provider 尚未保存 API Key。</p>
           )}
@@ -253,6 +377,49 @@ export function Inspector() {
             <Pin size={11} /> {node.ui?.pinned ? '解除锁定' : '锁定结果'}
           </button>
         </div>
+        {SPLITTABLE_NODES.has(activeNode.type) && (
+          <>
+            <div className="inspector-section-head">
+              <span className="inspector-note">拆帧</span>
+              <button
+                type="button"
+                className="inspector-link"
+                disabled={!splitSource || splitting}
+                onClick={() => { void runSplit(); }}
+              >
+                {splitting ? '拆帧中…' : '拆成单张'}
+              </button>
+            </div>
+            {views.length ? (
+              <div className="sheet-views">
+                {views.map((view) => (
+                  <button
+                    key={view.assetId}
+                    type="button"
+                    className={referenceIds.includes(view.assetId) ? 'active' : ''}
+                    title={`${view.label}（点击${referenceIds.includes(view.assetId) ? '取消' : '设为'}参考图）`}
+                    onClick={() => toggleReference(view.assetId)}
+                  >
+                    {viewThumbs[view.assetId] && <img src={viewThumbs[view.assetId]} alt={view.label} />}
+                    <span>{view.label}</span>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <p className="inspector-note">运行后可拆成单张视角，勾选后作为本节点的参考图。</p>
+            )}
+            {referenceIds.length > 0 && (
+              <p className="inspector-note">已选 {referenceIds.length} 张作为参考图，会随运行一起发出。</p>
+            )}
+          </>
+        )}
+        {capability && (
+          <ReferencePicker
+            projectId={project?.id}
+            selected={referenceIds}
+            onToggle={toggleReference}
+          />
+        )}
         <RunHistory runs={nodeRuns} />
         {latestRun && (
           <CandidateList
@@ -262,7 +429,38 @@ export function Inspector() {
             onSelect={(assetId) => { void chooseCandidate(assetId); }}
           />
         )}
+        {latestRun?.route?.length ? (
+          <div className="route-trace">
+            <span className="inspector-note">路由轨迹</span>
+            {latestRun.route.map((attempt, index) => (
+              <span key={`${attempt.providerId}-${index}`} className={attempt.ok ? 'ok' : 'fail'}>
+                {attempt.providerName} · {attempt.keyLabel}
+                {attempt.code ? ` → ${attempt.code}` : ''}
+              </span>
+            ))}
+          </div>
+        ) : null}
       </section>
+
+      {maskNode && (
+        <section className="inspector-section">
+          <div className="inspector-section-head">
+            <h3>蒙版</h3>
+            <button
+              type="button"
+              className="inspector-link"
+              disabled={!maskSourceId}
+              onClick={() => setMaskEditorOpen(true)}
+            >
+              <Brush size={11} /> {maskAssetId ? '重新绘制' : '绘制蒙版'}
+            </button>
+          </div>
+          {maskAssetId && maskUrl
+            ? <img className="mask-thumb" src={maskUrl} alt="当前蒙版" />
+            : <p className="inspector-note">绘制后只重画白色区域，其余像素保持原样。</p>}
+          {!maskSourceId && <p className="inspector-warning">先把源图连到「源图」端口并运行上游节点。</p>}
+        </section>
+      )}
 
       <section className="inspector-section">
         <h3>检查</h3>
@@ -274,6 +472,16 @@ export function Inspector() {
             : <li className="ok">当前节点没有发现问题</li>}
         </ul>
       </section>
+
+      {maskEditorOpen && maskSourceId && nodeId && (
+        <MaskEditor
+          sourceAssetId={maskSourceId}
+          nodeId={nodeId}
+          projectId={project?.id ?? ''}
+          onClose={() => setMaskEditorOpen(false)}
+          onSaved={(asset) => onMaskSaved(asset.assetId)}
+        />
+      )}
     </aside>
   );
 }

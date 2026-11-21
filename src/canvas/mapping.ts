@@ -11,7 +11,7 @@ const ROLE_LABEL: Record<EdgeRole, string> = {
   location_ref: '场景', prop_ref: '道具', style_ref: '风格',
   first_frame: '首帧', last_frame: '尾帧', middle_frame: '中间帧',
   reference_image: '参考图', reference_video: '参考视频', reference_audio: '参考音频',
-  prev_shot: '前镜', storyboard: '分镜', video_clip: '视频', audio: '音频', timeline: '时间线',
+  prev_shot: '前镜', source_image: '源图', storyboard: '分镜', video_clip: '视频', audio: '音频', timeline: '时间线',
 };
 
 /**
@@ -24,7 +24,7 @@ const ROLE_COLOR: Record<EdgeRole, string> = {
   location_ref: '#3a72b0', prop_ref: '#7a5cb8', style_ref: '#a8761a',
   first_frame: '#7d51b8', last_frame: '#6b46a0', middle_frame: '#744eb0',
   reference_image: '#7d51b8', reference_video: '#7d51b8', reference_audio: '#17897c',
-  prev_shot: '#b3603f', storyboard: '#b3603f', video_clip: '#b3603f', audio: '#17897c',
+  prev_shot: '#b3603f', source_image: '#3a72b0', storyboard: '#b3603f', video_clip: '#b3603f', audio: '#17897c',
   timeline: '#6b737b',
 };
 

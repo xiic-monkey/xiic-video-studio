@@ -56,6 +56,22 @@ export async function setProviderKey(providerId: string, apiKey: string): Promis
   await invoke('save_provider_credential', { providerId, apiKey });
 }
 
+/** 保存某个供应商下的一个 Key（多 Key 场景）。 */
+export async function setProviderKeyById(
+  providerId: string,
+  keyId: string,
+  apiKey: string,
+): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('save_provider_key', { providerId, keyId, apiKey });
+}
+
+/** 删除某个供应商下的一个 Key。 */
+export async function deleteProviderKeyById(providerId: string, keyId: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('delete_provider_key', { providerId, keyId });
+}
+
 export async function providerHasKey(providerId: string): Promise<boolean> {
   if (!isTauri()) return false;
   return invoke<boolean>('provider_has_key', { providerId });
@@ -142,9 +158,53 @@ export async function resumeJobs(): Promise<number> {
   return invoke<number>('resume_jobs');
 }
 
+/** 资产库：按项目列出资产（不传项目则列出全部）。 */
+export async function listAssets(projectId?: string): Promise<AssetRef[]> {
+  if (!isTauri()) return [];
+  return invoke<AssetRef[]>('list_assets', { projectId: projectId ?? null });
+}
+
+/** 拆帧：把设定图按版式切成各视角，返回每个视角的资产 id。 */
+export async function splitSheet(
+  assetId: string,
+  layout: 'landscape' | 'portrait',
+  nodeId: string,
+  projectId: string,
+): Promise<Array<{ view: string; label: string; assetId: string; mime: string; path: string }>> {
+  if (!isTauri()) return [];
+  return invoke('split_sheet', { assetId, layout, nodeId, projectId });
+}
+
+/** 保存好的蒙版资产：白=重绘区域，尺寸与源图一致。 */
+export interface MaskAsset {
+  assetId: string;
+  mime: string;
+  path: string;
+  width: number;
+  height: number;
+}
+
+/** 局部重绘：把画好的蒙版（PNG data URL）交给后端校验并落库。 */
+export async function saveMask(
+  maskDataUrl: string,
+  sourceAssetId: string,
+  nodeId: string,
+  projectId: string,
+): Promise<MaskAsset> {
+  if (!isTauri()) throw new Error('保存蒙版只能在桌面应用中运行');
+  return invoke('save_mask', { maskDataUrl, sourceAssetId, nodeId, projectId });
+}
+
 export async function assetUrl(assetId: string): Promise<string> {
   if (!isTauri()) return '';
   const path = await invoke<string>('asset_file_path', { assetId });
+  return convertFileSrc(path);
+}
+
+/** 缩略图地址：有缩略图用缩略图，没有就退回原文件。 */
+export async function assetThumbUrl(assetId: string): Promise<string> {
+  if (!isTauri()) return '';
+  const path = await invoke<string>('asset_thumb_file_path', { assetId });
   return convertFileSrc(path);
 }
 

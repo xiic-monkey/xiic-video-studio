@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type { ProviderProfile } from '../types';
 import { edge, makeDoc, node, videoNode } from '../graph/testFixtures';
 import {
   S3_HOST, TEST_KEYS, TEST_PROFILES, assetRef, succeededRun, testProject,
@@ -25,6 +26,22 @@ describe('prepareRun', () => {
     if (!outcome.ok) expect(outcome.issues.map((issue) => issue.code)).toContain('PARAM_PROMPT_EMPTY');
   });
 
+  it('carries node-level reference assets into the request', () => {
+    const doc = makeDoc([node('i', 'image', { prompt: '雨夜街头', referenceAssetIds: ['asset_front'] })], []);
+    const outcome = prepareRun(doc, 'i', deps());
+    if (!outcome.ok) throw new Error(outcome.issues.map((issue) => issue.message).join('；'));
+    expect(outcome.request.referenceAssetIds).toEqual(['asset_front']);
+    // 参考图由后端按资产 id 解析，不混进连线输入。
+    expect(outcome.request.inputs).toEqual([]);
+  });
+
+  it('sends the catalog-resolved protocol so the backend does not fall back to the adapter default', () => {
+    const doc = makeDoc([node('i', 'image', { prompt: '海报' })], []);
+    const outcome = prepareRun(doc, 'i', deps());
+    if (!outcome.ok) throw new Error('expected ok');
+    expect(outcome.request.protocol).toBe('openai-images');
+  });
+
   it('injects upstream text and appends it when the prompt does not reference it', () => {
     const doc = makeDoc(
       [node('t', 'text'), node('i', 'image', { prompt: '雨夜街头' })],
@@ -37,7 +54,8 @@ describe('prepareRun', () => {
     if (!outcome.ok) throw new Error(outcome.issues.map((issue) => issue.message).join('；'));
     expect(outcome.request.promptSnapshot.text).toBe('雨夜街头\n\n第一幕：告别的雨夜');
     expect(outcome.request.capability).toBe('image.generate');
-    expect(outcome.request.providerId).toBe('openai-compatible');
+    // 自动路由：供应商留空，由后端按模型下的供应商顺序逐家尝试。
+    expect(outcome.request.providerId).toBe('');
     expect(outcome.request.model).toBe('gpt-image-1');
     expect(outcome.request.inputs).toEqual([]);
   });
@@ -70,6 +88,72 @@ describe('prepareRun', () => {
       { role: 'reference_image', assetId: 'asset_img', kind: 'image', mime: 'image/png' },
     ]);
     expect(outcome.request.inputAssetIds).toEqual(['asset_img']);
+  });
+
+  it('injects a saved mask as a dedicated input for the inpaint node', () => {
+    const doc = makeDoc(
+      [node('a', 'image'), node('p', 'inpaint', { prompt: '换掉背景', maskAssetId: 'mask_1' })],
+      [edge('e1', 'a', 'p', 'image', 'source', 'source_image')],
+    );
+    const outcome = prepareRun(doc, 'p', deps({
+      runs: [succeededRun('a', 'asset_src')],
+      assets: {
+        asset_src: assetRef('asset_src', 'image', 'image/png'),
+        mask_1: assetRef('mask_1', 'image', 'image/png'),
+      },
+    }));
+    if (!outcome.ok) throw new Error(outcome.issues.map((issue) => issue.message).join('；'));
+    expect(outcome.request.capability).toBe('image.edit');
+    expect(outcome.request.inputs).toEqual([
+      { role: 'source_image', assetId: 'asset_src', kind: 'image', mime: 'image/png' },
+      { role: 'mask', assetId: 'mask_1', kind: 'image', mime: 'image/png' },
+    ]);
+    expect(outcome.request.promptSnapshot.text).toContain('只重绘蒙版标记的白色区域');
+  });
+
+  it('blocks inpaint when no mask has been saved', () => {
+    const doc = makeDoc(
+      [node('a', 'image'), node('p', 'inpaint', { prompt: '换掉背景' })],
+      [edge('e1', 'a', 'p', 'image', 'source', 'source_image')],
+    );
+    const outcome = prepareRun(doc, 'p', deps({
+      runs: [succeededRun('a', 'asset_src')],
+      assets: { asset_src: assetRef('asset_src', 'image', 'image/png') },
+    }));
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.issues.map((issue) => issue.code)).toContain('RUN_MASK_MISSING');
+  });
+
+  it('blocks inpaint when the model does not accept a mask', () => {
+    const custom: ProviderProfile = {
+      ...TEST_PROFILES[0],
+      models: [{
+        id: 'custom-edit',
+        displayName: 'Custom Edit',
+        capabilities: [{
+          capability: 'image.edit', inputTransport: ['dataUrl'], async: false,
+          supportsMask: false,
+        }],
+      }],
+    };
+    const doc = makeDoc(
+      [
+        node('a', 'image'),
+        node('p', 'inpaint', { prompt: '换掉背景', maskAssetId: 'mask_1', model: 'custom-edit' }),
+      ],
+      [edge('e1', 'a', 'p', 'image', 'source', 'source_image')],
+    );
+    const outcome = prepareRun(doc, 'p', deps({
+      profiles: [custom],
+      hasKeys: { 'openai-compatible': true },
+      runs: [succeededRun('a', 'asset_src')],
+      assets: {
+        asset_src: assetRef('asset_src', 'image', 'image/png'),
+        mask_1: assetRef('mask_1', 'image', 'image/png'),
+      },
+    }));
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.issues.map((issue) => issue.code)).toContain('CAP_MASK_UNSUPPORTED');
   });
 
   it('feeds a connected system port into params instead of the prompt', () => {
@@ -123,6 +207,20 @@ describe('prepareRun', () => {
     const allowed = prepareRun(doc, 'v', { ...base, assetHost: S3_HOST });
     if (!allowed.ok) throw new Error('expected ok with s3 host');
     expect(allowed.request.inputs[0]).toEqual({ role: 'first_frame', assetId: 'asset_frame', kind: 'image', mime: 'image/png' });
+  });
+
+  it('blocks a public-url-only model when only node-level references are present', () => {
+    const doc = makeDoc([videoNode('v', { prompt: '镜头推进', referenceAssetIds: ['asset_ref'] })], []);
+    const base = deps({
+      profiles: [TEST_PROFILES[1]],
+      hasKeys: { 'minimax-h3': true },
+      assets: { asset_ref: assetRef('asset_ref', 'image', 'image/png') },
+    });
+    const blocked = prepareRun(doc, 'v', base);
+    expect(blocked.ok).toBe(false);
+    if (!blocked.ok) expect(blocked.issues.map((issue) => issue.code)).toContain('CAP_PUBLIC_URL_REQUIRED');
+    const allowed = prepareRun(doc, 'v', { ...base, assetHost: S3_HOST });
+    expect(allowed.ok).toBe(true);
   });
 
   it('rejects an unsupported resolution before submitting', () => {

@@ -236,3 +236,62 @@
 .studio-library-head-actions { display: flex; align-items: center; gap: 10px; }
 .studio-notice { margin: 14px 0 0; color: var(--text-muted); font-size: 11px; line-height: 1.6; }
 .studio-dock .busy { color: var(--warning); }
+
+/* 多 Key 与模型管理 */
+.settings-key { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1.4fr) 28px; align-items: center; gap: 6px; }
+.settings-key input { min-width: 0; padding: 6px 7px; color: var(--text); background: var(--panel-2); border: 1px solid var(--line-strong); border-radius: 3px; font-size: 11px; }
+.settings-key-label { font-family: var(--font-mono); font-size: 10px; }
+.studio-badge.warn { color: var(--danger); background: var(--danger-soft); }
+.settings-models-list { display: grid; gap: 12px; }
+.settings-model-group { display: grid; gap: 6px; padding: 12px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; }
+.settings-model-group > header { display: flex; align-items: center; gap: 8px; }
+.settings-model-group > header b { font-size: 12px; }
+.settings-model-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 7px 9px; background: var(--panel); border: 1px solid var(--line); border-radius: 4px; }
+.settings-model-provider { min-width: 110px; font-size: 11px; }
+.settings-protocol { display: inline-flex; align-items: center; gap: 5px; color: var(--text-muted); font-size: 10px; }
+.settings-protocol select { padding: 4px 6px; color: var(--text); background: var(--panel-2); border: 1px solid var(--line-strong); border-radius: 3px; font-size: 10px; }
+
+/* 资产库 */
+.asset-library { display: grid; gap: 8px; }
+.asset-library h2 { margin: 0; color: var(--text-dim); font-size: 10px; font-weight: 500; letter-spacing: .6px; text-transform: uppercase; }
+.asset-kinds { display: flex; flex-wrap: wrap; gap: 4px; }
+.asset-kinds button { padding: 3px 7px; color: var(--text-muted); border-radius: 3px; font-size: 10px; }
+.asset-kinds button.active { color: var(--mint); background: var(--mint-soft); }
+.asset-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; max-height: 220px; overflow: auto; }
+.asset-card { display: grid; place-items: center; aspect-ratio: 1; overflow: hidden; padding: 0; background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; }
+.asset-card.active { border-color: var(--mint); }
+.asset-card img { width: 100%; height: 100%; object-fit: cover; }
+.asset-icon { color: var(--text-dim); }
+.asset-detail { display: grid; gap: 2px; padding: 7px 8px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; font-size: 10px; color: var(--text-muted); }
+.asset-detail b { color: var(--text); font-size: 11px; }
+
+/* 拆帧视角 */
+.sheet-views { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; margin: 6px 0; }
+.sheet-views button { display: grid; gap: 2px; padding: 3px; color: var(--text-muted); background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; font-size: 9px; }
+.sheet-views button.active { border-color: var(--mint); color: var(--mint); }
+.sheet-views img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 3px; }
+.reference-picker { display: grid; gap: 6px; margin-top: 6px; }
+.reference-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; }
+.reference-grid button { padding: 0; overflow: hidden; background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; }
+.reference-grid button.active { border-color: var(--mint); }
+.reference-grid img { display: block; width: 100%; aspect-ratio: 1; object-fit: cover; }
+.route-trace { display: grid; gap: 2px; margin-top: 6px; font-size: 10px; }
+.route-trace .ok { color: var(--mint); }
+.route-trace .fail { color: var(--text-dim); }
+
+/* 局部重绘蒙版编辑器 */
+.mask-thumb { display: block; width: 100%; max-height: 160px; object-fit: contain; background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; }
+.mask-dialog { display: grid; gap: 10px; width: min(960px, 100%); max-height: min(860px, calc(100vh - 48px)); overflow: hidden; padding: 18px; background: var(--panel); border: 1px solid var(--line-strong); border-radius: 8px; box-shadow: 0 24px 64px rgba(0, 0, 0, .22); }
+.mask-dialog-head { display: flex; align-items: center; justify-content: space-between; }
+.mask-dialog-head h2 { margin: 0; font-size: 15px; }
+.mask-dialog-head button { display: grid; place-items: center; width: 26px; height: 26px; padding: 0; color: var(--text-muted); background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; cursor: pointer; }
+.mask-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.mask-tools button { display: inline-flex; align-items: center; gap: 4px; padding: 5px 8px; color: var(--text-muted); background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; cursor: pointer; font-size: 11px; }
+.mask-tools button.active { border-color: var(--mint); color: var(--mint); }
+.mask-tools label { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; font-size: 11px; color: var(--text-muted); }
+.mask-tools input[type="range"] { width: 140px; }
+.mask-coverage { font-size: 11px; color: var(--text-dim); }
+.mask-stage { position: relative; display: grid; place-items: center; min-height: 240px; overflow: auto; background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px; }
+.mask-stage canvas { display: block; max-width: 100%; max-height: min(60vh, 560px); cursor: crosshair; touch-action: none; }
+.mask-stage-note { color: var(--text-muted); font-size: 11px; }
+.mask-dialog-foot { display: flex; justify-content: flex-end; gap: 8px; }

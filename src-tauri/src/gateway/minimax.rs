@@ -222,6 +222,10 @@ mod tests {
             id: "MiniMax-H3".to_string(),
             display_name: "MiniMax H3".to_string(),
             capabilities: Vec::new(),
+            protocols: std::collections::HashMap::new(),
+            priority: None,
+            enabled: None,
+            vendor: None,
             defaults: json!({
                 "protocol": "official",
                 "submitPath": "/v1/video_generation",
@@ -235,7 +239,7 @@ mod tests {
     fn runtime(base_url: &str) -> ProviderRuntime {
         let mut profile = test_profile("minimax-h3", base_url);
         profile.models = vec![model()];
-        ProviderRuntime { profile, api_key: "h3-key".to_string() }
+        ProviderRuntime { profile, api_key: "h3-key".to_string(), protocol: "minimax-video".to_string() }
     }
 
     fn request() -> CapabilityRequest {

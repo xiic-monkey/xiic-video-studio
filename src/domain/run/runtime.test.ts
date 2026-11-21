@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { edge, makeDoc, node, videoNode } from '../graph/testFixtures';
 import { emptyStyleGuide } from '../types';
+import type { ProviderProfile } from '../types';
 import { TEST_KEYS, TEST_PROFILES, runningRun } from './runFixtures';
 import { buildCacheContext, mergeRunRecord, nodeParams, resolveModel, runCapability } from './runtime';
 
@@ -10,6 +11,11 @@ describe('runCapability', () => {
     expect(runCapability(doc, doc.nodes.img)).toBe('image.edit');
   });
 
+  it('always runs the inpaint node with the edit capability', () => {
+    const doc = makeDoc([node('p', 'inpaint')], []);
+    expect(runCapability(doc, doc.nodes.p)).toBe('image.edit');
+  });
+
   it('returns undefined for utility nodes', () => {
     const doc = makeDoc([node('note', 'note')], []);
     expect(runCapability(doc, doc.nodes.note)).toBeUndefined();
@@ -17,11 +23,20 @@ describe('runCapability', () => {
 });
 
 describe('resolveModel', () => {
-  it('auto-picks the first enabled provider that supports the capability', () => {
+  it('auto-picks a model that supports the capability and keeps the provider unset', () => {
     const doc = makeDoc([node('t', 'text', { prompt: '写一段开场' })], []);
     const result = resolveModel(TEST_PROFILES, TEST_KEYS, doc.nodes.t, 'text.chat');
-    expect(result.ok && result.resolved.providerId).toBe('openai-compatible');
+    // 自动路由时 providerId 留空：调用顺序由模型下各供应商的优先级决定。
+    expect(result.ok && result.resolved.providerId).toBe('');
+    expect(result.ok && result.resolved.providerName).toBe('自动路由');
     expect(result.ok && result.resolved.modelId).toBe('gpt-4o-mini');
+  });
+
+  it('pins the provider when the node selected one', () => {
+    const doc = makeDoc([node('t', 'text', { prompt: '写一段开场', model: 'gpt-4o-mini', providerId: 'openai-compatible' })], []);
+    const result = resolveModel(TEST_PROFILES, TEST_KEYS, doc.nodes.t, 'text.chat');
+    expect(result.ok && result.resolved.providerId).toBe('openai-compatible');
+    expect(result.ok && result.resolved.providerName).toBe('OpenAI 兼容中转');
   });
 
   it('prefers an actionable key error over CAP_NO_MODEL', () => {
@@ -54,6 +69,45 @@ describe('resolveModel', () => {
       expect(result.issue.message).toContain('MiniMax H3');
     }
   });
+
+  /// 所有 Key 都在冷却中时不能当成「可用」：预检要拦住，别等后端报没有候选。
+  it('reports a cooling key instead of treating the provider as usable', () => {
+    const cooling: ProviderProfile = {
+      ...TEST_PROFILES[0],
+      keys: [{
+        id: 'k1',
+        label: '主 Key',
+        keyRef: 'provider/openai-compatible/key/k1',
+        enabled: true,
+        status: 'cooling',
+        cooldownUntil: new Date(Date.now() + 60_000).toISOString(),
+        hasSecret: true,
+      }],
+    };
+    const doc = makeDoc([node('t', 'text', { prompt: '写一段开场', model: 'gpt-4o-mini', providerId: 'openai-compatible' })], []);
+    const result = resolveModel([cooling], TEST_KEYS, doc.nodes.t, 'text.chat');
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.issue.code).toBe('PROVIDER_KEY_COOLING');
+  });
+
+  /// 冷却过期的 Key 立刻恢复可用。
+  it('accepts a key whose cooldown has expired', () => {
+    const expired: ProviderProfile = {
+      ...TEST_PROFILES[0],
+      keys: [{
+        id: 'k1',
+        label: '主 Key',
+        keyRef: 'provider/openai-compatible/key/k1',
+        enabled: true,
+        status: 'cooling',
+        cooldownUntil: new Date(Date.now() - 1_000).toISOString(),
+        hasSecret: true,
+      }],
+    };
+    const doc = makeDoc([node('t', 'text', { prompt: '写一段开场', model: 'gpt-4o-mini', providerId: 'openai-compatible' })], []);
+    const result = resolveModel([expired], TEST_KEYS, doc.nodes.t, 'text.chat');
+    expect(result.ok).toBe(true);
+  });
 });
 
 describe('nodeParams', () => {
@@ -73,13 +127,26 @@ describe('nodeParams', () => {
     const doc = makeDoc([node('a', 'audio', { text: '你好', voice: 'Chelsie', format: 'wav' })], []);
     expect(nodeParams(doc.nodes.a, 'audio.tts')).toEqual({ voice: 'Chelsie', format: 'wav', text: '你好' });
   });
+
+  it('carries the catalog params rendered in the Inspector', () => {
+    const audio = makeDoc([node('a', 'audio', { text: '你好', speed: 1.5 })], []);
+    expect(nodeParams(audio.nodes.a, 'audio.tts', { id: 'speech-02-hd' })).toMatchObject({ speed: 1.5 });
+    const image = makeDoc([node('i', 'image', { count: 1 })], []);
+    expect(nodeParams(image.nodes.i, 'image.generate', { id: 'gpt-image-1' })).toMatchObject({
+      quality: 'auto',
+    });
+  });
 });
 
 describe('buildCacheContext', () => {
   it('keys runtime per node and leaves promptHashes empty', () => {
     const doc = makeDoc([node('t', 'text', { prompt: 'hi' }), node('note', 'note')], []);
     const ctx = buildCacheContext({ doc, runs: [], profiles: TEST_PROFILES, hasKeys: TEST_KEYS, styleGuide: emptyStyleGuide() });
-    expect(ctx.runtime.t).toEqual({ providerId: 'openai-compatible', model: 'gpt-4o-mini', params: { system: '' } });
+    // 自动路由不进缓存键：换一家供应商不该让缓存失效。
+    expect(ctx.runtime.t).toEqual({
+      providerId: '', model: 'gpt-4o-mini',
+      params: { system: '', temperature: 0.7, maxTokens: 4096 },
+    });
     expect(ctx.runtime.note).toBeUndefined();
     expect(ctx.promptHashes).toEqual({});
   });

@@ -246,6 +246,7 @@ fn imported_run(project_id: &str, board_id: &str, node_id: &str, asset_id: &str,
         selected_asset_id: Some(asset_id.to_string()),
         cost: Some(json!({ "estimated": { "amount": 0, "currency": "", "unit": "导入" } })),
         error: None,
+        route: vec![],
         started_at: now.clone(),
         finished_at: Some(now),
     }

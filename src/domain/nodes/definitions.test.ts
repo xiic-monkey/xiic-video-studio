@@ -2,9 +2,29 @@ import { describe, expect, it } from 'vitest';
 import { createNode, edgeRoleFor, getNodeDefinition, listNodeDefinitions, visibleInputPorts } from './definitions';
 
 describe('node definitions', () => {
-  it('registers the seven P0 primitive nodes', () => {
+  it('registers the primitive nodes plus the business ones', () => {
     expect(listNodeDefinitions().map((def) => def.type).sort())
-      .toEqual(['audio', 'group', 'image', 'note', 'script', 'text', 'video']);
+      .toEqual([
+        'audio', 'character', 'continuity', 'coverage', 'expression', 'group', 'image', 'inpaint', 'note',
+        'redraw', 'script', 'storyboard', 'text', 'turnaround', 'variant', 'video',
+      ]);
+  });
+
+  it('gives the character sheet node a layout and background choice', () => {
+    const node = createNode('character', { x: 0, y: 0 });
+    expect(node.data).toMatchObject({ layout: 'landscape', background: 'white' });
+    const def = getNodeDefinition('character')!;
+    expect(def.actions[0].capability).toBe('image.generate');
+    expect(def.inputs.map((port) => port.key)).toEqual(['prompt', 'references']);
+  });
+
+  it('defines the inpaint node as an edit-only node with a required source port', () => {
+    const def = getNodeDefinition('inpaint')!;
+    expect(def.actions[0].capability).toBe('image.edit');
+    expect(def.inputs.map((port) => port.key)).toEqual(['prompt', 'source']);
+    expect(def.inputs[1].required).toBe(true);
+    expect(def.inputs[1].role).toBe('source_image');
+    expect(createNode('inpaint', { x: 0, y: 0 }).data).toMatchObject({ maskAssetId: '' });
   });
 
   it('creates a video node with H3-safe defaults', () => {
