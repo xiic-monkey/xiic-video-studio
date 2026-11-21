@@ -1,31 +1,44 @@
 @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;600;700&display=swap');
 
+/**
+ * 浅色主题令牌。
+ *
+ * 底色以白与灰为主，强调色（薄荷青）拆成两套：
+ * - `--mint` 深色版，用作文字、描边、图标（白底上需要足够对比度）
+ * - `--mint-soft` 浅色版，用作填充背景（选中态、徽章底色）
+ * 两者混用会导致白底上文字读不清，所以命名上严格区分。
+ */
 :root {
-  color-scheme: dark;
-  --bg: #111617;
-  --panel: #151b1c;
-  --panel-2: #1a2223;
-  --panel-3: #20292a;
-  --line: #2c383a;
-  --line-strong: #3a4a4c;
-  --text: #e9f0ee;
-  --text-muted: #9aa9a7;
-  --text-dim: #6f7f7d;
-  --mint: #75d8bd;
-  --mint-strong: #9ae6d0;
-  --warm: #bf7256;
-  --danger: #d87368;
-  --warning: #d8b66a;
+  color-scheme: light;
+  --bg: #f2f3f5;
+  --panel: #ffffff;
+  --panel-2: #f7f8f9;
+  --panel-3: #eceef1;
+  --line: #dfe2e6;
+  --line-strong: #c3c8ce;
+  --text: #1c2024;
+  --text-muted: #5d656d;
+  --text-dim: #8b939b;
+  --mint: #1f8f74;
+  --mint-strong: #17705c;
+  --mint-soft: #e3f4ee;
+  --mint-fill: #5fc4a8;
+  --warm: #b3603f;
+  --warm-soft: #fbeee8;
+  --danger: #c0392b;
+  --danger-soft: #fdecea;
+  --warning: #a8761a;
+  --warning-soft: #fdf4e0;
   --radius: 6px;
   --font-ui: 'Noto Sans SC', -apple-system, BlinkMacSystemFont, sans-serif;
   --font-mono: 'DM Mono', ui-monospace, monospace;
-  --node-text: #d8b66a;
-  --node-script: #d8b66a;
-  --node-image: #b08ad8;
-  --node-video: #b08ad8;
-  --node-audio: #62c8b4;
-  --node-note: #7f908e;
-  --node-group: #52605e;
+  --node-text: #a8761a;
+  --node-script: #a8761a;
+  --node-image: #7d51b8;
+  --node-video: #7d51b8;
+  --node-audio: #17897c;
+  --node-note: #6b737b;
+  --node-group: #8b939b;
 }
 
 * { box-sizing: border-box; }
@@ -43,4 +56,4 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   outline: 2px solid var(--mint);
   outline-offset: 2px;
 }
-::selection { background: rgba(117, 216, 189, .28); }
+::selection { background: rgba(31, 143, 116, .2); }

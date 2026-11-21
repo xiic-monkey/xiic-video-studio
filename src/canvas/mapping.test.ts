@@ -1,11 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import type { RunRecord } from '../domain/types';
 import { computeStaleSet } from '../domain/graph/stale';
 import type { CacheContext } from '../domain/graph/cacheKey';
 import { edge, makeDoc, node } from '../domain/graph/testFixtures';
 import { topoSort } from '../domain/graph/topo';
 import { validateBoard } from '../domain/graph/validate';
-import { danglingEdgeCount, toFlowEdges, toFlowNodes } from './mapping';
+import { danglingEdgeCount, recordMeasured, resetMappingCaches, toFlowEdges, toFlowNodes } from './mapping';
 
 function run(nodeId: string, id: string): RunRecord {
   return {
@@ -63,6 +63,8 @@ describe('canvas mapping', () => {
 });
 
 describe('toFlowNodes 的 data 身份缓存', () => {
+  beforeEach(() => resetMappingCaches());
+
   it('reuses the same data object for unchanged nodes', () => {
     const { doc } = wideBoard(3);
     const first = toFlowNodes(doc);
@@ -95,5 +97,80 @@ describe('toFlowNodes 的 data 身份缓存', () => {
     expect(Array.isArray(issues)).toBe(true);
     // 这是「别再退化成 O(n²)」的绊线，不是性能基准；真机手感在 Step 12 手工验收。
     expect(elapsed).toBeLessThan(1500);
+  });
+});
+
+describe('toFlowNodes 的节点外壳身份缓存', () => {
+  beforeEach(() => resetMappingCaches());
+
+  it('keeps the same node object when nothing changed', () => {
+    const { doc } = wideBoard(3);
+    const first = toFlowNodes(doc);
+    const second = toFlowNodes(doc);
+    expect(second[0]).toBe(first[0]);
+  });
+
+  it('replaces the node object when its position moved', () => {
+    const { doc } = wideBoard(3);
+    const before = toFlowNodes(doc);
+    const moved = { ...doc, nodes: { ...doc.nodes } };
+    const target = Object.values(moved.nodes)[0];
+    moved.nodes[target.id] = { ...target, position: { x: 999, y: 888 } };
+    const after = toFlowNodes(moved);
+    expect(after[0]).not.toBe(before[0]);
+    expect(after[0].position).toEqual({ x: 999, y: 888 });
+  });
+
+  it('replaces the node object when its selection state flipped', () => {
+    const { doc } = wideBoard(3);
+    const before = toFlowNodes(doc, []);
+    const after = toFlowNodes(doc, [Object.values(doc.nodes)[0].id]);
+    expect(after[0]).not.toBe(before[0]);
+    expect(after[0].selected).toBe(true);
+  });
+});
+
+describe('实测尺寸透传给 userNode（minimap 依赖它算包围盒）', () => {
+  beforeEach(() => resetMappingCaches());
+
+  it('carries the measured size onto the node so the minimap can place it', () => {
+    const { doc } = wideBoard(3);
+    const id = Object.values(doc.nodes)[0].id;
+    // 真实时序：React Flow 先量尺寸，再重建 userNode。
+    toFlowNodes(doc);
+    recordMeasured(id, 264, 189);
+    const flow = toFlowNodes(doc);
+    const target = flow.find((item) => item.id === id)!;
+    expect(target.measured).toEqual({ width: 264, height: 189 });
+  });
+
+  it('refreshes the node object when the measured size changes', () => {
+    const { doc } = wideBoard(3);
+    const id = Object.values(doc.nodes)[0].id;
+    toFlowNodes(doc);
+    recordMeasured(id, 264, 189);
+    const before = toFlowNodes(doc);
+    recordMeasured(id, 264, 260);
+    const after = toFlowNodes(doc);
+    const target = after.find((item) => item.id === id)!;
+    expect(target.measured).toEqual({ width: 264, height: 260 });
+    expect(target).not.toBe(before.find((item) => item.id === id));
+  });
+
+  it('leaves nodes without a measured size untouched', () => {
+    const { doc } = wideBoard(3);
+    toFlowNodes(doc);
+    const flow = toFlowNodes(doc);
+    expect(flow.every((item) => item.measured === undefined)).toBe(true);
+  });
+
+  it('drops cached sizes when switching to another board', () => {
+    const { doc } = wideBoard(3);
+    const id = Object.values(doc.nodes)[0].id;
+    toFlowNodes(doc);
+    recordMeasured(id, 264, 189);
+    expect(toFlowNodes(doc).find((item) => item.id === id)!.measured).toBeDefined();
+    const other = { ...doc, id: 'board_other' };
+    expect(toFlowNodes(other).find((item) => item.id === id)!.measured).toBeUndefined();
   });
 });

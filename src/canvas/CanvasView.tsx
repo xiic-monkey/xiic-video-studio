@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useRef } from 'react';
 import {
   Background, Controls, MiniMap, ReactFlow, ReactFlowProvider,
-  type Connection, type EdgeChange, type NodeChange, useReactFlow,
+  type Connection, type EdgeChange, type NodeChange, useReactFlow, useStore,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { newId } from '../domain/ids';
@@ -12,7 +12,7 @@ import { useBoardStore } from '../stores/boardStore';
 import { useRunStore } from '../stores/runStore';
 import { useStaleNodeIds } from '../run/useStaleNodeIds';
 import { nodeTypes } from '../nodes/registry';
-import { danglingEdgeCount, nodeColor, toFlowEdges, toFlowNodes } from './mapping';
+import { danglingEdgeCount, nodeColor, recordMeasured, subscribeMeasured, toFlowEdges, toFlowNodes } from './mapping';
 
 function CanvasInner() {
   const board = useBoardStore((state) => state.board);
@@ -28,9 +28,12 @@ function CanvasInner() {
   const wrapper = useRef<HTMLDivElement>(null);
 
   const staleNodeIds = useStaleNodeIds();
+  // measured 变了要重建 userNode（minimap 依赖它算包围盒），所以订阅一下。
+  const [measuredTick, bumpMeasured] = useReducer((n: number) => n + 1, 0);
+  useEffect(() => subscribeMeasured(bumpMeasured), []);
   const nodes = useMemo(
     () => (board ? toFlowNodes(board, selectedNodeIds, staleNodeIds) : []),
-    [board, selectedNodeIds, staleNodeIds],
+    [board, selectedNodeIds, staleNodeIds, measuredTick],
   );
   const edges = useMemo(() => (board ? toFlowEdges(board) : []), [board]);
   const dangling = board ? danglingEdgeCount(board) : 0;
@@ -227,9 +230,10 @@ function CanvasInner() {
         nodeDragThreshold={0}
         elevateNodesOnSelect={false}
       >
-        <Background color="#26302f" gap={24} size={1} />
+        <Background color="#dfe2e6" gap={24} size={1} />
         <Controls showInteractive={false} />
-        <MiniMap pannable zoomable nodeColor={(node) => nodeColor(node.type ?? '')} maskColor="rgba(9, 13, 13, 0.72)" />
+        <MiniMap pannable zoomable nodeColor={(node) => nodeColor(node.type ?? '')} maskColor="rgba(242, 243, 245, 0.72)" />
+        <MeasuredSync />
       </ReactFlow>
       {!nodes.length && (
         <div className="canvas-empty">
@@ -249,4 +253,27 @@ export function CanvasView() {
       <CanvasInner />
     </ReactFlowProvider>
   );
+}
+
+/**
+ * 把 React Flow 内部量出的节点尺寸写回给 userNode。
+ *
+ * React Flow 只把实测尺寸写进内部节点，MiniMap 读的却是 userNode，
+ * 于是小地图算不出包围盒。这里订阅内部 store，把尺寸同步到
+ * `mapping.ts` 的缓存，`toFlowNodes` 下次构建 userNode 时带上 `measured`。
+ */
+function MeasuredSync() {
+  const sizes = useStore((s) =>
+    Array.from(s.nodeLookup.values()).map((n) => ({
+      id: n.id,
+      width: n.measured?.width,
+      height: n.measured?.height,
+    })),
+  );
+  useEffect(() => {
+    for (const size of sizes) {
+      if (size.width && size.height) recordMeasured(size.id, size.width, size.height);
+    }
+  }, [sizes]);
+  return null;
 }
