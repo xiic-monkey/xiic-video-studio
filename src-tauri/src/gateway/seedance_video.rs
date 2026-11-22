@@ -24,6 +24,15 @@ pub async fn execute(
     // content 第一项必须是文本提示词，其后按输入顺序追加图片。
     let mut content = vec![json!({ "type": "text", "text": request.prompt })];
     for input in &request.inputs {
+        // Seedance 协议只接受图片参考。视频/音频参考必须显式失败：
+        // 静默 continue 会让用户花钱跑完却拿到完全没用上参考素材的结果。
+        if matches!(input.role.as_str(), "reference_video" | "reference_audio") {
+            return Err(AppError::new(
+                "CAP_UNSUPPORTED_INPUT",
+                "Seedance 不支持参考视频或参考音频输入",
+                false,
+            ));
+        }
         if !matches!(
             input.role.as_str(),
             "first_frame" | "last_frame" | "reference_image"
@@ -351,6 +360,31 @@ mod tests {
             .await
             .expect_err("auth");
         assert_eq!(error.code, "AUTH_UNAUTHORIZED");
+    }
+
+    /// 参考视频/音频不能静默丢弃：必须显式失败并说明原因，
+    /// 否则用户连了参考素材、花了钱，结果却完全没用上它们。
+    #[tokio::test]
+    async fn reference_video_and_audio_are_rejected_not_ignored() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/contents/generations/tasks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "task-1" })))
+            .mount(&server)
+            .await;
+        for role in ["reference_video", "reference_audio"] {
+            let mut req = request();
+            req.inputs = vec![PreparedInput {
+                role: role.to_string(),
+                kind: role.strip_prefix("reference_").unwrap().to_string(),
+                mime: "application/octet-stream".to_string(),
+                value: "https://cdn.example.com/ref".to_string(),
+            }];
+            let error = execute(&reqwest::Client::new(), &runtime(&server.uri()), &req)
+                .await
+                .expect_err("不支持的参考类型必须报错");
+            assert_eq!(error.code, "CAP_UNSUPPORTED_INPUT");
+        }
     }
 
     #[tokio::test]

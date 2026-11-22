@@ -57,6 +57,19 @@ const IMAGE_PARAMS: ParamDef[] = [
   { key: 'count', label: '生成数量', type: 'number', min: 1, max: 4, step: 1, default: 2 },
 ];
 
+/** Nano Banana 的图片分辨率档位与适配器 image_size 对齐（只认 1K / 2K）。 */
+const BANANA_PARAMS: ParamDef[] = [
+  ...IMAGE_PARAMS,
+  {
+    key: 'resolution', label: '分辨率', type: 'select',
+    options: [
+      { label: '1K', value: '1K' },
+      { label: '2K', value: '2K' },
+    ],
+    default: '1K',
+  },
+];
+
 const VIDEO_PARAMS: ParamDef[] = [
   { key: 'duration', label: '时长（秒）', type: 'number', min: 4, max: 30, step: 1, default: 6 },
   {
@@ -261,7 +274,7 @@ export const CATALOG: CatalogModel[] = [
         protocols: ['banana-image'],
       },
     ],
-    params: [...IMAGE_PARAMS],
+    params: [...BANANA_PARAMS],
     suggestedProviders: [
       { name: 'Google Gemini', baseUrl: 'https://generativelanguage.googleapis.com', protocol: 'banana-image' },
     ],
@@ -371,6 +384,9 @@ export const CATALOG: CatalogModel[] = [
         capability: 'video.generate',
         modes: ['t2v', 'firstLast', 'reference'],
         maxReferenceImages: 10,
+        // Seedance 协议只接受图片参考，视频/音频参考必须拦下并提示，不能静默丢弃。
+        maxReferenceVideos: 0,
+        maxReferenceAudios: 0,
         supportsFirstFrame: true,
         supportsLastFrame: true,
         supportsNativeAudio: false,

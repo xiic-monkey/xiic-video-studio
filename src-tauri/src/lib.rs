@@ -509,8 +509,19 @@ fn save_provider_profile(mut profile: Value, state: State<'_, AppState>) -> Resu
 }
 
 #[tauri::command]
-fn provider_has_key(provider_id: String) -> Result<bool, String> {
-    Ok(provider_credential(&provider_id)?.is_some())
+async fn provider_has_key(
+    provider_id: String,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    // 与「测试连接」同源：多 Key 约定优先，旧单 Key 账户兜底。
+    // 只读旧账户会让用新约定保存 Key 的供应商误判为「没有 Key」。
+    let Some(profile) = runs::load_provider_profile(&state, &provider_id)? else {
+        // profile 不存在时维持旧行为，仍尝试旧单 Key 账户。
+        return Ok(provider_credential(&provider_id)?.is_some());
+    };
+    Ok(test_key_refs(&profile, &provider_id)
+        .into_iter()
+        .any(|key_ref| provider_key_secret(&key_ref).is_some()))
 }
 
 #[derive(serde::Serialize)]
@@ -521,6 +532,24 @@ struct ProviderTestResult {
     model_count: Option<usize>,
 }
 
+/// 测试连接要尝试的密钥引用：多 Key 约定优先，旧单 Key 账户兜底。
+///
+/// 新约定把每个 Key 存到 provider/{id}/key/{keyId}（见 save_provider_key），
+/// 旧版单 Key 存在 provider/{id}。测试连接不能只读旧账户，否则用新约定保存
+/// Key 后会误报「尚未保存 API Key」。
+pub(crate) fn test_key_refs(profile: &gateway::ProviderProfile, provider_id: &str) -> Vec<String> {
+    let mut refs: Vec<String> = profile
+        .key_refs()
+        .into_iter()
+        .map(|(_, key_ref)| key_ref)
+        .collect();
+    let legacy = format!("{CREDENTIAL_ACCOUNT_PREFIX}{provider_id}");
+    if !refs.contains(&legacy) {
+        refs.push(legacy);
+    }
+    refs
+}
+
 #[tauri::command]
 async fn test_provider_profile(
     provider_id: String,
@@ -528,7 +557,9 @@ async fn test_provider_profile(
 ) -> Result<ProviderTestResult, String> {
     let profile = runs::load_provider_profile(&state, &provider_id)?
         .ok_or_else(|| "Provider 未配置".to_string())?;
-    let key = provider_credential(&provider_id)?
+    let key = test_key_refs(&profile, &provider_id)
+        .into_iter()
+        .find_map(|key_ref| provider_key_secret(&key_ref))
         .ok_or_else(|| "尚未保存 API Key".to_string())?;
     let client = http_client()?;
     if profile.adapter == "openai-compatible" {
@@ -953,6 +984,32 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试连接必须按新约定读 Key：keys 里的 keyRef 优先，旧单 Key 账户兜底。
+    /// 只查旧账户会让「用新约定保存 Key」的供应商永远报「尚未保存 API Key」。
+    #[test]
+    fn test_key_refs_prefer_new_keys_then_legacy() {
+        let mut profile = gateway::test_profile("openai-compatible", "https://example.com");
+        profile.keys = vec![
+            gateway::ProviderKey {
+                id: "k1".to_string(),
+                label: "主".to_string(),
+                key_ref: "provider/p1/key/k1".to_string(),
+                enabled: true,
+                status: "active".to_string(),
+                cooldown_until: None,
+                has_secret: true,
+            },
+        ];
+        let refs = test_key_refs(&profile, "p1");
+        assert_eq!(refs.first().map(String::as_str), Some("provider/p1/key/k1"));
+        assert!(refs.iter().any(|item| item == "provider/p1"), "旧账户仍要兜底");
+
+        // 没有多 Key 的 profile：key_refs 走 auth.keyRef，与旧账户一致，不重复。
+        let legacy_only = gateway::test_profile("openai-compatible", "https://example.com");
+        let refs = test_key_refs(&legacy_only, "test");
+        assert_eq!(refs, vec!["provider/test".to_string()]);
+    }
 
     /// profile 必须原样返回：绑定参数、能力上限这些字段不能被结构体吃掉，
     /// 否则前端一保存就把配置写回成残缺结构。
