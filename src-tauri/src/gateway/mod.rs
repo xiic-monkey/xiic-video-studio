@@ -282,9 +282,19 @@ pub fn map_http_status(status: reqwest::StatusCode, body: &str, label: &str) -> 
     let raw = body.chars().take(800).collect::<String>();
     // 状态码优先：鉴权、限流、端点错误都有确定的含义，不能被错误体里的
     // 一个 "safety" 关键词改成审核拒绝（那会硬失败且不作废 Key）。
+    let moderation_hint = lower.contains("moderation")
+        || lower.contains("content policy")
+        || lower.contains("safety");
     match status.as_u16() {
         401 => AppError::new("AUTH_UNAUTHORIZED", format!("{label} 鉴权失败，请检查 API Key"), false).with_raw(raw),
-        403 => AppError::new("PERM_FORBIDDEN", format!("{label} 无权限访问该模型"), false).with_raw(raw),
+        403 => {
+            // 403 多半是「该模型无权限」，但也有供应商拿它做内容拦截。
+            if moderation_hint {
+                AppError::new("MODERATION_REJECTED", format!("{label} 拒绝了该内容"), false).with_raw(raw)
+            } else {
+                AppError::new("PERM_FORBIDDEN", format!("{label} 无权限访问该模型"), false).with_raw(raw)
+            }
+        }
         404 => AppError::new("PARAM_ENDPOINT_NOT_FOUND", format!("{label} 端点不存在，请检查 Base URL"), false).with_raw(raw),
         429 => AppError::new("RATE_LIMIT", format!("{label} 限流"), true).with_raw(raw),
         value if (500..=599).contains(&value) => {
@@ -292,7 +302,7 @@ pub fn map_http_status(status: reqwest::StatusCode, body: &str, label: &str) -> 
         }
         400 | 422 => {
             // 审核拒绝和参数错误都走 400：只有错误体明确提到审核时才算审核拒。
-            if lower.contains("moderation") || lower.contains("content policy") || lower.contains("safety") {
+            if moderation_hint {
                 AppError::new("MODERATION_REJECTED", format!("{label} 拒绝了该内容"), false).with_raw(raw)
             } else {
                 AppError::new("PARAM_INVALID", format!("{label} 参数无效"), false).with_raw(raw)
@@ -384,12 +394,14 @@ pub async fn poll(
     model: &ModelConfig,
     task_id: &str,
 ) -> Result<JobStatus, AppError> {
-    match runtime.protocol.as_str() {
+    let result = match runtime.protocol.as_str() {
         "seedance-video" => seedance_video::poll(client, runtime, model, task_id).await,
         "qwen-image" => qwen_image::poll(client, runtime, model, task_id).await,
         "banana-image" => banana_image::poll(client, runtime, model, task_id).await,
         _ => minimax::poll(client, runtime, model, task_id).await,
-    }
+    };
+    // 轮询错误同样会落进运行记录、事件与导出包，供应商在这里回显密钥也得脱敏。
+    result.map_err(|error| redact_secrets(error, &[runtime.api_key.as_str()]))
 }
 
 /// 取消异步任务：按协议分发。
@@ -399,12 +411,13 @@ pub async fn cancel(
     model: &ModelConfig,
     task_id: &str,
 ) -> Result<(), AppError> {
-    match runtime.protocol.as_str() {
+    let result = match runtime.protocol.as_str() {
         "seedance-video" => seedance_video::cancel(client, runtime, model, task_id).await,
         "qwen-image" => qwen_image::cancel(client, runtime, model, task_id).await,
         "banana-image" => banana_image::cancel(client, runtime, model, task_id).await,
         _ => minimax::cancel(client, runtime, model, task_id).await,
-    }
+    };
+    result.map_err(|error| redact_secrets(error, &[runtime.api_key.as_str()]))
 }
 
 /// 失败是否值得换下一个候选（供应商 / Key）。
@@ -434,14 +447,13 @@ pub fn invalidates_key(error: &AppError) -> bool {
 }
 
 /// 临时性失败：Key 可能恢复，限时冷却后还能再用。
+///
+/// 403 不在这里：它多半是「该模型没权限」，不是这个 Key 整体不可用，
+/// 冷却整个 Key 会把同一 Key 下的其它模型一起停掉。
 pub fn cooldowns_key(error: &AppError) -> bool {
     matches!(
         error.code.as_str(),
-        "PERM_FORBIDDEN"
-            | "RATE_LIMIT"
-            | "UNAVAILABLE_PROVIDER"
-            | "TIMEOUT_PROVIDER"
-            | "UNKNOWN_PROVIDER"
+        "RATE_LIMIT" | "UNAVAILABLE_PROVIDER" | "TIMEOUT_PROVIDER" | "UNKNOWN_PROVIDER"
     )
 }
 
@@ -615,6 +627,24 @@ mod tests {
         assert_eq!(plain.code, "PARAM_INVALID");
     }
 
+    /// 403 多数是「无权限」，但也有供应商拿它做内容拦截：按错误体区分。
+    #[test]
+    fn forbidden_is_permission_unless_the_body_says_moderation() {
+        let denied = map_http_status(
+            reqwest::StatusCode::FORBIDDEN,
+            "model gpt-image-1 is not available for this key",
+            "测试",
+        );
+        assert_eq!(denied.code, "PERM_FORBIDDEN");
+
+        let blocked = map_http_status(
+            reqwest::StatusCode::FORBIDDEN,
+            "request blocked by content policy",
+            "测试",
+        );
+        assert_eq!(blocked.code, "MODERATION_REJECTED");
+    }
+
     /// 回退策略：换一家供应商能救回来的错误才回退。
     #[test]
     fn fallback_only_for_provider_level_failures() {
@@ -637,7 +667,9 @@ mod tests {
         assert!(invalidates_key(&AppError::new("AUTH_UNAUTHORIZED", "x", false)));
         assert!(!invalidates_key(&AppError::new("PERM_FORBIDDEN", "x", false)));
         assert!(!invalidates_key(&AppError::new("RATE_LIMIT", "x", true)));
-        assert!(cooldowns_key(&AppError::new("PERM_FORBIDDEN", "x", false)));
+        // 403 多半是「该模型没权限」，不是这个 Key 整体不可用：冷却它会把
+        // 同一 Key 下的其它模型一起停掉，所以只换候选、不冷却。
+        assert!(!cooldowns_key(&AppError::new("PERM_FORBIDDEN", "x", false)));
         assert!(cooldowns_key(&AppError::new("RATE_LIMIT", "x", true)));
         assert!(!cooldowns_key(&AppError::new("AUTH_UNAUTHORIZED", "x", false)));
     }
@@ -700,5 +732,33 @@ mod tests {
             },
         ];
         assert_eq!(multi.key_refs(), vec![("k1".to_string(), "provider/test/key/k1".to_string())]);
+    }
+
+    /// 轮询错误也会落进运行记录、事件与导出包，供应商回显的密钥必须脱敏。
+    #[tokio::test]
+    async fn poll_errors_are_redacted() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/query/video_generation"))
+            .respond_with(wiremock::ResponseTemplate::new(401).set_body_string(
+                "Incorrect API key provided: sk-live-abcdef0123456789",
+            ))
+            .mount(&server)
+            .await;
+        let error = poll(
+            &reqwest::Client::new(),
+            &ProviderRuntime {
+                profile: test_profile("minimax-h3", &server.uri()),
+                api_key: "sk-live-abcdef0123456789".to_string(),
+                protocol: "minimax-video".to_string(),
+            },
+            &test_profile("minimax-h3", &server.uri()).models[0],
+            "task_1",
+        )
+        .await
+        .expect_err("auth");
+        assert_eq!(error.code, "AUTH_UNAUTHORIZED");
+        let raw = error.provider_raw.as_deref().unwrap_or("");
+        assert!(!raw.contains("sk-live-abcdef0123456789"), "轮询错误里还留着密钥：{raw}");
     }
 }

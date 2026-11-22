@@ -22,6 +22,13 @@ pub async fn execute(
     if !system.is_empty() {
         body["instructions"] = json!(system);
     }
+    // 目录里声明的采样参数：用户在 Inspector 改了就要真的发出去。
+    if let Some(temperature) = request.params.get("temperature").and_then(Value::as_f64) {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(max_tokens) = request.params.get("maxTokens").and_then(Value::as_u64) {
+        body["max_output_tokens"] = json!(max_tokens);
+    }
     let response = client
         .post(api_url(&runtime.profile.base_url, "responses"))
         .bearer_auth(&runtime.api_key)

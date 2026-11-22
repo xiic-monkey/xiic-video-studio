@@ -25,6 +25,11 @@ pub fn should_resume(status: &str, remote_task_id: Option<&str>) -> bool {
     matches!(status, "submitted" | "polling") && remote_task_id.is_some()
 }
 
+/// 瞬时错误还有没有重试预算（与轮询退避计数分开）。
+pub fn transient_budget_left(transient: u32) -> bool {
+    transient < MAX_TRANSIENT_RETRIES
+}
+
 /// 运行是否已经到终态：到终态就不该再恢复轮询，
 /// 更不能把它当成「提交中断」改判成失败。
 pub fn run_is_terminal(status: &str) -> bool {
@@ -98,7 +103,10 @@ async fn poll_loop(
         }
     };
     let started = std::time::Instant::now();
+    // attempt 是退避计数，transient 是「瞬时错误」重试次数：两者必须分开，
+    // 否则正常轮询几十次就把重试预算吃光，任务明明还在跑却被判失败。
     let mut attempt = 0u32;
+    let mut transient = 0u32;
     loop {
         tokio::time::sleep(poll_delay(attempt)).await;
         if is_cancelled(&db_path, &run.id) {
@@ -153,8 +161,20 @@ async fn poll_loop(
                 );
                 attempt = attempt.saturating_add(1);
             }
-            Err(error) if error.retryable && attempt < MAX_TRANSIENT_RETRIES => {
+            Err(error) if error.retryable && transient_budget_left(transient) => {
+                transient = transient.saturating_add(1);
                 attempt = attempt.saturating_add(1);
+                // 瞬时错误要看得见：否则界面只会一直显示「轮询中」。
+                set_job_values(&db_path, &job_id, "polling", attempt);
+                let _ = app.emit(
+                    "job.updated",
+                    json!({
+                        "id": job_id,
+                        "status": "polling",
+                        "transientError": error.message,
+                        "retry": transient,
+                    }),
+                );
             }
             Err(error) => {
                 finish_failed(&app, &db_path, &run, error);
@@ -347,6 +367,17 @@ mod tests {
         assert!(should_resume("submitted", Some("task_1")));
         assert!(should_resume("polling", Some("task_1")));
         assert!(!should_resume("succeeded", Some("task_1")));
+    }
+
+    /// 瞬时错误的重试预算必须独立于轮询退避计数：
+    /// 正常轮询几十次不能把重试预算吃光，否则任务还在跑就被判失败。
+    #[test]
+    fn transient_retry_budget_is_separate_from_the_poll_backoff() {
+        // 轮询 20 次（正常任务）之后，瞬时错误仍然还有预算。
+        let transient = 0u32;
+        assert!(transient_budget_left(transient));
+        assert!(transient_budget_left(MAX_TRANSIENT_RETRIES - 1));
+        assert!(!transient_budget_left(MAX_TRANSIENT_RETRIES));
     }
 
     /// 已经成功的运行不再恢复：恢复扫描不能把它改判成失败。

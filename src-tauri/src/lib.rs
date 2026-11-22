@@ -144,7 +144,12 @@ pub(crate) fn provider_key_secret(key_ref: &str) -> Option<String> {
 
 /// 保存某个 Key。同一供应商可以有多个 Key，账户名按 key_id 区分。
 #[tauri::command]
-fn save_provider_key(provider_id: String, key_id: String, api_key: String) -> Result<(), String> {
+fn save_provider_key(
+    provider_id: String,
+    key_id: String,
+    api_key: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     if api_key.trim().is_empty() {
         return Err("API key cannot be empty".to_string());
     }
@@ -155,12 +160,20 @@ fn save_provider_key(provider_id: String, key_id: String, api_key: String) -> Re
     Entry::new(KEYCHAIN_SERVICE, &account)
         .map_err(|error| error.to_string())?
         .set_password(api_key.trim())
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    // 重新填了密钥就意味着用户想继续用它：把之前的失效 / 冷却状态清掉，
+    // 否则这个 Key 会永远被跳过（401 作废后没有任何恢复入口）。
+    let _ = runs::reset_key_status(&state, &provider_id, &key_id);
+    Ok(())
 }
 
 /// 删除某个 Key（钥匙串与配置里的状态一起清掉）。
 #[tauri::command]
-fn delete_provider_key(provider_id: String, key_id: String) -> Result<(), String> {
+fn delete_provider_key(
+    provider_id: String,
+    key_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let account = format!("{CREDENTIAL_ACCOUNT_PREFIX}{provider_id}/key/{key_id}");
     if let Ok(entry) = Entry::new(KEYCHAIN_SERVICE, &account) {
         match entry.delete_credential() {
@@ -169,6 +182,8 @@ fn delete_provider_key(provider_id: String, key_id: String) -> Result<(), String
             Err(error) => return Err(error.to_string()),
         }
     }
+    // 钥匙串里没了，配置里的失效 / 冷却状态也要一起清掉。
+    let _ = runs::reset_key_status(&state, &provider_id, &key_id);
     Ok(())
 }
 
@@ -317,35 +332,78 @@ fn list_provider_profiles(state: State<'_, AppState>) -> Result<Vec<Value>, Stri
     let rows = statement
         .query_map([], |row| row.get::<_, String>(0))
         .map_err(|error| error.to_string())?;
-    let mut profiles: Vec<gateway::ProviderProfile> = rows
+    let mut profiles: Vec<Value> = rows
         .map(|row| {
             let payload = row.map_err(|error| error.to_string())?;
             serde_json::from_str(&payload).map_err(|error| error.to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    // 注入每个 Key 的「钥匙串里是否真的有密钥」，前端据此显示状态。
+    inject_key_state(&mut profiles);
+    Ok(profiles)
+}
+
+/// 注入每个 Key 的「钥匙串里是否真的有密钥」，前端据此显示状态。
+///
+/// 直接在原始 JSON 上改：经过 ProviderProfile 结构体会丢掉未建模的字段
+///（绑定参数、能力上限等），前端一保存就把残缺结构写回库，配置被悄悄洗掉。
+fn inject_key_state(profiles: &mut [Value]) {
     for profile in profiles.iter_mut() {
-        for key in profile.keys.iter_mut() {
-            let key_ref = if key.key_ref.trim().is_empty() {
-                format!("{CREDENTIAL_ACCOUNT_PREFIX}{}/key/{}", profile.id, key.id)
-            } else {
-                key.key_ref.clone()
-            };
-            key.has_secret = provider_key_secret(&key_ref).is_some();
-        }
-        profile.has_key = if profile.keys.is_empty() {
-            provider_key_secret(&profile.auth.key_ref).is_some()
-        } else {
-            profile
-                .keys
-                .iter()
-                .any(|key| key.enabled && key.status != "invalid" && key.has_secret)
+        let Some(object) = profile.as_object_mut() else {
+            continue;
         };
+        let provider_id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let key_count = object
+            .get("keys")
+            .and_then(Value::as_array)
+            .map(|keys| keys.len())
+            .unwrap_or(0);
+        let mut usable = false;
+        if let Some(keys) = object.get_mut("keys").and_then(Value::as_array_mut) {
+            for key in keys.iter_mut() {
+                let Some(key_object) = key.as_object_mut() else {
+                    continue;
+                };
+                let key_id = key_object.get("id").and_then(Value::as_str).unwrap_or("");
+                let key_ref = key_object
+                    .get("keyRef")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let resolved = if key_ref.is_empty() {
+                    format!("{CREDENTIAL_ACCOUNT_PREFIX}{provider_id}/key/{key_id}")
+                } else {
+                    key_ref
+                };
+                let has_secret = provider_key_secret(&resolved).is_some();
+                key_object.insert("hasSecret".to_string(), Value::Bool(has_secret));
+                let enabled = key_object.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+                let status = key_object
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("active");
+                if enabled && status != "invalid" && has_secret {
+                    usable = true;
+                }
+            }
+        }
+        let has_key = if key_count == 0 {
+            // 旧版 profile 只有 auth.keyRef。
+            let auth_ref = object
+                .get("auth")
+                .and_then(|auth| auth.get("keyRef"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            provider_key_secret(auth_ref).is_some()
+        } else {
+            usable
+        };
+        object.insert("hasKey".to_string(), Value::Bool(has_key));
     }
-    profiles
-        .into_iter()
-        .map(|profile| serde_json::to_value(profile).map_err(|error| error.to_string()))
-        .collect()
 }
 
 /// 远端地址校验失败时保留错误码，方便前端提示与日志排查区分具体原因。
@@ -557,13 +615,15 @@ async fn start_run(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<runs::RunRecord, String> {
+    // 缓存命中不需要供应商：先判缓存，否则供应商停用 / Key 失效时
+    // 会把「本来能直接复用」的一次运行也拦掉。
+    if let Some(asset_id) = request.cached_asset_id.clone() {
+        return runs::finish_cached(&state, &request, &asset_id);
+    }
     // 候选展开：自动路由时按模型下各供应商的顺序展开（供应商 × Key）。
     let candidates = runs::expand_candidates(&state, &request)?;
     if candidates.is_empty() {
         return Err("没有可用供应商：请检查该模型的供应商配置、协议与 API Key".to_string());
-    }
-    if let Some(asset_id) = request.cached_asset_id.clone() {
-        return runs::finish_cached(&state, &request, &asset_id);
     }
     let run = runs::create_run(&state, &request)?;
     let job_id = format!("job_{}", uuid::Uuid::new_v4());
@@ -712,27 +772,28 @@ fn save_mask(
 fn list_assets(project_id: Option<String>, state: State<'_, AppState>) -> Result<Vec<Value>, String> {
     let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
     let connection = db::open(&path)?;
+    query_assets(&connection, project_id.as_deref())
+}
+
+/// 资产库查询：先按项目过滤再排序限量。
+///
+/// 先 LIMIT 再过滤的话，资产超过上限时靠后的项目会一条都查不到。
+fn query_assets(connection: &rusqlite::Connection, project_id: Option<&str>) -> Result<Vec<Value>, String> {
+    let filter = project_id.filter(|item| !item.trim().is_empty());
     let mut statement = connection
-        .prepare("SELECT payload FROM assets ORDER BY created_at DESC LIMIT 500")
+        .prepare(
+            "SELECT payload FROM assets
+             WHERE (?1 IS NULL OR json_extract(payload, '$.provenance.projectId') = ?1)
+             ORDER BY created_at DESC LIMIT 500",
+        )
         .map_err(|error| error.to_string())?;
     let rows = statement
-        .query_map([], |row| row.get::<_, String>(0))
+        .query_map([filter], |row| row.get::<_, String>(0))
         .map_err(|error| error.to_string())?;
     let mut assets: Vec<Value> = Vec::new();
     for row in rows {
         let payload = row.map_err(|error| error.to_string())?;
         let value: Value = serde_json::from_str(&payload).map_err(|error| error.to_string())?;
-        if let Some(project) = project_id.as_ref().filter(|item| !item.trim().is_empty()) {
-            let belongs = value
-                .get("provenance")
-                .and_then(|item| item.get("projectId"))
-                .and_then(Value::as_str)
-                .map(|owner| owner == project)
-                .unwrap_or(false);
-            if !belongs {
-                continue;
-            }
-        }
         assets.push(value);
     }
     Ok(assets)
@@ -891,6 +952,81 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// profile 必须原样返回：绑定参数、能力上限这些字段不能被结构体吃掉，
+    /// 否则前端一保存就把配置写回成残缺结构。
+    #[test]
+    fn provider_profiles_keep_fields_the_backend_does_not_model() {
+        let profile = json!({
+            "id": "p1",
+            "name": "P1",
+            "adapter": "openai-compatible",
+            "baseUrl": "https://example.com",
+            "auth": { "type": "bearer", "keyRef": "provider/p1" },
+            "enabled": true,
+            "schemaVersion": 2,
+            "models": [{
+                "id": "m1",
+                "displayName": "M1",
+                "params": [{ "key": "quality", "label": "质量", "type": "select" }],
+                "capabilities": [{
+                    "capability": "image.edit",
+                    "supportsMask": true,
+                    "maxReferenceImages": 4,
+                    "inputTransport": ["dataUrl"],
+                    "async": false
+                }]
+            }],
+            "keys": [{ "id": "k1", "label": "主", "keyRef": "provider/p1/key/k1", "enabled": true, "status": "active" }]
+        });
+        let mut profiles = vec![profile];
+        inject_key_state(&mut profiles);
+        let models = profiles[0]["models"].as_array().expect("models");
+        assert_eq!(models[0]["params"][0]["key"], "quality");
+        assert_eq!(models[0]["capabilities"][0]["supportsMask"], true);
+        assert_eq!(models[0]["capabilities"][0]["maxReferenceImages"], 4);
+        // 没有钥匙串密钥时 hasKey 为 false，但仍要保留 hasSecret 字段。
+        assert_eq!(profiles[0]["keys"][0]["hasSecret"], false);
+        assert_eq!(profiles[0]["hasKey"], false);
+    }
+
+    /// 资产库：项目过滤要下推到查询，否则资产超过上限时靠后的项目查不到。
+    #[test]
+    fn asset_query_filters_by_project_before_limiting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("db.sqlite3");
+        let connection = db::open(&path).expect("db");
+        for index in 0..600 {
+            let project = if index < 550 { "p_old" } else { "p_new" };
+            let payload = json!({
+                "id": format!("a{index}"),
+                "kind": "image",
+                "path": format!("assets/a{index}"),
+                "mime": "image/png",
+                "bytes": 1,
+                "provenance": { "projectId": project }
+            });
+            connection
+                .execute(
+                    "INSERT INTO assets (id, kind, path, mime, bytes, payload, created_at) VALUES (?1, 'image', ?2, 'image/png', 1, ?3, ?4)",
+                    rusqlite::params![
+                        format!("a{index}"),
+                        format!("assets/a{index}"),
+                        serde_json::to_string(&payload).expect("json"),
+                        format!("2026-01-01T00:00:{index:02}Z")
+                    ],
+                )
+                .expect("insert");
+        }
+        let all = query_assets(&connection, None).expect("all");
+        assert_eq!(all.len(), 500);
+        let filtered = query_assets(&connection, Some("p_new")).expect("filtered");
+        assert_eq!(filtered.len(), 50, "按项目过滤后应该仍能查到该项目的资产");
+        let empty = query_assets(&connection, Some("  ")).expect("blank");
+        assert_eq!(empty.len(), 500, "空项目名等于不过滤");
+    }
+
     use super::*;
 
     #[test]

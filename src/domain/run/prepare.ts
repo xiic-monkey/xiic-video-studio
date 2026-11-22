@@ -4,6 +4,7 @@ import { isMaskNode, maskAssetIdOf } from '../nodes/mask';
 import { instructionFor } from '../nodes/templates';
 import type { Issue, NodeContext } from '../nodes/types';
 import { capabilityOf, estimateCost } from '../providers/capabilities';
+import { catalogParamOptions } from '../providers/catalog';
 import { compilePrompt } from '../prompts/compile';
 import { validateBoard } from '../graph/validate';
 import { buildCacheContext, nodeParams, resolveModel, runCapability } from './runtime';
@@ -99,18 +100,27 @@ export function inboundTextAssetIds(
   return [...new Set(ids)];
 }
 
-function referenceOverflow(inputs: RunRequestDraft['inputs'], limit?: ModelCapability): string | undefined {
-  const rules: Array<[string, number, string]> = [
-    ['reference_image', limit?.maxReferenceImages ?? Number.POSITIVE_INFINITY, '参考图'],
-    ['reference_video', limit?.maxReferenceVideos ?? Number.POSITIVE_INFINITY, '参考视频'],
-    ['reference_audio', limit?.maxReferenceAudios ?? Number.POSITIVE_INFINITY, '参考音频'],
-    ['first_frame', limit && limit.supportsFirstFrame === false ? 0 : Number.POSITIVE_INFINITY, '首帧'],
-    ['last_frame', limit && limit.supportsLastFrame === false ? 0 : Number.POSITIVE_INFINITY, '尾帧'],
+/** 参考图超额：角色 + 提示文案。 */
+function referenceOverflow(
+  inputs: RunRequestDraft['inputs'],
+  limit?: ModelCapability,
+): { role: string; message: string } | undefined {
+  const count = (role: string) => inputs.filter((item) => item.role === role).length;
+  // 风格参考图与参考图共用图片额度。
+  const imageCount = count('reference_image') + count('style_ref');
+  const rules: Array<[string, number, number, string]> = [
+    ['reference_image', imageCount, limit?.maxReferenceImages ?? Number.POSITIVE_INFINITY, '参考图'],
+    ['reference_video', count('reference_video'), limit?.maxReferenceVideos ?? Number.POSITIVE_INFINITY, '参考视频'],
+    ['reference_audio', count('reference_audio'), limit?.maxReferenceAudios ?? Number.POSITIVE_INFINITY, '参考音频'],
+    ['first_frame', count('first_frame'), limit && limit.supportsFirstFrame === false ? 0 : Number.POSITIVE_INFINITY, '首帧'],
+    ['last_frame', count('last_frame'), limit && limit.supportsLastFrame === false ? 0 : Number.POSITIVE_INFINITY, '尾帧'],
   ];
-  for (const [role, max, label] of rules) {
-    const count = inputs.filter((item) => item.role === role).length;
-    if (count === 0 || count <= max) continue;
-    return max === 0 ? `${label}不受支持` : `${label}超出模型上限（最多 ${max}）`;
+  for (const [role, total, max, label] of rules) {
+    if (total === 0 || total <= max) continue;
+    return {
+      role,
+      message: max === 0 ? `${label}不受支持` : `${label}超出模型上限（最多 ${max}）`,
+    };
   }
   return undefined;
 }
@@ -225,10 +235,20 @@ export function prepareRun(doc: BoardDoc, nodeId: string, deps: PrepareDeps): Pr
   else if (upstreamSystem) params.system = upstreamSystem;
   if (capability === 'audio.tts') params.text = finalText;
 
+  // 节点级参考图也要算进模型的上限。
+  const referenceAssetIds = Array.isArray(node.data.referenceAssetIds)
+    ? node.data.referenceAssetIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
+    : [];
+
   if (capability === 'video.generate') {
     const mode = String(params.mode ?? 't2v');
     if (limit?.modes && !limit.modes.includes(mode)) {
       issues.push(error('PARAM_MODE_UNSUPPORTED', `${resolved.modelName} 不支持${MODE_LABEL[mode] ?? mode}模式`));
+    }
+    // 首尾帧与参考图互斥：后端会直接报错，这里提前拦下来。
+    const referenceBlocked = mode === 'firstLast' || Boolean(limit?.modes && !limit.modes.includes('reference'));
+    if (referenceBlocked && referenceAssetIds.length) {
+      issues.push(error('PARAM_MODE_CONFLICT', '首尾帧模式下不能同时使用参考图，请清空参考图或改用其他模式'));
     }
     const duration = Number(params.duration ?? 0);
     const range = limit?.durations;
@@ -236,19 +256,21 @@ export function prepareRun(doc: BoardDoc, nodeId: string, deps: PrepareDeps): Pr
       issues.push(error('PARAM_DURATION_RANGE', `时长需在 ${range.min}–${range.max} 秒之间`));
     }
     const resolution = String(params.resolution ?? '');
-    if (limit?.resolutions && !limit.resolutions.includes(resolution)) {
+    // 能力里没有分辨率档位时，用目录参数的选项校验。
+    const allowedResolutions = limit?.resolutions
+      ?? catalogParamOptions(resolved.modelId, capability, 'resolution')?.map((option) => option.value);
+    if (allowedResolutions && !allowedResolutions.includes(resolution)) {
       issues.push(error('PARAM_RESOLUTION_UNSUPPORTED', `${resolved.modelName} 不支持 ${resolution || '空'} 分辨率`));
     }
     const ratio = String(params.ratio ?? '');
     if (limit?.ratios && !limit.ratios.includes(ratio)) {
       issues.push(error('PARAM_RATIO_UNSUPPORTED', `${resolved.modelName} 不支持 ${ratio || '空'} 比例`));
     }
+    if (params.generateAudio && limit?.supportsNativeAudio === false) {
+      issues.push(error('PARAM_MODE_UNSUPPORTED', `${resolved.modelName} 不支持生成原生音频`));
+    }
   }
 
-  // 节点级参考图也要算进模型的上限。
-  const referenceAssetIds = Array.isArray(node.data.referenceAssetIds)
-    ? node.data.referenceAssetIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
-    : [];
   const overflow = referenceOverflow(
     [
       ...mediaInputs,
@@ -256,7 +278,16 @@ export function prepareRun(doc: BoardDoc, nodeId: string, deps: PrepareDeps): Pr
     ],
     limit,
   );
-  if (overflow) issues.push(error('PARAM_REFERENCE_LIMIT', overflow));
+  if (overflow) issues.push(error('PARAM_REFERENCE_LIMIT', overflow.message));
+  // 风格图与参考图共用额度，这里再兜一次更明确的提示。
+  const imageQuota = limit?.maxReferenceImages;
+  const imageCount = [
+    ...mediaInputs,
+    ...referenceAssetIds.map((assetId) => ({ role: 'reference_image', assetId, kind: 'image', mime: '' })),
+  ].filter((item) => item.role === 'reference_image' || item.role === 'style_ref').length;
+  if (imageQuota !== undefined && imageCount > imageQuota && overflow?.role !== 'reference_image') {
+    issues.push(error('PARAM_REFERENCE_LIMIT', `参考图与风格图合计超出模型上限（最多 ${imageQuota} 张）`));
+  }
 
   // 节点级参考图也要走同样的传输方式：只看 mediaInputs 会漏掉「仅用拆帧参考图」的情况。
   const needsPublicUrl = (mediaInputs.length + referenceAssetIds.length) > 0 && limit

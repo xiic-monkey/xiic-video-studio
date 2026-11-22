@@ -28,6 +28,10 @@ pub async fn execute(
     if !system.is_empty() {
         body["system"] = json!(system);
     }
+    // 目录里声明的采样参数：用户在 Inspector 改了就要真的发出去。
+    if let Some(temperature) = request.params.get("temperature").and_then(Value::as_f64) {
+        body["temperature"] = json!(temperature);
+    }
     let response = client
         .post(api_url(&runtime.profile.base_url, "messages"))
         .header("x-api-key", &runtime.api_key)

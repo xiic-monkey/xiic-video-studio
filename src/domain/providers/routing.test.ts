@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ModelCapability, ProviderProfile } from '../types';
+import { catalogCapability } from './catalog';
 import {
   autoModels, effectiveCapability, keyIsCooling, planRoute, protocolOf, providersForModel,
 } from './routing';
@@ -126,6 +127,24 @@ describe('effectiveCapability', () => {
     expect(merged?.durations).toEqual({ min: 4, max: 30, step: 1 });
     // 目录里没写的字段仍保留
     expect(merged?.ratios).toContain('9:16');
+  });
+
+  it('returns undefined when the binding does not declare the capability', () => {
+    // 与后端一致：绑定里没有的能力项，后端会跳过这个供应商。
+    const binding = {
+      id: 'gpt-image-1',
+      displayName: 'GPT Image 1',
+      capabilities: [{
+        capability: 'image.generate',
+        inputTransport: ['dataUrl'] as ModelCapability['inputTransport'],
+        async: false,
+      }],
+    };
+    expect(effectiveCapability('gpt-image-1', binding, 'image.edit')).toBeUndefined();
+    // 目录里有这项能力也不行：以前前端会把它列成可用，后端却直接跳过。
+    expect(catalogCapability('gpt-image-1', 'image.edit')).toBeTruthy();
+    // 只有没有绑定对象时才回落目录基线。
+    expect(effectiveCapability('gpt-image-1', undefined, 'image.edit')).toBeTruthy();
   });
 });
 

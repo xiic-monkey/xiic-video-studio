@@ -3,7 +3,7 @@ import { edge, makeDoc, node, videoNode } from '../graph/testFixtures';
 import { emptyStyleGuide } from '../types';
 import type { ProviderProfile } from '../types';
 import { TEST_KEYS, TEST_PROFILES, runningRun } from './runFixtures';
-import { buildCacheContext, mergeRunRecord, nodeParams, resolveModel, runCapability } from './runtime';
+import { buildCacheContext, mergeRunRecord, nodeParams, providerKeysUnavailable, resolveModel, runCapability } from './runtime';
 
 describe('runCapability', () => {
   it('switches an image node to the edit capability when a reference is connected', () => {
@@ -110,6 +110,22 @@ describe('resolveModel', () => {
   });
 });
 
+describe('providerKeysUnavailable', () => {
+  const base = { id: 'k1', label: '主 Key', keyRef: 'ref', enabled: true, status: 'active' as const };
+
+  it('tells apart a missing key from a cooling or an invalid one', () => {
+    expect(providerKeysUnavailable('OpenAI', []).code).toBe('PROVIDER_KEY_MISSING');
+    expect(providerKeysUnavailable('OpenAI', [{ ...base, hasSecret: false }]).code).toBe('PROVIDER_KEY_MISSING');
+    expect(providerKeysUnavailable('OpenAI', [{ ...base, status: 'invalid', hasSecret: true }]).code).toBe('PROVIDER_KEY_INVALID');
+    expect(providerKeysUnavailable('OpenAI', [{
+      ...base,
+      status: 'cooling',
+      hasSecret: true,
+      cooldownUntil: new Date(Date.now() + 60_000).toISOString(),
+    }]).code).toBe('PROVIDER_KEY_COOLING');
+  });
+});
+
 describe('nodeParams', () => {
   it('maps the video ratio field onto the provider parameter name', () => {
     const doc = makeDoc([videoNode('v', { mode: 'firstLast', duration: 8, resolution: '2K', aspectRatio: '16:9', generateAudio: false })], []);
@@ -135,6 +151,36 @@ describe('nodeParams', () => {
     expect(nodeParams(image.nodes.i, 'image.generate', { id: 'gpt-image-1' })).toMatchObject({
       quality: 'auto',
     });
+  });
+
+  it('only sends the text params the protocol can read', () => {
+    const doc = makeDoc([node('t', 'text', { prompt: 'hi' })], []);
+    expect(nodeParams(doc.nodes.t, 'text.chat', { id: 'gpt-4o-mini' })).toEqual({
+      system: '', temperature: 0.7, maxTokens: 4096,
+    });
+    // 目录里没有的模型没有协议契约：读不到的参数不下发，免得白让缓存失效。
+    expect(nodeParams(doc.nodes.t, 'text.chat', { id: 'my-model' })).toEqual({ system: '' });
+  });
+
+  it('falls back to the catalog voice default', () => {
+    const doc = makeDoc([node('a', 'audio', { text: '你好' })], []);
+    expect(nodeParams(doc.nodes.a, 'audio.tts', { id: 'speech-02-hd' }).voice).toBe('male-qn-qingse');
+    expect(nodeParams(doc.nodes.a, 'audio.tts', { id: 'mimo-v2.5-tts' }).voice).toBe('mimo_default');
+    // 节点里填了音色就用节点的。
+    const custom = makeDoc([node('a', 'audio', { text: '你好', voice: 'Chelsie' })], []);
+    expect(nodeParams(custom.nodes.a, 'audio.tts', { id: 'speech-02-hd' }).voice).toBe('Chelsie');
+  });
+
+  it('takes the native audio switch from the catalog default', () => {
+    const doc = makeDoc([videoNode('v')], []);
+    expect(nodeParams(doc.nodes.v, 'video.generate', { id: 'MiniMax-H3' }).generateAudio).toBe(true);
+    expect(nodeParams(doc.nodes.v, 'video.generate', { id: 'doubao-seedance-1-0-pro-250528' }).generateAudio).toBe(false);
+  });
+
+  it('takes the resolution from the catalog default', () => {
+    const doc = makeDoc([videoNode('v')], []);
+    const seedance = nodeParams(doc.nodes.v, 'video.generate', { id: 'doubao-seedance-1-0-pro-250528' });
+    expect(seedance.resolution).toBe('720p');
   });
 });
 

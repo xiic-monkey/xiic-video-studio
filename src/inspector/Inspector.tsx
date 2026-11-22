@@ -147,8 +147,9 @@ export function Inspector() {
 
   const splitSource = latestRun ? selectedAssetOf(latestRun) : undefined;
   const splitLayout = node ? splitLayoutFor(node) : undefined;
-  const views = node ? viewsOf(node) : [];
-  const referenceIds = node ? referenceIdsOf(node) : [];
+  // viewsOf 每次都返回新数组：不 memo 的话下面取缩略图的 effect 每次渲染都会重跑。
+  const views = useMemo(() => (node ? viewsOf(node) : []), [node]);
+  const referenceIds = useMemo(() => (node ? referenceIdsOf(node) : []), [node]);
   const maskNode = Boolean(node && isMaskNode(node));
   const maskSourceId = board && nodeId ? sourceAssetIdOf(board, nodeId, Object.values(runs)) : undefined;
   const maskAssetId = node ? maskAssetIdOf(node) : undefined;

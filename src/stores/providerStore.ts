@@ -25,6 +25,29 @@ export function bindingOf(profile: ProviderProfile, modelId: string): ModelConfi
   return profile.models.find((model) => model.id === modelId);
 }
 
+/**
+ * 按目录补齐绑定里缺失的能力。
+ *
+ * 目录是唯一真源：目录新增能力后，老绑定里没有对应项，后端会跳过这家供应商，
+ * 前端也会把它判成不支持。补齐的是「目录声明的能力」，不动用户已有的覆盖值。
+ */
+export function syncCatalogCapabilities(profile: ProviderProfile): {
+  profile: ProviderProfile;
+  changed: boolean;
+} {
+  let changed = false;
+  const models = profile.models.map((binding) => {
+    const catalog = catalogModel(binding.id);
+    if (!catalog) return binding;
+    const owned = new Set(binding.capabilities.map((item) => item.capability));
+    const missing = catalog.capabilities.filter((item) => !owned.has(item.capability));
+    if (!missing.length) return binding;
+    changed = true;
+    return { ...binding, capabilities: [...binding.capabilities, ...missing] };
+  });
+  return { profile: changed ? { ...profile, models } : profile, changed };
+}
+
 /** 旧版 profile 只有一个 Key，这里补成一条可编辑的记录。 */
 export function normalizedKeys(profile: ProviderProfile): ProviderKey[] {
   if (profile.keys?.length) return profile.keys;
@@ -78,6 +101,14 @@ export const useProviderStore = create<ProviderState>((set, get) => ({
       if (!profiles.length) {
         for (const profile of DEFAULT_PROVIDERS) await saveProviderProfile(profile);
         profiles = await listProviderProfiles();
+      }
+      // 目录新增能力后，老绑定要补齐，否则后端会跳过这家供应商。
+      for (const profile of profiles) {
+        const synced = syncCatalogCapabilities(profile);
+        if (synced.changed) {
+          await saveProviderProfile(synced.profile);
+          profiles = profiles.map((item) => (item.id === synced.profile.id ? synced.profile : item));
+        }
       }
       const hasKeys: Record<string, boolean> = {};
       for (const profile of profiles) {
@@ -161,6 +192,13 @@ export const useProviderStore = create<ProviderState>((set, get) => ({
       enabled: true,
     };
     const merged: ModelConfig = { ...base, ...patch };
+    // 目录声明的能力要补齐：用户手动加模型时也要拿到完整的能力集。
+    if (catalog) {
+      const capabilities = merged.capabilities ?? [];
+      const owned = new Set(capabilities.map((item) => item.capability));
+      const missing = catalog.capabilities.filter((item) => !owned.has(item.capability));
+      if (missing.length) merged.capabilities = [...capabilities, ...missing];
+    }
     const models = existing
       ? profile.models.map((model) => (model.id === modelId ? merged : model))
       : [...profile.models, merged];

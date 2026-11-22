@@ -2,9 +2,12 @@ import { describe, expect, it } from 'vitest';
 import {
   CATALOG,
   PROTOCOL_IDS,
+  TEXT_PROTOCOL_PARAM_MAP,
   capabilityProtocols,
   catalogCapability,
+  catalogModel,
   catalogModelsFor,
+  catalogParamOptions,
   catalogParams,
   protocolLabel,
 } from './catalog';
@@ -77,5 +80,27 @@ describe('model catalog', () => {
       expect(label.length, protocol).toBeGreaterThan(0);
       expect(label, protocol).not.toBe(protocol);
     }
+  });
+
+  it('declares the ark image submit path for seedream', () => {
+    // 火山方舟的图片接口在 /api/v3 下，不是 /v1。
+    expect(catalogModel('seedream-4.0')?.defaults?.submitPath).toBe('/api/v3/images/generations');
+  });
+
+  it('maps the params each text protocol can read', () => {
+    expect(TEXT_PROTOCOL_PARAM_MAP['openai-chat']).toEqual(['temperature', 'maxTokens']);
+    expect(TEXT_PROTOCOL_PARAM_MAP['anthropic-messages']).toEqual(['temperature', 'maxTokens']);
+  });
+
+  it('exposes the catalog param options and defaults', () => {
+    const options = catalogParamOptions('doubao-seedance-1-0-pro-250528', 'video.generate', 'resolution');
+    expect(options?.map((option) => option.value)).toEqual(['480p', '720p', '1080p']);
+    // 没有选项的参数返回 undefined。
+    expect(catalogParamOptions('gpt-4o-mini', 'text.chat', 'temperature')).toBeUndefined();
+  });
+
+  it('marks seedance as a model without native audio', () => {
+    expect(catalogCapability('doubao-seedance-1-0-pro-250528', 'video.generate')?.supportsNativeAudio).toBe(false);
+    expect(catalogCapability('MiniMax-H3', 'video.generate')?.supportsNativeAudio).toBe(true);
   });
 });

@@ -56,7 +56,7 @@ pub struct StartRunRequest {
     /// 空串表示自动路由：由后端按模型下各供应商的顺序逐家尝试。
     pub provider_id: String,
     pub model: String,
-    /// 前端按目录解析出的协议；非空时以它为准（目录只在前端维护）。
+    /// 前端按目录解析出的协议；绑定里显式配的协议优先于它。
     #[serde(default)]
     pub protocol: String,
     pub prompt_snapshot: Value,
@@ -509,6 +509,9 @@ fn run_with_attempts(
     tracked
 }
 
+/// 单个生成结果的下载上限（256 MB）：视频再大也不该把内存吃光。
+const MAX_OUTPUT_BYTES: u64 = 256 * 1024 * 1024;
+
 async fn store_outputs(
     app: &AppHandle,
     state: &AppState,
@@ -552,14 +555,27 @@ async fn store_outputs(
                 if !response.status().is_success() {
                     return Err(gateway::map_http_status(response.status(), "", "结果下载"));
                 }
-                (
-                    response
-                        .bytes()
-                        .await
-                        .map_err(|error| gateway::map_reqwest(error, "结果下载"))?
-                        .to_vec(),
-                    output.mime.clone(),
-                )
+                // 下载结果要有上限：供应商返回超大文件时不能把内存吃光。
+                let length = response.content_length().unwrap_or_default() as u64;
+                if length > MAX_OUTPUT_BYTES {
+                    return Err(AppError::new(
+                        "DOWNLOAD_TOO_LARGE",
+                        "生成结果超过下载上限",
+                        false,
+                    ));
+                }
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|error| gateway::map_reqwest(error, "结果下载"))?;
+                if bytes.len() as u64 > MAX_OUTPUT_BYTES {
+                    return Err(AppError::new(
+                        "DOWNLOAD_TOO_LARGE",
+                        "生成结果超过下载上限",
+                        false,
+                    ));
+                }
+                (bytes.to_vec(), output.mime.clone())
             }
             (None, None) => {
                 return Err(AppError::new(
@@ -817,18 +833,65 @@ pub fn request_is_async(
         .unwrap_or(false)
 }
 
-/// 把某个 Key 标记为失效（401 之后不再尝试这个 Key）。
-pub fn mark_key_invalid(state: &AppState, provider_id: &str, key_id: &str) -> Result<(), String> {
-    let Some(mut profile) = load_provider_profile(state, provider_id)? else {
-        return Ok(());
-    };
-    let Some(key) = profile.keys.iter_mut().find(|item| item.id == key_id) else {
-        return Ok(());
-    };
-    if key.status == "invalid" {
-        return Ok(());
+/// 读取供应商 profile 的原始 JSON。
+///
+/// 不经过 `ProviderProfile` 结构体：结构体只建模了部分字段，反序列化再序列化
+/// 会丢掉绑定参数、能力上限等配置。
+pub fn load_provider_profile_json(
+    state: &AppState,
+    provider_id: &str,
+) -> Result<Option<Value>, String> {
+    let path = db_path(state)?;
+    let connection = db::open(&path)?;
+    let mut statement = connection
+        .prepare("SELECT payload FROM provider_profiles WHERE id=?1")
+        .map_err(|error| error.to_string())?;
+    let mut rows = statement
+        .query([provider_id])
+        .map_err(|error| error.to_string())?;
+    match rows.next().map_err(|error| error.to_string())? {
+        Some(row) => {
+            let payload: String = row.get(0).map_err(|error| error.to_string())?;
+            Ok(Some(
+                serde_json::from_str(&payload).map_err(|error| error.to_string())?,
+            ))
+        }
+        None => Ok(None),
     }
-    key.status = "invalid".to_string();
+}
+
+/// 只改某个 Key 的状态字段，其余配置原样保留。
+pub fn patch_key_status(
+    state: &AppState,
+    provider_id: &str,
+    key_id: &str,
+    status: &str,
+    cooldown_until: Option<String>,
+) -> Result<bool, String> {
+    let Some(mut profile) = load_provider_profile_json(state, provider_id)? else {
+        return Ok(false);
+    };
+    let Some(keys) = profile.get_mut("keys").and_then(Value::as_array_mut) else {
+        return Ok(false);
+    };
+    let Some(key) = keys
+        .iter_mut()
+        .find(|key| key.get("id").and_then(Value::as_str) == Some(key_id))
+    else {
+        return Ok(false);
+    };
+    let Some(object) = key.as_object_mut() else {
+        return Ok(false);
+    };
+    object.insert("status".to_string(), Value::String(status.to_string()));
+    match cooldown_until {
+        Some(until) => {
+            object.insert("cooldownUntil".to_string(), Value::String(until));
+        }
+        None => {
+            object.remove("cooldownUntil");
+        }
+    }
     let payload = serde_json::to_string(&profile).map_err(|error| error.to_string())?;
     let path = db_path(state)?;
     db::open(&path)?
@@ -837,29 +900,43 @@ pub fn mark_key_invalid(state: &AppState, provider_id: &str, key_id: &str) -> Re
             rusqlite::params![payload, chrono::Utc::now().to_rfc3339(), provider_id],
         )
         .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+/// 把某个 Key 标记为失效（401 之后不再尝试这个 Key）。
+pub fn mark_key_invalid(state: &AppState, provider_id: &str, key_id: &str) -> Result<(), String> {
+    // 已经是失效状态就不必再写一次。
+    if let Some(profile) = load_provider_profile_json(state, provider_id)? {
+        let already = profile
+            .get("keys")
+            .and_then(Value::as_array)
+            .and_then(|keys| {
+                keys.iter()
+                    .find(|key| key.get("id").and_then(Value::as_str) == Some(key_id))
+                    .and_then(|key| key.get("status"))
+                    .and_then(Value::as_str)
+                    .map(|status| status == "invalid")
+            })
+            .unwrap_or(false);
+        if already {
+            return Ok(());
+        }
+    }
+    patch_key_status(state, provider_id, key_id, "invalid", None)?;
     Ok(())
 }
 
-/// 把某个 Key 限时冷却：403 / 限流 / 服务不可用等临时错误不再立刻重试。
+/// 把某个 Key 限时冷却：限流 / 服务不可用等临时错误不再立刻重试。
 pub fn mark_key_cooldown(state: &AppState, provider_id: &str, key_id: &str) -> Result<(), String> {
-    let Some(mut profile) = load_provider_profile(state, provider_id)? else {
-        return Ok(());
-    };
-    let Some(key) = profile.keys.iter_mut().find(|item| item.id == key_id) else {
-        return Ok(());
-    };
-    key.status = "cooling".to_string();
-    key.cooldown_until = Some(
-        (chrono::Utc::now() + chrono::Duration::seconds(gateway::KEY_COOLDOWN_SECONDS)).to_rfc3339(),
-    );
-    let payload = serde_json::to_string(&profile).map_err(|error| error.to_string())?;
-    let path = db_path(state)?;
-    db::open(&path)?
-        .execute(
-            "UPDATE provider_profiles SET payload=?1, updated_at=?2 WHERE id=?3",
-            rusqlite::params![payload, chrono::Utc::now().to_rfc3339(), provider_id],
-        )
-        .map_err(|error| error.to_string())?;
+    let until = (chrono::Utc::now() + chrono::Duration::seconds(gateway::KEY_COOLDOWN_SECONDS))
+        .to_rfc3339();
+    patch_key_status(state, provider_id, key_id, "cooling", Some(until))?;
+    Ok(())
+}
+
+/// 把某个 Key 恢复成可用（用户重新填了密钥，或删掉了这个 Key）。
+pub fn reset_key_status(state: &AppState, provider_id: &str, key_id: &str) -> Result<(), String> {
+    patch_key_status(state, provider_id, key_id, "active", None)?;
     Ok(())
 }
 
@@ -999,6 +1076,70 @@ mod tests {
         request.protocol = "seedance-video".to_string();
         let overridden = expand_candidates(&state, &request).expect("overridden");
         assert!(overridden.iter().all(|candidate| candidate.protocol == "seedance-video"));
+    }
+
+    /// 改 Key 状态时不能顺手把用户配置的参数洗掉：
+    /// 结构体只建模了部分字段，整份覆盖会把绑定参数、能力上限抹掉。
+    #[test]
+    fn patching_a_key_status_keeps_the_rest_of_the_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::AppState {
+            db_path: std::sync::Mutex::new(dir.path().join("db.sqlite3")),
+            data_dir: dir.path().to_path_buf(),
+        };
+        let connection = db::open(&runs_db_path(&state)).expect("db");
+        let profile = json!({
+            "id": "p1",
+            "name": "P1",
+            "adapter": "openai-compatible",
+            "baseUrl": "https://example.com",
+            "auth": { "type": "bearer", "keyRef": "provider/p1" },
+            "enabled": true,
+            "schemaVersion": 2,
+            "models": [{
+                "id": "gpt-image-1",
+                "displayName": "GPT Image 1",
+                "params": [{ "key": "quality", "label": "质量", "type": "select" }],
+                "capabilities": [{
+                    "capability": "image.edit",
+                    "supportsMask": true,
+                    "maxReferenceImages": 4,
+                    "inputTransport": ["dataUrl"],
+                    "async": false
+                }]
+            }],
+            "keys": [{
+                "id": "k1", "label": "主", "keyRef": "provider/p1/key/k1",
+                "enabled": true, "status": "active"
+            }]
+        });
+        connection
+            .execute(
+                "INSERT INTO provider_profiles (id, adapter, base_url, enabled, payload, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    "p1", "openai-compatible", "https://example.com", 1,
+                    serde_json::to_string(&profile).expect("json"),
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )
+            .expect("insert");
+
+        mark_key_invalid(&state, "p1", "k1").expect("mark");
+        let stored = load_provider_profile_json(&state, "p1")
+            .expect("load")
+            .expect("profile");
+        assert_eq!(stored["keys"][0]["status"], "invalid");
+        // 状态之外的配置必须原样保留。
+        assert_eq!(stored["models"][0]["params"][0]["key"], "quality");
+        assert_eq!(stored["models"][0]["capabilities"][0]["supportsMask"], true);
+        assert_eq!(stored["models"][0]["capabilities"][0]["maxReferenceImages"], 4);
+
+        // 重新填密钥后要能恢复可用，否则这个 Key 永远被跳过。
+        reset_key_status(&state, "p1", "k1").expect("reset");
+        let restored = load_provider_profile_json(&state, "p1")
+            .expect("load")
+            .expect("profile");
+        assert_eq!(restored["keys"][0]["status"], "active");
     }
 
     /// 传输方式不匹配时换下一家，而不是把整次运行判死。

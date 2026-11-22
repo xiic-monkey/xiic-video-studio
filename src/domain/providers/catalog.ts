@@ -32,6 +32,18 @@ const TEXT_PARAMS: ParamDef[] = [
   { key: 'maxTokens', label: '最大输出 tokens', type: 'number', min: 256, max: 32768, step: 256, default: 4096 },
 ];
 
+/**
+ * 文本协议能读取的参数。
+ *
+ * 只有协议真正支持的参数才允许下发：协议读不到的参数改了也没用，
+ * 还会白白让缓存键失效（缓存键里含 params）。
+ */
+export const TEXT_PROTOCOL_PARAM_MAP: Record<string, string[]> = {
+  'openai-chat': ['temperature', 'maxTokens'],
+  'openai-responses': ['temperature', 'maxTokens'],
+  'anthropic-messages': ['temperature', 'maxTokens'],
+};
+
 const IMAGE_PARAMS: ParamDef[] = [
   {
     key: 'size', label: '尺寸', type: 'select',
@@ -79,6 +91,11 @@ const AUDIO_PARAMS: ParamDef[] = [
   },
   { key: 'speed', label: '语速', type: 'number', min: 0.5, max: 2, step: 0.1, default: 1 },
 ];
+
+/** MiMo 的音色名和 MiniMax 不一样，默认音色不能共用。 */
+const MIMO_AUDIO_PARAMS: ParamDef[] = AUDIO_PARAMS.map((param) => (
+  param.key === 'voice' ? { ...param, default: 'mimo_default' } : param
+));
 
 const RATIO_OPTIONS = (ratios: string[]) => ratios.map((value) => ({ label: value, value }));
 
@@ -287,6 +304,10 @@ export const CATALOG: CatalogModel[] = [
       },
     ],
     params: [...IMAGE_PARAMS],
+    defaults: {
+      // 火山方舟的图片接口在 /api/v3 下，不是 /v1。
+      submitPath: '/api/v3/images/generations',
+    },
     suggestedProviders: [
       { name: '火山方舟', baseUrl: 'https://ark.cn-beijing.volces.com', protocol: 'openai-images' },
     ],
@@ -352,6 +373,7 @@ export const CATALOG: CatalogModel[] = [
         maxReferenceImages: 10,
         supportsFirstFrame: true,
         supportsLastFrame: true,
+        supportsNativeAudio: false,
         durations: { min: 4, max: 30, step: 1 },
         ratios: ['21:9', '16:9', '4:3', '1:1', '3:4', '9:16', 'adaptive'],
         resolutions: ['480p', '720p', '1080p'],
@@ -416,7 +438,7 @@ export const CATALOG: CatalogModel[] = [
         protocols: ['mimo-tts'],
       },
     ],
-    params: [...AUDIO_PARAMS],
+    params: [...MIMO_AUDIO_PARAMS],
     suggestedProviders: [
       { name: '小米 MiMo', baseUrl: 'https://api.xiaomimimo.com', protocol: 'mimo-tts' },
     ],
@@ -468,4 +490,13 @@ export function catalogParams(id: string, capability: string): ParamDef[] {
 /** 某模型在某能力下支持的协议。 */
 export function capabilityProtocols(id: string, capability: string): ProtocolId[] {
   return catalogCapability(id, capability)?.protocols ?? [];
+}
+
+/** 目录参数里某个键的可选值（没有选项时返回 undefined）。 */
+export function catalogParamOptions(
+  id: string,
+  capability: string,
+  key: string,
+): Array<{ label: string; value: string }> | undefined {
+  return catalogParams(id, capability).find((param) => param.key === key)?.options;
 }

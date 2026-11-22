@@ -125,12 +125,16 @@ export interface StartRunInput {
   capability: string;
   providerId: string;
   model: string;
+  /** 前端按目录解析出的协议；绑定里显式配的协议优先于它。 */
+  protocol?: string;
   promptSnapshot: RunRecord['promptSnapshot'];
   params: Record<string, unknown>;
   inputs: RunInput[];
   inputAssetIds: string[];
   cacheKey: string;
   cachedAssetId?: string;
+  /** 节点级参考图（拆帧出来的视角），由后端按资产 id 解析。 */
+  referenceAssetIds?: string[];
 }
 
 export async function startRun(request: StartRunInput): Promise<RunRecord> {

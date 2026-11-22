@@ -1,13 +1,13 @@
 import type { CacheContext, NodeRuntimeConfig } from '../graph/cacheKey';
 import { capabilityOf } from '../providers/capabilities';
-import { catalogParams } from '../providers/catalog';
+import { catalogCapability, catalogParams, TEXT_PROTOCOL_PARAM_MAP } from '../providers/catalog';
 import {
-  autoModels, effectiveCapability, effectiveModel, planRoute, type RoutePlan,
+  autoModels, effectiveCapability, effectiveModel, keyIsCooling, planRoute, type RoutePlan,
 } from '../providers/routing';
 import type { Issue } from '../nodes/types';
 import type {
-  BoardDoc, BoardNode, ModelCapability, ModelConfig, ProtocolId, ProviderProfile, RunRecord,
-  RunStatus, StyleGuide,
+  BoardDoc, BoardNode, ModelCapability, ModelConfig, ProtocolId, ProviderKey, ProviderProfile,
+  RunRecord, RunStatus, StyleGuide,
 } from '../types';
 
 const error = (code: string, message: string): Issue => ({ code, message, severity: 'error' });
@@ -38,6 +38,29 @@ export interface ResolvedModel {
 }
 
 export type ModelResolution = { ok: true; resolved: ResolvedModel } | { ok: false; issue: Issue };
+
+/**
+ * 这个供应商为什么一个可用 Key 都没有。
+ *
+ * Key 列表为空有四种原因（停用 / 失效 / 没填密钥 / 冷却），提示必须说准，
+ * 否则用户会照着「稍后重试」一直等一个永远不恢复的 Key。
+ */
+export function providerKeysUnavailable(providerName: string, keys: ProviderKey[]): Issue {
+  if (!keys.length) return error('PROVIDER_KEY_MISSING', `${providerName} 尚未保存 API Key`);
+  const cooling = keys.filter((key) => keyIsCooling(key));
+  if (cooling.length) {
+    return error('PROVIDER_KEY_COOLING', `${providerName} 的 ${cooling.length} 个 API Key 正在冷却中，请稍后重试`);
+  }
+  const withoutSecret = keys.filter((key) => key.hasSecret === false);
+  if (withoutSecret.length) {
+    return error('PROVIDER_KEY_MISSING', `${providerName} 的 ${withoutSecret.length} 个 API Key 还没填写密钥`);
+  }
+  const invalid = keys.filter((key) => key.status === 'invalid');
+  if (invalid.length) {
+    return error('PROVIDER_KEY_INVALID', `${providerName} 的 ${invalid.length} 个 API Key 已失效，请重新填写`);
+  }
+  return error('PROVIDER_KEY_MISSING', `${providerName} 暂无可用的 API Key`);
+}
 
 export function runCapability(doc: BoardDoc, node: BoardNode): string | undefined {
   if (node.type === 'text') return 'text.chat';
@@ -98,13 +121,7 @@ export function resolveModel(
   if (!usable.length) {
     const first = plan.candidates[0];
     const known = profiles.find((profile) => profile.id === first.providerId)?.keys ?? [];
-    const cooling = known.length > 0 && first.keys.length === 0;
-    return {
-      ok: false,
-      issue: cooling
-        ? error('PROVIDER_KEY_COOLING', `${first.providerName} 的所有 API Key 都在冷却中，请稍后重试`)
-        : error('PROVIDER_KEY_MISSING', `${first.providerName} 尚未保存 API Key`),
-    };
+    return { ok: false, issue: providerKeysUnavailable(first.providerName, known) };
   }
 
   const primary = usable[0];
@@ -145,8 +162,16 @@ export function nodeParams(
     }
   }
   switch (capability) {
-    case 'text.chat':
-      return { ...catalog, system: String(node.data.system ?? '') };
+    case 'text.chat': {
+      // 只下发协议真正读得到的参数：读不到改了也没用，还会白白让缓存失效。
+      const protocol = model?.id ? catalogCapability(model.id, 'text.chat')?.protocols?.[0] : undefined;
+      const allowed = protocol ? TEXT_PROTOCOL_PARAM_MAP[protocol] ?? [] : [];
+      const params: Record<string, unknown> = { system: String(node.data.system ?? '') };
+      for (const key of allowed) {
+        if (catalog[key] !== undefined) params[key] = catalog[key];
+      }
+      return params;
+    }
     case 'image.generate':
     case 'image.edit': {
       const layout = String(node.data.layout ?? '');
@@ -159,19 +184,25 @@ export function nodeParams(
         size,
       };
     }
-    case 'audio.tts':
+    case 'audio.tts': {
+      // 音色：节点填的 → 目录默认值（各家后端各认各的音色） → 兜底。
+      const voice = String(node.data.voice ?? '').trim() || String(catalog.voice ?? '').trim() || 'alloy';
       return {
         ...catalog,
-        voice: String(node.data.voice ?? 'alloy'),
+        voice,
         format: String(node.data.format ?? 'mp3'),
         text: String(node.data.text ?? ''),
       };
+    }
     case 'video.generate': {
       const durations = limit?.durations;
       const ratios = limit?.ratios;
       const resolutions = limit?.resolutions;
       const duration = Number(node.data.duration ?? durations?.min ?? 5);
-      const resolution = String(node.data.resolution ?? resolutions?.[0] ?? '768P');
+      const resolution = String(node.data.resolution ?? '').trim()
+        || String(catalog.resolution ?? '').trim()
+        || resolutions?.[0]
+        || '768P';
       const ratio = String(node.data.aspectRatio ?? (ratios?.includes('9:16') ? '9:16' : ratios?.[0] ?? '9:16'));
       return {
         ...catalog,
@@ -179,7 +210,8 @@ export function nodeParams(
         duration,
         resolution,
         ratio,
-        generateAudio: Boolean(node.data.generateAudio ?? true),
+        // 原生音频听模型的：目录默认是什么就是什么。
+        generateAudio: Boolean(node.data.generateAudio ?? catalog.generateAudio ?? false),
       };
     }
     default:

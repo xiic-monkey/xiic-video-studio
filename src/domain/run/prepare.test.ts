@@ -244,6 +244,106 @@ describe('prepareRun', () => {
     if (!outcome.ok) expect(outcome.issues.map((issue) => issue.code)).toContain('PARAM_REFERENCE_LIMIT');
   });
 
+  it('counts the style reference against the image quota', () => {
+    const refs = Array.from({ length: 4 }, (_, index) => node(`r${index}`, 'image'));
+    const doc = makeDoc(
+      [...refs, node('i', 'image', { prompt: '融合参考' })],
+      [
+        ...refs.map((ref, index) => edge(`e${index}`, ref.id, 'i', 'image', 'references', 'reference_image')),
+        edge('estyle', 'r0', 'i', 'image', 'style', 'style_ref'),
+      ],
+    );
+    const outcome = prepareRun(doc, 'i', deps({
+      runs: refs.map((ref, index) => succeededRun(ref.id, `asset_${index}`)),
+      assets: Object.fromEntries(refs.map((_, index) => [`asset_${index}`, assetRef(`asset_${index}`, 'image', 'image/png')])),
+    }));
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.issues.map((issue) => issue.code)).toContain('PARAM_REFERENCE_LIMIT');
+  });
+
+  it('blocks the first-last-frame mode when node-level references are present', () => {
+    const doc = makeDoc(
+      [
+        node('f1', 'image'), node('f2', 'image'),
+        videoNode('v', { mode: 'firstLast', referenceAssetIds: ['asset_ref'] }),
+      ],
+      [
+        edge('e1', 'f1', 'v', 'image', 'start', 'first_frame'),
+        edge('e2', 'f2', 'v', 'image', 'end', 'last_frame'),
+      ],
+    );
+    const outcome = prepareRun(doc, 'v', deps({
+      assetHost: S3_HOST,
+      runs: [succeededRun('f1', 'asset_f1'), succeededRun('f2', 'asset_f2')],
+      assets: {
+        asset_f1: assetRef('asset_f1', 'image', 'image/png'),
+        asset_f2: assetRef('asset_f2', 'image', 'image/png'),
+      },
+    }));
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.issues.map((issue) => issue.code)).toContain('PARAM_MODE_CONFLICT');
+      expect(outcome.issues[0].message).toContain('首尾帧模式下不能同时使用参考图');
+    }
+  });
+
+  it('blocks the native audio switch for a model without native audio', () => {
+    const seedance: ProviderProfile = {
+      ...TEST_PROFILES[1],
+      models: [{
+        id: 'doubao-seedance-1-0-pro-250528',
+        displayName: 'Seedance 1.0 Pro',
+        capabilities: [{
+          capability: 'video.generate',
+          modes: ['t2v', 'firstLast', 'reference'],
+          durations: { min: 4, max: 30, step: 1 },
+          ratios: ['16:9', '9:16'],
+          resolutions: ['480p', '720p', '1080p'],
+          supportsNativeAudio: false,
+          inputTransport: ['publicUrl'],
+          async: true,
+        }],
+      }],
+    };
+    const doc = makeDoc([videoNode('v', { generateAudio: true })], []);
+    const outcome = prepareRun(doc, 'v', deps({
+      profiles: [seedance],
+      hasKeys: { 'minimax-h3': true },
+    }));
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.issues.map((issue) => issue.code)).toContain('PARAM_MODE_UNSUPPORTED');
+      expect(outcome.issues[0].message).toContain('不支持生成原生音频');
+    }
+  });
+
+  it('sends the catalog resolution when the node has none', () => {
+    const seedance: ProviderProfile = {
+      ...TEST_PROFILES[1],
+      models: [{
+        id: 'doubao-seedance-1-0-pro-250528',
+        displayName: 'Seedance 1.0 Pro',
+        capabilities: [{
+          capability: 'video.generate',
+          modes: ['t2v', 'firstLast', 'reference'],
+          durations: { min: 4, max: 30, step: 1 },
+          ratios: ['16:9', '9:16'],
+          resolutions: ['480p', '720p', '1080p'],
+          inputTransport: ['publicUrl'],
+          async: true,
+        }],
+      }],
+    };
+    const doc = makeDoc([videoNode('v')], []);
+    const outcome = prepareRun(doc, 'v', deps({
+      profiles: [seedance],
+      hasKeys: { 'minimax-h3': true },
+    }));
+    if (!outcome.ok) throw new Error(outcome.issues.map((issue) => issue.message).join('；'));
+    expect(outcome.request.params.resolution).toBe('720p');
+    expect(outcome.request.params.generateAudio).toBe(false);
+  });
+
   it('estimates cost from the priced capability', () => {
     const doc = makeDoc([node('i', 'image', { prompt: '海报', count: 3 })], []);
     const outcome = prepareRun(doc, 'i', deps());

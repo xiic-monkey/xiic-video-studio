@@ -63,7 +63,17 @@ function imageNode(): NodeDefinition<ImageNodeData> {
   };
 }
 
-function videoNode(): NodeDefinition<VideoNodeData> {
+/**
+ * 视频节点数据。
+ *
+ * generateAudio 与 resolution 不写死：两者的默认值都来自目录里的模型参数。
+ */
+type VideoNodeDefaults = Omit<VideoNodeData, 'generateAudio' | 'resolution'> & {
+  generateAudio?: boolean;
+  resolution?: string;
+};
+
+function videoNode(): NodeDefinition<VideoNodeDefaults> {
   return {
     type: 'video', typeVersion: 1, title: '视频', category: 'media',
     inputs: [
@@ -82,7 +92,7 @@ function videoNode(): NodeDefinition<VideoNodeData> {
         { label: '文生视频', value: 't2v' }, { label: '首尾帧', value: 'firstLast' },
         { label: '全能参考', value: 'reference' },
       ] },
-      { key: 'duration', label: '时长（秒）', type: 'number', min: 5, max: 15, step: 1 },
+      { key: 'duration', label: '时长（秒）', type: 'number', min: 1, step: 1 },
       { key: 'resolution', label: '分辨率', type: 'select', options: [
         { label: '768P', value: '768P' }, { label: '2K', value: '2K' },
       ] },
@@ -94,14 +104,14 @@ function videoNode(): NodeDefinition<VideoNodeData> {
       { key: 'generateAudio', label: '生成原生音频', type: 'toggle' },
     ],
     createDefaults: () => ({
-      prompt: '', negative: '', mode: 't2v', duration: 6, resolution: '768P',
-      aspectRatio: '9:16', generateAudio: true,
+      prompt: '', negative: '', mode: 't2v', duration: 6, aspectRatio: '9:16',
     }),
     validate: (node) => {
       const issues: Issue[] = [];
+      // 时长范围按所选模型的能力在运行前校验，这里只保证是正整数。
       const duration = Number(node.data.duration ?? 0);
-      if (!Number.isInteger(duration) || duration < 5 || duration > 15) {
-        issues.push(missing('PARAM_DURATION_RANGE', 'H3 时长需为 5–15 的整数秒'));
+      if (!Number.isInteger(duration) || duration <= 0) {
+        issues.push(missing('PARAM_DURATION_RANGE', '时长需为正整数秒'));
       }
       return issues;
     },
@@ -124,7 +134,7 @@ function audioNode(): NodeDefinition<AudioNodeData> {
         { label: 'MP3', value: 'mp3' }, { label: 'WAV', value: 'wav' },
       ] },
     ],
-    createDefaults: () => ({ text: '', voice: 'alloy', format: 'mp3' }),
+    createDefaults: () => ({ text: '', voice: '', format: 'mp3' }),
     validate: () => [],
     actions: [{ key: 'generate', label: '生成语音', capability: 'audio.tts' }],
   };

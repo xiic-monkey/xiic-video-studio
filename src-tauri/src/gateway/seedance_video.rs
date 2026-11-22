@@ -36,13 +36,17 @@ pub async fn execute(
         }));
     }
 
-    let body = json!({
+    let mut body = json!({
         "model": request.model,
         "content": content,
         "ratio": request.params.get("ratio").and_then(Value::as_str).unwrap_or("9:16"),
         "duration": request.params.get("duration").and_then(Value::as_i64).unwrap_or(5),
         "generate_audio": request.params.get("generateAudio").and_then(Value::as_bool).unwrap_or(false)
     });
+    // 分辨率：目录里选的值要真的发出去，否则 1080p 会被悄悄降级。
+    if let Some(resolution) = request.params.get("resolution").and_then(Value::as_str) {
+        body["resolution"] = json!(resolution);
+    }
 
     let response = client
         .post(join_path(&runtime.profile.base_url, &submit_path))

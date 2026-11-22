@@ -92,6 +92,16 @@ pub async fn poll(
                 data: None,
             })
             .collect();
+        // 成功但没有图：不能当成功。百炼可能返回 SUCCEEDED 却没有结果，
+        // 或者结果里 code != 200 —— 当成成功会让节点拿到空结果。
+        if outputs.is_empty() {
+            return Err(AppError::new(
+                "PROVIDER_BAD_RESPONSE",
+                "任务已结束但没有返回图片",
+                false,
+            )
+            .with_raw(value.to_string()));
+        }
         return Ok(JobStatus {
             status: "succeeded".to_string(),
             progress: Some(100.0),
@@ -357,5 +367,27 @@ mod tests {
         cancel(&reqwest::Client::new(), &runtime(&server.uri()), &model(), "task-abc")
             .await
             .expect("cancel");
+    }
+
+    /// 任务成功但没有图片：不能判成功，否则节点拿到空结果。
+    #[tokio::test]
+    async fn succeeded_without_a_picture_is_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/tasks/task_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "output": { "task_status": "SUCCEEDED", "results": [] }
+            })))
+            .mount(&server)
+            .await;
+        let error = poll(
+            &reqwest::Client::new(),
+            &runtime(&server.uri()),
+            &model(),
+            "task_1",
+        )
+        .await
+        .expect_err("empty output");
+        assert_eq!(error.code, "PROVIDER_BAD_RESPONSE");
     }
 }

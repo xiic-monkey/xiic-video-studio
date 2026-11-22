@@ -181,7 +181,7 @@ fn redact_secret_values(value: &mut Value, secrets: &[String]) {
 /// 读不到就跳过：钥匙串不可用不该让导出失败。
 fn secret_values(connection: &Connection, state: &AppState) -> Vec<String> {
     let mut secrets: Vec<String> = Vec::new();
-    let provider_ids: Vec<String> = {
+    let profiles: Vec<Value> = {
         let Ok(mut statement) = connection.prepare("SELECT payload FROM provider_profiles") else {
             return Vec::new();
         };
@@ -191,17 +191,30 @@ fn secret_values(connection: &Connection, state: &AppState) -> Vec<String> {
         };
         rows.filter_map(|row| row.ok())
             .filter_map(|payload| serde_json::from_str::<Value>(&payload).ok())
-            .filter_map(|profile| {
-                profile
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
             .collect()
     };
-    for provider_id in provider_ids {
-        if let Ok(Some(key)) = crate::provider_credential(&provider_id) {
+    for profile in profiles {
+        let Some(provider_id) = profile.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        // 旧版 profile：单个密钥，账户名就是 provider/{id}。
+        if let Ok(Some(key)) = crate::provider_credential(provider_id) {
             secrets.push(key);
+        }
+        // 新版 profile：每个 Key 一个账户 provider/{id}/key/{keyId}，一个都不能漏。
+        if let Some(keys) = profile.get("keys").and_then(Value::as_array) {
+            for key in keys {
+                let key_id = key.get("id").and_then(Value::as_str).unwrap_or("");
+                let key_ref = key.get("keyRef").and_then(Value::as_str).unwrap_or("").trim();
+                let resolved = if key_ref.is_empty() {
+                    format!("provider/{provider_id}/key/{key_id}")
+                } else {
+                    key_ref.to_string()
+                };
+                if let Some(secret) = crate::provider_key_secret(&resolved) {
+                    secrets.push(secret);
+                }
+            }
         }
     }
     secrets.extend(crate::asset_host_secrets(state));

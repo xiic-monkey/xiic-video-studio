@@ -65,7 +65,10 @@ export function protocolOf(
 /**
  * 生效的能力定义：目录给基线，绑定可以覆盖。
  *
- * 目录里没有这个模型时（例如用户自建的中转模型），直接用绑定自身的定义。
+ * 口径与后端一致（runs.rs 展开候选时只看绑定）：
+ * - 没有绑定对象时回落目录基线；
+ * - 绑定存在但缺这项能力时返回 undefined：这个供应商会被后端跳过，
+ *   前端不能把它当成可用模型。
  */
 export function effectiveCapability(
   modelId: string,
@@ -73,9 +76,10 @@ export function effectiveCapability(
   capability: string,
 ): ModelCapability | undefined {
   const base = catalogCapability(modelId, capability);
-  const own = binding?.capabilities.find((item) => item.capability === capability);
+  if (!binding) return base;
+  const own = binding.capabilities.find((item) => item.capability === capability);
+  if (!own) return undefined;
   if (!base) return own;
-  if (!own) return base;
   return { ...base, ...own, protocols: own.protocols ?? base.protocols };
 }
 
