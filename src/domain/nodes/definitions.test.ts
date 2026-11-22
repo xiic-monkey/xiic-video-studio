@@ -5,8 +5,8 @@ describe('node definitions', () => {
   it('registers the primitive nodes plus the business ones', () => {
     expect(listNodeDefinitions().map((def) => def.type).sort())
       .toEqual([
-        'audio', 'character', 'continuity', 'coverage', 'expression', 'group', 'image', 'inpaint', 'note',
-        'redraw', 'script', 'storyboard', 'text', 'turnaround', 'variant', 'video',
+        'audio', 'character', 'continuity', 'coverage', 'expression', 'group', 'image', 'inpaint',
+        'media_source', 'note', 'redraw', 'script', 'storyboard', 'text', 'turnaround', 'variant', 'video',
       ]);
   });
 

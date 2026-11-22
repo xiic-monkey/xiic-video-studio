@@ -21,11 +21,7 @@
       }
     ],
     "security": {
-      "assetProtocol": {
-        "enable": true,
-        "scope": ["$APPDATA/assets/**"]
-      },
-      "csp": "default-src 'self' https: data: blob:; img-src 'self' https: data: blob:; style-src 'self' 'unsafe-inline' https:; font-src 'self' https: data:; connect-src 'self' https:; media-src 'self' https: data: blob:"
+      "csp": "default-src 'self' https: data: blob:; img-src 'self' https: data: blob: frameforge-media:; style-src 'self' 'unsafe-inline' https:; font-src 'self' https: data:; connect-src 'self' https:; media-src 'self' https: data: blob: frameforge-media:"
     }
   },
   "bundle": {

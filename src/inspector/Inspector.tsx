@@ -160,7 +160,7 @@ export function Inspector() {
       setMaskUrl('');
       return;
     }
-    void assetThumbUrl(maskAssetId).then((url) => {
+    void assetThumbUrl(project?.id ?? '', maskAssetId).then((url) => {
       if (alive) setMaskUrl(url);
     }).catch(() => undefined);
     return () => { alive = false; };
@@ -171,7 +171,7 @@ export function Inspector() {
     const missing = views.filter((view) => !viewThumbs[view.assetId]);
     if (!missing.length) return;
     void Promise.all(missing.map(async (view) => {
-      const url = await assetThumbUrl(view.assetId);
+      const url = await assetThumbUrl(project?.id ?? '', view.assetId);
       return [view.assetId, url] as const;
     })).then((entries) => {
       if (alive) setViewThumbs((items) => ({ ...items, ...Object.fromEntries(entries) }));

@@ -1,5 +1,6 @@
 import { sha256Json } from '../hash';
 import { getNodeDefinition } from '../nodes/definitions';
+import { resolveNodeOutput } from './output';
 import type { BoardDoc, RunRecord, StyleGuide } from '../types';
 
 export interface NodeRuntimeConfig {
@@ -42,7 +43,7 @@ export function computeCacheKey(doc: BoardDoc, nodeId: string, ctx: CacheContext
     .filter((item) => item.target === nodeId)
     .sort((left, right) => left.targetPort.localeCompare(right.targetPort) || left.id.localeCompare(right.id));
   const inputHashes = inbound.map((item) =>
-    `${item.targetPort}:${selectedAssetOf(latestSucceededRun(ctx.runs, item.source)) ?? 'missing'}`);
+    `${item.targetPort}:${resolveNodeOutput(doc.nodes[item.source], item.sourcePort, ctx.runs) ?? 'missing'}`);
   const nodeData = Object.fromEntries(Object.entries(node.data).filter(([key]) => !EXCLUDED_NODE_KEYS.has(key)));
   const runtime = ctx.runtime[nodeId] ?? { params: {} };
   return sha256Json({

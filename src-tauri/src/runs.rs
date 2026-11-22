@@ -1,6 +1,7 @@
 use crate::assets::{self, AssetRef};
 use crate::db;
 use crate::gateway::{self, AppError};
+use crate::production::repository::{record_asset_membership, AssetOrigin};
 use crate::security;
 use crate::AppState;
 use serde::{Deserialize, Serialize};
@@ -52,6 +53,13 @@ pub struct StartRunRequest {
     pub project_id: String,
     pub board_id: String,
     pub node_id: String,
+    /// Optional production entity association. When present, the backend verifies
+    /// that the entity belongs to the same project before creating the run.
+    #[serde(default)]
+    pub entity_id: Option<String>,
+    /// User-visible production action (for example `video` or `storyboard`).
+    #[serde(default)]
+    pub action: Option<String>,
     pub capability: String,
     /// 空串表示自动路由：由后端按模型下各供应商的顺序逐家尝试。
     pub provider_id: String,
@@ -120,8 +128,8 @@ pub fn create_run(state: &AppState, request: &StartRunRequest) -> Result<RunReco
         project_id: request.project_id.clone(),
         board_id: request.board_id.clone(),
         node_id: request.node_id.clone(),
-        entity_id: None,
-        action: "generate".to_string(),
+        entity_id: request.entity_id.clone(),
+        action: request.action.clone().unwrap_or_else(|| "generate".to_string()),
         cache_key: request.cache_key.clone(),
         status: "queued".to_string(),
         provider_id: Some(request.provider_id.clone()),
@@ -174,7 +182,9 @@ pub fn load_run(state: &AppState, run_id: &str) -> Result<RunRecord, String> {
     let path = db_path(state)?;
     let connection = db::open(&path)?;
     let payload: String = connection
-        .query_row("SELECT payload FROM runs WHERE id=?1", [run_id], |row| row.get(0))
+        .query_row("SELECT payload FROM runs WHERE id=?1", [run_id], |row| {
+            row.get(0)
+        })
         .map_err(|error| error.to_string())?;
     serde_json::from_str(&payload).map_err(|error| error.to_string())
 }
@@ -224,7 +234,9 @@ pub fn mark_cancelled(state: &AppState, run_id: &str) -> Result<RunRecord, Strin
 /// 把它当成「提交阶段被中断」，反过来把已经成功的运行改判成失败。
 fn close_jobs_for_run(state: &AppState, run_id: &str, status: &str) {
     let Ok(path) = db_path(state) else { return };
-    let Ok(connection) = db::open(&path) else { return };
+    let Ok(connection) = db::open(&path) else {
+        return;
+    };
     let _ = connection.execute(
         "UPDATE jobs SET status=?1, updated_at=?2 WHERE run_id=?3 AND status IN ('queued','submitted','polling')",
         rusqlite::params![status, chrono::Utc::now().to_rfc3339(), run_id],
@@ -266,9 +278,11 @@ async fn prepare_inputs(
     let mut prepared = Vec::new();
     for input in &request.inputs {
         let payload: String = connection
-            .query_row("SELECT payload FROM assets WHERE id=?1", [&input.asset_id], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT payload FROM assets WHERE id=?1",
+                [&input.asset_id],
+                |row| row.get(0),
+            )
             .map_err(|_| {
                 AppError::new(
                     "STORAGE_ASSET_MISSING",
@@ -278,9 +292,13 @@ async fn prepare_inputs(
             })?;
         let asset: AssetRef = serde_json::from_str(&payload)
             .map_err(|error| AppError::new("STORAGE_ASSET_CORRUPT", error.to_string(), false))?;
-        let transport =
-            gateway::transport::prepare_input(&state.data_dir, &asset, &capability.input_transport, host)
-                .await?;
+        let transport = gateway::transport::prepare_input(
+            &state.data_dir,
+            &asset,
+            &capability.input_transport,
+            host,
+        )
+        .await?;
         prepared.push(gateway::PreparedInput {
             role: input.role.clone(),
             kind: asset.kind.clone(),
@@ -291,9 +309,11 @@ async fn prepare_inputs(
     // 节点级参考图：拆帧出来的视角、锁版后的角色包等。
     for asset_id in &request.reference_asset_ids {
         let payload: String = connection
-            .query_row("SELECT payload FROM assets WHERE id=?1", [asset_id], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT payload FROM assets WHERE id=?1",
+                [asset_id],
+                |row| row.get(0),
+            )
             .map_err(|_| {
                 AppError::new(
                     "STORAGE_ASSET_MISSING",
@@ -303,9 +323,13 @@ async fn prepare_inputs(
             })?;
         let asset: AssetRef = serde_json::from_str(&payload)
             .map_err(|error| AppError::new("STORAGE_ASSET_CORRUPT", error.to_string(), false))?;
-        let transport =
-            gateway::transport::prepare_input(&state.data_dir, &asset, &capability.input_transport, host)
-                .await?;
+        let transport = gateway::transport::prepare_input(
+            &state.data_dir,
+            &asset,
+            &capability.input_transport,
+            host,
+        )
+        .await?;
         prepared.push(gateway::PreparedInput {
             role: "reference_image".to_string(),
             kind: asset.kind.clone(),
@@ -529,7 +553,9 @@ async fn store_outputs(
                         assets::decode_data_url(&data).map(|(_, bytes)| bytes)
                     } else {
                         use base64::Engine;
-                        base64::engine::general_purpose::STANDARD.decode(data.as_bytes()).ok()
+                        base64::engine::general_purpose::STANDARD
+                            .decode(data.as_bytes())
+                            .ok()
                     };
                     (
                         decoded.ok_or_else(|| {
@@ -624,10 +650,14 @@ pub(crate) fn save_asset(state: &AppState, asset: &AssetRef) -> Result<(), AppEr
         db::open(&path).map_err(|message| AppError::new("STORAGE_DB_FAILED", message, false))?;
     let payload = serde_json::to_string(asset)
         .map_err(|error| AppError::new("STORAGE_JSON_FAILED", error.to_string(), false))?;
-    connection
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| AppError::new("STORAGE_DB_FAILED", error.to_string(), false))?;
+    transaction
         .execute(
-            "INSERT OR REPLACE INTO assets (id, kind, path, mime, bytes, width, height, duration, payload, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO assets (id, kind, path, mime, bytes, width, height, duration, payload, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(id) DO NOTHING",
             rusqlite::params![
                 asset.id,
                 asset.kind,
@@ -641,6 +671,35 @@ pub(crate) fn save_asset(state: &AppState, asset: &AssetRef) -> Result<(), AppEr
                 asset.created_at
             ],
         )
+        .map_err(|error| AppError::new("STORAGE_DB_FAILED", error.to_string(), false))?;
+    let project_id = asset
+        .provenance
+        .get("projectId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AppError::new("PROJECT_ID_REQUIRED", "素材缺少项目归属", false))?;
+    record_asset_membership(
+        &transaction,
+        project_id,
+        asset,
+        &AssetOrigin {
+            kind: asset
+                .provenance
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("generated")
+                .to_string(),
+            reference: asset
+                .provenance
+                .get("runId")
+                .or_else(|| asset.provenance.get("sourceAssetId"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        },
+    )
+    .map_err(|error| AppError::new("STORAGE_DB_FAILED", error.to_string(), false))?;
+    transaction
+        .commit()
         .map_err(|error| AppError::new("STORAGE_DB_FAILED", error.to_string(), false))?;
     Ok(())
 }
@@ -802,11 +861,15 @@ pub fn expand_candidates(
     }
 
     candidates.sort_by(|left, right| {
-        left.0.cmp(&right.0)
+        left.0
+            .cmp(&right.0)
             .then(left.1.cmp(&right.1))
             .then(left.2.cmp(&right.2))
     });
-    Ok(candidates.into_iter().map(|(_, _, _, candidate)| candidate).collect())
+    Ok(candidates
+        .into_iter()
+        .map(|(_, _, _, candidate)| candidate)
+        .collect())
 }
 
 /// 这次请求是不是异步能力（决定要不要建 job 行）。
@@ -950,12 +1013,58 @@ mod tests {
         state.db_path.lock().expect("lock").clone()
     }
 
+    #[test]
+    fn duplicate_asset_preserves_each_project_origin() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState {
+            db_path: std::sync::Mutex::new(directory.path().join("db.sqlite3")),
+            data_dir: directory.path().to_owned(),
+        };
+        let first = assets::store_bytes(
+            directory.path(),
+            b"same-content",
+            "text",
+            "text/plain",
+            json!({"projectId":"p1", "runId":"run-1"}),
+        )
+        .unwrap();
+        let second = assets::store_bytes(
+            directory.path(),
+            b"same-content",
+            "text",
+            "text/plain",
+            json!({"projectId":"p2", "runId":"run-2"}),
+        )
+        .unwrap();
+        save_asset(&state, &first).unwrap();
+        save_asset(&state, &second).unwrap();
+        let connection = db::open(&runs_db_path(&state)).unwrap();
+        let membership_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM project_assets WHERE asset_id=?1",
+                [&first.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(membership_count, 2);
+        let first_asset =
+            crate::production::repository::require_project_asset(&connection, "p1", &first.id)
+                .unwrap();
+        let second_asset =
+            crate::production::repository::require_project_asset(&connection, "p2", &first.id)
+                .unwrap();
+        assert_eq!(first_asset.provenance["runId"], "run-1");
+        assert_eq!(second_asset.provenance["runId"], "run-2");
+    }
+
     fn request(cache_key: &str) -> StartRunRequest {
         StartRunRequest {
             schema_version: 1,
             project_id: "project_1".to_string(),
             board_id: "board_1".to_string(),
             node_id: "node_1".to_string(),
+            entity_id: None,
+            action: None,
             capability: "text.chat".to_string(),
             provider_id: "openai-compatible".to_string(),
             model: "test-model".to_string(),
@@ -986,6 +1095,21 @@ mod tests {
     }
 
     #[test]
+    fn production_runs_keep_the_shot_and_action_association() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::AppState {
+            db_path: std::sync::Mutex::new(dir.path().join("db.sqlite3")),
+            data_dir: dir.path().to_path_buf(),
+        };
+        let mut request = request("cache-shot");
+        request.entity_id = Some("shot-7".into());
+        request.action = Some("video".into());
+        let run = create_run(&state, &request).unwrap();
+        assert_eq!(run.entity_id.as_deref(), Some("shot-7"));
+        assert_eq!(run.action, "video");
+    }
+
+    #[test]
     fn selecting_a_candidate_updates_the_run() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = crate::AppState {
@@ -1010,13 +1134,20 @@ mod tests {
         };
         let connection = db::open(&runs_db_path(&state)).expect("db");
         let now = chrono::Utc::now().to_rfc3339();
-        for (id, priority, enabled) in [("slow", 50_i64, true), ("fast", 10, true), ("off", 1, false)] {
+        for (id, priority, enabled) in [
+            ("slow", 50_i64, true),
+            ("fast", 10, true),
+            ("off", 1, false),
+        ] {
             let profile = gateway::ProviderProfile {
                 id: id.to_string(),
                 name: id.to_string(),
                 adapter: "minimax-h3".to_string(),
                 base_url: "https://example.com".to_string(),
-                auth: gateway::AuthConfig { kind: "bearer".to_string(), key_ref: format!("provider/{id}") },
+                auth: gateway::AuthConfig {
+                    kind: "bearer".to_string(),
+                    key_ref: format!("provider/{id}"),
+                },
                 models: vec![gateway::ModelConfig {
                     id: "MiniMax-H3".to_string(),
                     display_name: "MiniMax H3".to_string(),
@@ -1075,7 +1206,9 @@ mod tests {
         request.provider_id = String::new();
         request.protocol = "seedance-video".to_string();
         let overridden = expand_candidates(&state, &request).expect("overridden");
-        assert!(overridden.iter().all(|candidate| candidate.protocol == "seedance-video"));
+        assert!(overridden
+            .iter()
+            .all(|candidate| candidate.protocol == "seedance-video"));
     }
 
     /// 改 Key 状态时不能顺手把用户配置的参数洗掉：
@@ -1132,7 +1265,10 @@ mod tests {
         // 状态之外的配置必须原样保留。
         assert_eq!(stored["models"][0]["params"][0]["key"], "quality");
         assert_eq!(stored["models"][0]["capabilities"][0]["supportsMask"], true);
-        assert_eq!(stored["models"][0]["capabilities"][0]["maxReferenceImages"], 4);
+        assert_eq!(
+            stored["models"][0]["capabilities"][0]["maxReferenceImages"],
+            4
+        );
 
         // 重新填密钥后要能恢复可用，否则这个 Key 永远被跳过。
         reset_key_status(&state, "p1", "k1").expect("reset");
@@ -1168,7 +1304,10 @@ mod tests {
             name: "bound".to_string(),
             adapter: "minimax-h3".to_string(),
             base_url: "https://example.com".to_string(),
-            auth: gateway::AuthConfig { kind: "bearer".to_string(), key_ref: "provider/bound".to_string() },
+            auth: gateway::AuthConfig {
+                kind: "bearer".to_string(),
+                key_ref: "provider/bound".to_string(),
+            },
             models: vec![gateway::ModelConfig {
                 id: "MiniMax-H3".to_string(),
                 display_name: "MiniMax H3".to_string(),
@@ -1235,7 +1374,9 @@ mod tests {
 
         close_jobs_for_run(&state, &run.id, "succeeded");
         let status: String = connection
-            .query_row("SELECT status FROM jobs WHERE id='job_1'", [], |row| row.get(0))
+            .query_row("SELECT status FROM jobs WHERE id='job_1'", [], |row| {
+                row.get(0)
+            })
             .expect("status");
         assert_eq!(status, "succeeded");
     }
@@ -1248,7 +1389,10 @@ mod tests {
             name: id.to_string(),
             adapter: "openai-compatible".to_string(),
             base_url: "https://example.com".to_string(),
-            auth: gateway::AuthConfig { kind: "bearer".to_string(), key_ref: format!("provider/{id}") },
+            auth: gateway::AuthConfig {
+                kind: "bearer".to_string(),
+                key_ref: format!("provider/{id}"),
+            },
             models: vec![gateway::ModelConfig {
                 id: "test-model".to_string(),
                 display_name: "Test".to_string(),
@@ -1293,7 +1437,9 @@ mod tests {
         };
         seed_profile(&state, "cool", false);
         mark_key_cooldown(&state, "cool", "k1").expect("cooldown");
-        let profile = load_provider_profile(&state, "cool").expect("load").expect("profile");
+        let profile = load_provider_profile(&state, "cool")
+            .expect("load")
+            .expect("profile");
         assert_eq!(profile.keys[0].status, "cooling");
         assert!(profile.keys[0].cooldown_until.is_some());
         assert!(profile.keys[0].is_cooling());

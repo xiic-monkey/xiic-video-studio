@@ -8,7 +8,7 @@ vi.mock('@tauri-apps/api/core', () => ({
   convertFileSrc: (path: string) => `file://${path}`,
 }));
 
-import { assetUrl, importLegacyProject, listBoards, listRuns, saveAssetHost, startRun } from './tauri';
+import { assetUrl, importLegacyProject, listBoards, listRuns, listBreakdownDrafts, saveBreakdownDraft, saveAssetHost, startPaidRun } from './tauri';
 
 function enableTauri() {
   (globalThis as unknown as { window?: unknown }).window = { __TAURI_INTERNALS__: {} };
@@ -27,6 +27,16 @@ describe('tauri bridge', () => {
 
     await listRuns('board_1');
     expect(invoke).toHaveBeenCalledWith('list_runs', { boardId: 'board_1' });
+  });
+
+  it('persists and reloads project scoped breakdown drafts', async () => {
+    const draft = { shots: [{ localId: 's1' }], subjects: [] };
+    const stored = { draftId: 'd1', scriptId: 'script1', scriptRevision: 3, payload: draft };
+    invoke.mockResolvedValueOnce(undefined).mockResolvedValueOnce([stored]);
+    await saveBreakdownDraft('p1', 'd1', 'script1', 3, draft);
+    expect(invoke).toHaveBeenNthCalledWith(1, 'save_breakdown_draft', { projectId: 'p1', draftId: 'd1', scriptId: 'script1', scriptRevision: 3, payload: draft });
+    await expect(listBreakdownDrafts('p1', 'script1')).resolves.toEqual([stored]);
+    expect(invoke).toHaveBeenNthCalledWith(2, 'list_breakdown_drafts', { projectId: 'p1', scriptId: 'script1' });
   });
 
   it('keeps the run payload contract camelCase', async () => {
@@ -48,32 +58,47 @@ describe('tauri bridge', () => {
     expect(Object.keys(run)).toContain('cacheKey');
     expect(run.promptSnapshot.hash).toBe('h');
 
-    await startRun({
-      schemaVersion: 1,
-      projectId: run.projectId,
-      boardId: run.boardId,
-      nodeId: run.nodeId,
-      capability: 'image.generate',
-      providerId: 'provider_1',
-      model: 'gpt-image-1',
-      promptSnapshot: run.promptSnapshot,
-      params: {},
-      inputs: [],
-      inputAssetIds: [],
-      cacheKey: run.cacheKey,
-    });
+    await startPaidRun(
+      {
+        previewId: 'preview_1',
+        fingerprint: 'f1',
+        projectId: run.projectId,
+        boardId: run.boardId,
+        cached: false,
+        routes: [],
+        estimates: {},
+        warnings: [],
+        expiresAt: '2026-10-31T00:01:00.000Z',
+      },
+      {
+        schemaVersion: 1,
+        projectId: run.projectId,
+        boardId: run.boardId,
+        nodeId: run.nodeId,
+        capability: 'image.generate',
+        providerId: 'provider_1',
+        model: 'gpt-image-1',
+        promptSnapshot: run.promptSnapshot,
+        params: {},
+        inputs: [],
+        inputAssetIds: [],
+        cacheKey: run.cacheKey,
+      },
+    );
 
-    expect(invoke).toHaveBeenCalledWith('start_run', expect.objectContaining({ request: expect.anything() }));
+    expect(invoke).toHaveBeenCalledWith('start_paid_run', expect.objectContaining({ request: expect.anything() }));
     const request = invoke.mock.calls[0][1].request as Record<string, unknown>;
     expect(Object.keys(request)).toEqual(
       expect.arrayContaining(['schemaVersion', 'projectId', 'boardId', 'nodeId', 'cacheKey']),
     );
   });
 
-  it('builds an asset url from the resolved file path', async () => {
-    invoke.mockResolvedValue('/tmp/assets/a.png');
-    await expect(assetUrl('asset_1')).resolves.toBe('file:///tmp/assets/a.png');
-    expect(invoke).toHaveBeenCalledWith('asset_file_path', { assetId: 'asset_1' });
+  it('opens a project scoped media grant', async () => {
+    invoke.mockResolvedValue({ url: 'frameforge-media://mg_1', expiresAt: '2026-11-22T00:00:00Z' });
+    await expect(assetUrl('project_1', 'asset_1')).resolves.toBe('frameforge-media://mg_1');
+    expect(invoke).toHaveBeenCalledWith('open_project_media', {
+      projectId: 'project_1', assetId: 'asset_1', rendition: 'original',
+    });
   });
 
   it('keeps the asset host payload contract', async () => {

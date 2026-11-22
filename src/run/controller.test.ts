@@ -37,7 +37,7 @@ function enableTauri() {
 }
 
 function startCalls(): Array<[string, { request: StartRunPayload }]> {
-  return invoke.mock.calls.filter((call) => call[0] === 'start_run') as Array<[string, { request: StartRunPayload }]>;
+  return invoke.mock.calls.filter((call) => call[0] === 'start_paid_run') as Array<[string, { request: StartRunPayload }]>;
 }
 
 function loadBoard(doc: BoardDoc) {
@@ -48,13 +48,14 @@ beforeEach(() => {
   invoke.mockReset();
   dbRuns = [];
   enableTauri();
-  invoke.mockImplementation(async (cmd: string, args?: { request: StartRunPayload; assetId?: string }) => {
+  invoke.mockImplementation(async (cmd: string, args?: { request: StartRunPayload; draft?: StartRunPayload; assetId?: string }) => {
     if (cmd === 'list_runs') return dbRuns;
-    if (cmd === 'read_asset_text') {
+    if (cmd === 'read_project_asset_text') {
       if (args?.assetId === 'asset_missing') throw new Error('资产文件缺失');
       return '上游文本';
     }
-    if (cmd === 'start_run') {
+    if (cmd === 'prepare_paid_run') return { previewId: 'preview_1', fingerprint: 'f', projectId: args!.draft!.projectId, boardId: args!.draft!.boardId, cached: Boolean(args!.draft!.cachedAssetId), routes: [], estimates: {}, warnings: [], expiresAt: new Date(Date.now() + 60_000).toISOString() };
+    if (cmd === 'start_paid_run') {
       const request = args!.request;
       const run: RunRecord = {
         id: `run_${dbRuns.length + 1}`,
@@ -131,6 +132,18 @@ describe('run controller', () => {
     expect(useRunStore.getState().runs.run_1.status).toBe('queued');
   });
 
+  it('attaches production shot actions while keeping the confirmation flow', async () => {
+    loadBoard(makeDoc([node('v', 'video', { prompt: '镜头动作' })], []));
+
+    await useRunController.getState().requestRun('v', { entityId: 'shot-7', action: 'video' });
+
+    const pending = useRunController.getState().pending;
+    expect(pending?.request.entityId).toBe('shot-7');
+    expect(pending?.request.action).toBe('video');
+    expect(pending?.request.cacheKey).toContain(':production:shot-7:video');
+    expect(startCalls()).toHaveLength(0);
+  });
+
   it('reuses the cached asset without a confirmation dialog and without cost', async () => {
     loadBoard(makeDoc([node('i', 'image', { prompt: '海报' })], []));
 
@@ -155,6 +168,31 @@ describe('run controller', () => {
     const cached = dbRuns[dbRuns.length - 1];
     expect(cached.status).toBe('succeeded');
     expect(cached.cost?.estimated?.amount).toBe(0);
+  });
+
+  it('生产镜头动作即使节点已有缓存也走确认流程，不静默发起付费运行', async () => {
+    loadBoard(makeDoc([node('i', 'image', { prompt: '海报' })], []));
+
+    await useRunController.getState().requestRun('i');
+    const cacheKey = useRunController.getState().pending!.request.cacheKey;
+    useRunController.getState().dismissRun();
+
+    const previous = succeededRun('i', 'asset_out', cacheKey);
+    dbRuns = [previous];
+    useRunStore.setState({
+      runs: { [previous.id]: previous },
+      latestByNode: { i: previous.id },
+      assets: { asset_out: assetRef('asset_out', 'image', 'image/png') },
+    });
+
+    await useRunController.getState().requestRun('i', { entityId: 'shot-7', action: 'storyboard' });
+
+    // 生产动作带自己的 cacheKey 后缀，后端不可能命中缓存：
+    // 必须打开确认框，绝不能拿「缓存命中」的名义静默发起一次真实付费运行。
+    expect(useRunController.getState().pending).toBeDefined();
+    expect(useRunController.getState().pending!.request.cachedAssetId).toBeUndefined();
+    expect(useBoardStore.getState().notice).toBeUndefined();
+    expect(startCalls()).toHaveLength(0);
   });
 
   it('cancels the active run and refuses to cancel a finished one', async () => {

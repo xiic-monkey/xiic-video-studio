@@ -41,7 +41,8 @@ pub fn build_package(connection: &Connection, project_id: &str) -> Result<Value,
             |row| row.get(0),
         )
         .map_err(|_| format!("项目不存在：{project_id}"))?;
-    let mut project: Value = serde_json::from_str(&project_text).map_err(|error| error.to_string())?;
+    let mut project: Value =
+        serde_json::from_str(&project_text).map_err(|error| error.to_string())?;
     crate::strip_sensitive_fields(&mut project);
 
     let mut boards: Vec<Value> = Vec::new();
@@ -53,8 +54,8 @@ pub fn build_package(connection: &Connection, project_id: &str) -> Result<Value,
             .query_map([project_id], |row| row.get::<_, String>(0))
             .map_err(|error| error.to_string())?;
         for row in rows {
-            let mut board: Value =
-                serde_json::from_str(&row.map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+            let mut board: Value = serde_json::from_str(&row.map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
             crate::strip_sensitive_fields(&mut board);
             boards.push(board);
         }
@@ -69,8 +70,8 @@ pub fn build_package(connection: &Connection, project_id: &str) -> Result<Value,
             .query_map([project_id], |row| row.get::<_, String>(0))
             .map_err(|error| error.to_string())?;
         for row in rows {
-            let mut run: Value =
-                serde_json::from_str(&row.map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+            let mut run: Value = serde_json::from_str(&row.map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
             crate::strip_sensitive_fields(&mut run);
             runs.push(run);
         }
@@ -80,19 +81,53 @@ pub fn build_package(connection: &Connection, project_id: &str) -> Result<Value,
     for entry in boards.iter().chain(runs.iter()) {
         collect_referenced_assets(entry, &mut asset_ids);
     }
-    let assets: Vec<Value> = asset_ids
-        .iter()
-        .filter_map(|id| asset_entry(connection, id))
-        .collect();
+    let production = |table: &str| -> Vec<Value> {
+        let sql =
+            format!("SELECT payload FROM {table} WHERE project_id=?1 ORDER BY created_at ASC");
+        connection
+            .prepare(&sql)
+            .ok()
+            .and_then(|mut statement| {
+                statement
+                    .query_map([project_id], |row| row.get::<_, String>(0))
+                    .ok()
+                    .map(|rows| {
+                        rows.filter_map(|row| row.ok())
+                            .filter_map(|payload| serde_json::from_str(&payload).ok())
+                            .collect()
+                    })
+            })
+            .unwrap_or_default()
+    };
+    let subject_versions: Vec<Value> = connection.prepare("SELECT sv.payload FROM subject_versions sv JOIN project_entities e ON e.id=sv.subject_id WHERE e.project_id=?1 ORDER BY sv.ordinal ASC").ok().and_then(|mut statement| statement.query_map([project_id], |row| row.get::<_,String>(0)).ok().map(|rows| rows.filter_map(|row| row.ok()).filter_map(|payload| serde_json::from_str::<Value>(&payload).ok()).collect())).unwrap_or_default();
+    let shot_adoptions: Vec<Value> = connection.prepare("SELECT sa.payload FROM shot_adoptions sa JOIN project_entities e ON e.id=sa.shot_id WHERE e.project_id=?1 ORDER BY sa.adopted_at ASC").ok().and_then(|mut statement| statement.query_map([project_id], |row| row.get::<_,String>(0)).ok().map(|rows| rows.filter_map(|row| row.ok()).filter_map(|payload| serde_json::from_str::<Value>(&payload).ok()).collect())).unwrap_or_default();
+    let entities: Vec<Value> = connection.prepare("SELECT id,kind,schema_version,revision,payload,updated_at FROM project_entities WHERE project_id=?1 AND archived_at IS NULL ORDER BY updated_at ASC").ok().and_then(|mut statement| statement.query_map([project_id], |row| Ok(json!({"id": row.get::<_,String>(0)?, "kind": row.get::<_,String>(1)?, "schemaVersion": row.get::<_,i64>(2)?, "revision": row.get::<_,i64>(3)?, "payload": serde_json::from_str::<Value>(&row.get::<_,String>(4)?).unwrap_or(Value::Null), "updatedAt": row.get::<_,String>(5)?}))).ok().map(|rows| rows.filter_map(|row| row.ok()).collect())).unwrap_or_default();
+    let mut production_assets = Vec::new();
+    for entity in &entities { collect_referenced_assets(entity, &mut asset_ids); }
+    // 同一份素材可能被画板、运行记录和多个制作实体重复引用，
+    // 清单里只能出现一次，否则导出包里会出现重复条目。
+    let mut seen_assets: Vec<String> = Vec::new();
+    for id in asset_ids.iter() {
+        if seen_assets.iter().any(|seen| seen == id) { continue; }
+        let Some(entry) = asset_entry(connection, project_id, id) else { continue; };
+        seen_assets.push(id.clone());
+        production_assets.push(entry);
+    }
+    let package_assets = production_assets;
 
     let mut package = json!({
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "packageKind": "frameforge.project",
         "exportedAt": chrono::Utc::now().to_rfc3339(),
         "project": project,
         "boards": boards,
         "runs": runs,
-        "assets": assets,
+        "assets": package_assets,
+        "entities": entities,
+        "subjectVersions": subject_versions,
+        "shotAdoptions": shot_adoptions,
+        "productionReviews": production("production_reviews"),
+        "mediaExports": production("media_exports"),
         "assetBodiesIncluded": false,
     });
     scrub_local_paths(&mut package);
@@ -205,7 +240,11 @@ fn secret_values(connection: &Connection, state: &AppState) -> Vec<String> {
         if let Some(keys) = profile.get("keys").and_then(Value::as_array) {
             for key in keys {
                 let key_id = key.get("id").and_then(Value::as_str).unwrap_or("");
-                let key_ref = key.get("keyRef").and_then(Value::as_str).unwrap_or("").trim();
+                let key_ref = key
+                    .get("keyRef")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
                 let resolved = if key_ref.is_empty() {
                     format!("provider/{provider_id}/key/{key_id}")
                 } else {
@@ -236,6 +275,9 @@ fn collect_referenced_assets(value: &Value, sink: &mut Vec<String>) {
             if let Some(id) = map.get("selectedAssetId").and_then(Value::as_str) {
                 push_asset_id(id, sink);
             }
+            if let Some(id) = map.get("assetId").and_then(Value::as_str) {
+                push_asset_id(id, sink);
+            }
             for key in ["inputAssetIds", "outputAssetIds"] {
                 if let Some(ids) = map.get(key).and_then(Value::as_array) {
                     for id in ids.iter().filter_map(Value::as_str) {
@@ -256,11 +298,11 @@ fn collect_referenced_assets(value: &Value, sink: &mut Vec<String>) {
     }
 }
 
-fn asset_entry(connection: &Connection, id: &str) -> Option<Value> {
+fn asset_entry(connection: &Connection, project_id: &str, id: &str) -> Option<Value> {
     connection
         .query_row(
-            "SELECT id, kind, path, mime, bytes, width, height, duration FROM assets WHERE id=?1",
-            [id],
+            "SELECT a.id, a.kind, a.path, a.mime, a.bytes, a.width, a.height, a.duration FROM assets a JOIN project_assets pa ON pa.asset_id=a.id WHERE pa.project_id=?1 AND a.id=?2",
+            rusqlite::params![project_id, id],
             |row| {
                 Ok(json!({
                     "id": row.get::<_, String>(0).unwrap_or_default(),
@@ -278,13 +320,18 @@ fn asset_entry(connection: &Connection, id: &str) -> Option<Value> {
 }
 
 pub fn validate_destination(dest: &Path, data_dir: &Path) -> Result<PathBuf, String> {
-    if dest.components().any(|component| matches!(component, Component::ParentDir)) {
+    if dest
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
         return Err("导出路径不合法".to_string());
     }
     if dest.extension().and_then(|value| value.to_str()) != Some("json") {
         return Err("导出文件必须以 .json 结尾".to_string());
     }
-    let file_name = dest.file_name().ok_or_else(|| "导出路径缺少文件名".to_string())?;
+    let file_name = dest
+        .file_name()
+        .ok_or_else(|| "导出路径缺少文件名".to_string())?;
     let parent = dest
         .parent()
         .ok_or_else(|| "导出路径缺少目录".to_string())?
@@ -296,7 +343,9 @@ pub fn validate_destination(dest: &Path, data_dir: &Path) -> Result<PathBuf, Str
         return Err("不能导出到应用数据目录内".to_string());
     }
     if resolved.symlink_metadata().is_ok() {
-        let metadata = resolved.symlink_metadata().map_err(|error| error.to_string())?;
+        let metadata = resolved
+            .symlink_metadata()
+            .map_err(|error| error.to_string())?;
         // 覆盖本身交给保存对话框确认；这里只挡住软链接和目录，避免把导出重定向到别处。
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err("导出目标已存在且不是普通文件，已拒绝".to_string());
@@ -305,7 +354,11 @@ pub fn validate_destination(dest: &Path, data_dir: &Path) -> Result<PathBuf, Str
     Ok(resolved)
 }
 
-pub fn export_project(state: &AppState, project_id: &str, dest: &Path) -> Result<ExportSummary, String> {
+pub fn export_project(
+    state: &AppState,
+    project_id: &str,
+    dest: &Path,
+) -> Result<ExportSummary, String> {
     // 先校验目标路径：路径不合法就别白读一遍数据库。
     let resolved = validate_destination(dest, &state.data_dir)?;
     let db_path = state
@@ -374,6 +427,7 @@ mod tests {
                 [],
             )
             .unwrap();
+        connection.execute("INSERT INTO project_assets (project_id,asset_id,display_name,added_at,provenance) VALUES ('p1','a1','a1','2026-10-31T00:00:00Z','{}')", []).unwrap();
     }
 
     #[test]
@@ -386,12 +440,25 @@ mod tests {
         let raw = serde_json::to_string(&package).unwrap();
 
         assert!(!raw.contains("sk-leak"), "项目设置里的 apiKey 必须被剥掉");
-        assert!(!raw.contains("sk-run-leak"), "运行记录里的 apiKey 必须被剥掉");
-        assert!(raw.contains("board-cache-key-stays"), "cacheKey 不能被子串匹配误伤");
-        assert!(!raw.contains(dir.path().to_str().unwrap()), "导出不得含本机绝对路径");
+        assert!(
+            !raw.contains("sk-run-leak"),
+            "运行记录里的 apiKey 必须被剥掉"
+        );
+        assert!(
+            raw.contains("board-cache-key-stays"),
+            "cacheKey 不能被子串匹配误伤"
+        );
+        assert!(
+            !raw.contains(dir.path().to_str().unwrap()),
+            "导出不得含本机绝对路径"
+        );
         assert_eq!(package["boards"].as_array().map(Vec::len), Some(1));
-        assert_eq!(package["assets"][0]["relativePath"], serde_json::json!("assets/ab/ab12.png"));
+        assert_eq!(
+            package["assets"][0]["relativePath"],
+            serde_json::json!("assets/ab/ab12.png")
+        );
         assert_eq!(package["assetBodiesIncluded"], serde_json::json!(false));
+        assert_eq!(package["schemaVersion"], serde_json::json!(2));
     }
 
     #[test]
@@ -410,17 +477,26 @@ mod tests {
         let ok = validate_destination(&out_dir.path().join("包.json"), data_dir.path()).unwrap();
         assert!(ok.to_string_lossy().ends_with("包.json"));
 
-        assert!(validate_destination(std::path::Path::new("../evil.json"), data_dir.path()).is_err());
+        assert!(
+            validate_destination(std::path::Path::new("../evil.json"), data_dir.path()).is_err()
+        );
         assert!(validate_destination(&out_dir.path().join("evil.txt"), data_dir.path()).is_err());
-        assert!(validate_destination(&data_dir.path().join("inside.json"), data_dir.path()).is_err());
-        assert!(validate_destination(&out_dir.path().join("nope/missing.json"), data_dir.path()).is_err());
+        assert!(
+            validate_destination(&data_dir.path().join("inside.json"), data_dir.path()).is_err()
+        );
+        assert!(
+            validate_destination(&out_dir.path().join("nope/missing.json"), data_dir.path())
+                .is_err()
+        );
         // 普通文件可以覆盖（保存对话框已确认），软链接不行。
         std::fs::write(&out_dir.path().join("again.json"), b"{}").unwrap();
         assert!(validate_destination(&out_dir.path().join("again.json"), data_dir.path()).is_ok());
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink("/etc/passwd", &out_dir.path().join("link.json")).unwrap();
-            assert!(validate_destination(&out_dir.path().join("link.json"), data_dir.path()).is_err());
+            assert!(
+                validate_destination(&out_dir.path().join("link.json"), data_dir.path()).is_err()
+            );
         }
     }
 
@@ -483,8 +559,16 @@ mod tests {
 
         // 第一条：不能出现任何密钥字段名（大小写不敏感）。
         for field in [
-            "\"apiKey\"", "\"api_key\"", "\"secretKey\"", "\"secret_key\"", "\"accessKey\"",
-            "\"access_key\"", "\"token\"", "\"password\"", "\"credential\"", "\"secret\"",
+            "\"apiKey\"",
+            "\"api_key\"",
+            "\"secretKey\"",
+            "\"secret_key\"",
+            "\"accessKey\"",
+            "\"access_key\"",
+            "\"token\"",
+            "\"password\"",
+            "\"credential\"",
+            "\"secret\"",
         ] {
             let lower = text.to_ascii_lowercase();
             assert!(
@@ -527,7 +611,10 @@ mod tests {
             raw.contains("https://cdn.example.com/a.png"),
             "远端素材地址要保留，P2 重新导入时还要用"
         );
-        assert!(raw.contains("1/2 构图，仰角 45°"), "提示词正文不能被路径脱敏误伤");
+        assert!(
+            raw.contains("1/2 构图，仰角 45°"),
+            "提示词正文不能被路径脱敏误伤"
+        );
         assert!(raw.contains("assets/cd/cd34.png"), "CAS 相对路径要保留");
         assert!(raw.contains("ck2"), "cacheKey 不能被误伤");
     }
@@ -549,10 +636,7 @@ mod tests {
             "prompt": "提示词里提到 sk-live-abcdef0123456789 这个串也要被抹掉",
         });
 
-        redact_secret_values(
-            &mut package,
-            &["sk-live-abcdef0123456789".to_string()],
-        );
+        redact_secret_values(&mut package, &["sk-live-abcdef0123456789".to_string()]);
 
         let raw = serde_json::to_string(&package).unwrap();
         assert!(

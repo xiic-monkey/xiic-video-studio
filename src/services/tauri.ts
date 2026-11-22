@@ -1,4 +1,4 @@
-import { invoke, convertFileSrc } from '@tauri-apps/api/core';
+import { invoke } from '@tauri-apps/api/core';
 import { save } from '@tauri-apps/plugin-dialog';
 import type {
   AssetRef,
@@ -30,9 +30,9 @@ export async function loadBoard(boardId: string): Promise<BoardDoc | null> {
   return invoke<BoardDoc | null>('load_board', { boardId });
 }
 
-export async function saveBoard(board: BoardDoc): Promise<void> {
-  if (!isTauri()) return;
-  await invoke('save_board', { board });
+export async function saveBoard(board: BoardDoc): Promise<{ revision?: number }> {
+  if (!isTauri()) return {};
+  return invoke<{ revision?: number }>('save_board', { board, expectedRevision: board.revision ?? null });
 }
 
 export async function deleteBoard(boardId: string): Promise<void> {
@@ -122,6 +122,8 @@ export interface StartRunInput {
   projectId: string;
   boardId: string;
   nodeId: string;
+  entityId?: string;
+  action?: string;
   capability: string;
   providerId: string;
   model: string;
@@ -137,9 +139,29 @@ export interface StartRunInput {
   referenceAssetIds?: string[];
 }
 
-export async function startRun(request: StartRunInput): Promise<RunRecord> {
-  if (!isTauri()) throw new Error('生成只能在桌面应用中运行');
-  return invoke<RunRecord>('start_run', { request });
+// 后端不再暴露 start_run：所有付费运行都必须先走 prepare_paid_run 预览、
+// 再用 start_paid_run 单次提交，避免绕过费用确认。
+
+export interface RunPreview {
+  previewId: string;
+  fingerprint: string;
+  projectId: string;
+  boardId: string;
+  cached: boolean;
+  routes: string[];
+  estimates: Record<string, unknown>;
+  warnings: string[];
+  expiresAt: string;
+}
+
+export async function preparePaidRun(projectId: string, boardId: string, expectedRevision: number, draft: StartRunInput): Promise<RunPreview> {
+  if (!isTauri()) throw new Error('付费运行预览只能在桌面应用中创建');
+  return invoke<RunPreview>('prepare_paid_run', { projectId, boardId, expectedRevision, draft });
+}
+
+export async function startPaidRun(preview: RunPreview, request: StartRunInput): Promise<RunRecord> {
+  if (!isTauri()) throw new Error('付费运行只能在桌面应用中确认');
+  return invoke<RunRecord>('start_paid_run', { previewId: preview.previewId, fingerprint: preview.fingerprint, request });
 }
 
 export async function cancelRun(runId: string): Promise<void> {
@@ -162,10 +184,193 @@ export async function resumeJobs(): Promise<number> {
   return invoke<number>('resume_jobs');
 }
 
-/** 资产库：按项目列出资产（不传项目则列出全部）。 */
-export async function listAssets(projectId?: string): Promise<AssetRef[]> {
+export interface ProjectAssetPage {
+  items: AssetRef[];
+  nextCursor?: string;
+}
+
+export interface MediaTask {
+  id: string;
+  projectId: string;
+  kind: string;
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'paused';
+  assetId?: string;
+  payload: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export async function importMedia(projectId: string): Promise<MediaTask | undefined> {
+  if (!isTauri()) throw new Error('本地媒体导入仅支持桌面应用');
+  const grants = await invoke<Array<{ id: string; displayName: string }>>('pick_media_files', { projectId });
+  if (!grants.length) return undefined;
+  return invoke<MediaTask>('import_media', { projectId, fileGrantIds: grants.map((grant) => grant.id), requestId: crypto.randomUUID() });
+}
+
+export async function listMediaTasks(projectId: string): Promise<MediaTask[]> {
   if (!isTauri()) return [];
-  return invoke<AssetRef[]>('list_assets', { projectId: projectId ?? null });
+  return invoke<MediaTask[]>('list_media_tasks', { projectId });
+}
+
+export async function cancelMediaTask(projectId: string, jobId: string): Promise<MediaTask> {
+  if (!isTauri()) throw new Error('取消媒体任务仅支持桌面应用');
+  return invoke<MediaTask>('cancel_media_task', { projectId, jobId });
+}
+
+export async function listProductionEntities(projectId: string, kind?: string): Promise<Array<{ id: string; kind: string; revision: number; schemaVersion: number; payload: unknown; updatedAt: string }>> {
+  if (!isTauri()) return [];
+  return invoke('list_production_entities', { projectId, kind: kind ?? null });
+}
+
+export async function applyProductionChange(projectId: string, changeId: string, expectedRevisions: Record<string, number>, operations: unknown[]): Promise<{ changeId: string; revisionMap: Record<string, number>; affectedIds: string[] }> {
+  if (!isTauri()) throw new Error('制作变更只能在桌面应用中保存');
+  return invoke('apply_production_change', { projectId, changeId, expectedRevisions, operations });
+}
+
+export async function saveBreakdownDraft(projectId: string, draftId: string, scriptId: string, scriptRevision: number, payload: unknown): Promise<void> {
+  if (!isTauri()) throw new Error('拆镜草案只能在桌面应用中保存');
+  await invoke('save_breakdown_draft', { projectId, draftId, scriptId, scriptRevision, payload });
+}
+
+export async function listBreakdownDrafts(projectId: string, scriptId: string): Promise<unknown[]> {
+  if (!isTauri()) return [];
+  return invoke<unknown[]>('list_breakdown_drafts', { projectId, scriptId });
+}
+
+export interface ShotRunPreview {
+  previewId: string;
+  fingerprint: string;
+  shotId: string;
+  action: string;
+  intent: string;
+  warnings: string[];
+}
+
+export async function prepareShotRun(projectId: string, shotId: string, action: string, intent: 'normal' | 'regenerate' = 'normal', overrides?: Record<string, unknown>): Promise<ShotRunPreview> {
+  if (!isTauri()) throw new Error('镜头生成预览仅支持桌面应用');
+  return invoke('prepare_shot_run', { projectId, shotId, action, intent, overrides: overrides ?? null });
+}
+
+export async function adoptShotMedia(projectId: string, changeId: string, expectedRevisions: Record<string, number>, shotId: string, slot: string, assetId: string, specHash: string): Promise<{ changeId: string; revisionMap: Record<string, number>; affectedIds: string[] }> {
+  if (!isTauri()) throw new Error('镜头采纳仅支持桌面应用');
+  return invoke('adopt_shot_media', { projectId, changeId, expectedRevisions, shotId, slot, assetId, specHash });
+}
+
+export async function recordProductionReview(projectId: string, changeId: string, expectedRevisions: Record<string, number>, entityId: string, review: Record<string, unknown>): Promise<{ changeId: string; revisionMap: Record<string, number>; affectedIds: string[] }> {
+  if (!isTauri()) throw new Error('制作审批仅支持桌面应用');
+  return invoke('record_production_review', { projectId, changeId, expectedRevisions, entityId, review });
+}
+
+export interface ProductionEntity {
+  id: string;
+  projectId?: string;
+  kind: string;
+  revision: number;
+  schemaVersion: number;
+  payload: Record<string, unknown>;
+  updatedAt: string;
+}
+
+export async function createLocalComposeEntity(
+  projectId: string,
+  boardId: string,
+  timeline: Record<string, unknown>,
+): Promise<{ changeId: string; revisionMap: Record<string, number>; affectedIds: string[] }> {
+  const id = typeof timeline.id === 'string' ? timeline.id : `${projectId}:${boardId}:compose`;
+  return applyProductionChange(projectId, crypto.randomUUID(), { [id]: 0 }, [{ id, kind: 'timeline', payload: timeline }]);
+}
+
+export async function commitTimelineEdit(
+  projectId: string,
+  timelineId: string,
+  expectedRevision: number,
+  timeline: Record<string, unknown>,
+): Promise<{ changeId: string; revisionMap: Record<string, number>; affectedIds: string[] }> {
+  return applyProductionChange(projectId, crypto.randomUUID(), { [timelineId]: expectedRevision }, [{ id: timelineId, kind: 'timeline', payload: timeline }]);
+}
+
+export async function replaceTimelineClip(
+  projectId: string,
+  timelineId: string,
+  expectedRevision: number,
+  clipId: string,
+  assetId: string,
+  sourceInTicks: number,
+  sourceOutTicks: number,
+  acknowledgeShorter: boolean,
+): Promise<{ changeId: string; revisionMap: Record<string, number>; affectedIds: string[] }> {
+  if (!isTauri()) throw new Error('时间线换片仅支持桌面应用');
+  return invoke('replace_timeline_clip', {
+    projectId,
+    changeId: crypto.randomUUID(),
+    expectedRevisions: { [timelineId]: expectedRevision },
+    timelineId,
+    payload: { clipId, assetId, sourceInTicks, sourceOutTicks, acknowledgeShorter },
+  });
+}
+
+export async function listProductionEntityPage(projectId: string, kind?: string): Promise<ProductionEntity[]> {
+  if (!isTauri()) return [];
+  return invoke<ProductionEntity[]>('list_production_entities', { projectId, kind: kind ?? null });
+}
+
+export async function pickSubtitleFile(projectId: string): Promise<{ id: string; displayName: string } | undefined> {
+  if (!isTauri()) return undefined;
+  const grant = await invoke<{ id: string; displayName: string } | null>('pick_subtitle_file', { projectId });
+  return grant ?? undefined;
+}
+
+export async function importSubtitleDocument(projectId: string, fileGrantId: string): Promise<{ text: string; displayName: string }> {
+  if (!isTauri()) throw new Error('字幕导入仅支持桌面应用');
+  return invoke('import_subtitle_document', { projectId, fileGrantId });
+}
+
+export async function pickScriptFile(projectId: string): Promise<{ id: string; displayName: string } | undefined> {
+  if (!isTauri()) return undefined;
+  const grant = await invoke<{ id: string; displayName: string } | null>('pick_script_file', { projectId });
+  return grant ?? undefined;
+}
+
+export async function importScriptDocument(projectId: string, fileGrantId: string): Promise<{ title: string; body: string; displayName: string }> {
+  if (!isTauri()) throw new Error('剧本导入仅支持桌面应用');
+  return invoke('import_script_document', { projectId, fileGrantId });
+}
+
+export interface MediaExportPreview {
+  previewId: string;
+  projectId: string;
+  timelineId: string;
+  editHash: string;
+  totalTicks: number;
+  preset: string;
+  /** 阻断级问题：必须修好，不允许靠确认放行。 */
+  issues: string[];
+  /** 必须明确确认级问题：逐条确认后可继续交付。 */
+  warnings: string[];
+}
+
+export async function prepareMediaExport(projectId: string, timelineId: string, expectedRevision: number, preset = 'vertical-1080x1920'): Promise<MediaExportPreview> {
+  if (!isTauri()) throw new Error('导出仅支持桌面应用');
+  return invoke('prepare_media_export', { projectId, timelineId, expectedRevision, preset });
+}
+
+export async function startMediaExport(previewId: string, acknowledgedIssueIds: string[], requestId: string, targetGrantId: string): Promise<MediaTask> {
+  if (!isTauri()) throw new Error('导出仅支持桌面应用');
+  return invoke('start_media_export', { previewId, acknowledgedIssueIds, requestId, targetGrantId });
+}
+
+export async function pickExportTarget(projectId: string): Promise<{ id: string; displayName: string } | undefined> {
+  if (!isTauri()) throw new Error('导出仅支持桌面应用');
+  const grant = await invoke<{ id: string; displayName: string } | null>('pick_export_target', { projectId });
+  return grant ?? undefined;
+}
+
+
+/** 资产库：项目 ID 是授权边界，缺少项目时不读取任何素材。 */
+export async function listAssets(projectId?: string): Promise<AssetRef[]> {
+  if (!isTauri() || !projectId) return [];
+  const page = await invoke<ProjectAssetPage>('list_project_assets', { projectId, kind: null, query: null, cursor: null });
+  return page.items;
 }
 
 /** 拆帧：把设定图按版式切成各视角，返回每个视角的资产 id。 */
@@ -199,22 +404,24 @@ export async function saveMask(
   return invoke('save_mask', { maskDataUrl, sourceAssetId, nodeId, projectId });
 }
 
-export async function assetUrl(assetId: string): Promise<string> {
-  if (!isTauri()) return '';
-  const path = await invoke<string>('asset_file_path', { assetId });
-  return convertFileSrc(path);
+export async function assetUrl(projectId: string, assetId: string): Promise<string> {
+  if (!isTauri() || !projectId) return '';
+  const grant = await invoke<{ url: string }>('open_project_media', { projectId, assetId, rendition: 'original' });
+  return grant.url;
 }
 
 /** 缩略图地址：有缩略图用缩略图，没有就退回原文件。 */
-export async function assetThumbUrl(assetId: string): Promise<string> {
-  if (!isTauri()) return '';
-  const path = await invoke<string>('asset_thumb_file_path', { assetId });
-  return convertFileSrc(path);
+export async function assetThumbUrl(projectId: string, assetId: string): Promise<string> {
+  if (!isTauri() || !projectId) return '';
+  const grant = await invoke<{ url: string }>('open_project_media', { projectId, assetId, rendition: 'thumbnail' });
+  return grant.url;
 }
 
-export async function readAssetText(assetId: string): Promise<string> {
-  if (!isTauri()) return '';
-  return invoke<string>('read_asset_text', { assetId });
+export async function readAssetText(projectId: string, assetId: string): Promise<string> {
+  if (!isTauri() || !projectId) return '';
+  const value = await invoke<string | undefined>('read_project_asset_text', { projectId, assetId });
+  if (value === undefined) throw new Error('资产文本读取失败');
+  return value;
 }
 
 /** 旧项目导入结果：字段名与 Rust 侧 `#[serde(rename_all = "camelCase")]` 一致。 */

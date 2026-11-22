@@ -65,12 +65,12 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     const project = createStudioProject(name, aspectRatio);
     await saveStudioProject(project);
     const board = createEmptyBoard(project.id);
-    await saveBoard(board);
+    const savedBoard = { ...board, revision: (await saveBoard(board)).revision };
     set((state) => ({
       projects: [project, ...state.projects],
-      boards: [board],
+      boards: [savedBoard],
       currentProjectId: project.id,
-      currentBoardId: board.id,
+      currentBoardId: savedBoard.id,
       error: undefined,
     }));
     return project;
@@ -95,13 +95,13 @@ export const useStudioStore = create<StudioState>((set, get) => ({
     const projectId = get().currentProjectId;
     if (!projectId) return undefined;
     const board = createEmptyBoard(projectId, name.trim() || '未命名画布');
-    await saveBoard(board);
+    const savedBoard = { ...board, revision: (await saveBoard(board)).revision };
     set((state) => ({
-      boards: [board, ...state.boards],
-      currentBoardId: board.id,
+      boards: [savedBoard, ...state.boards],
+      currentBoardId: savedBoard.id,
       error: undefined,
     }));
-    return board;
+    return savedBoard;
   },
 
   async selectBoard(boardId) {

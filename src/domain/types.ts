@@ -22,6 +22,7 @@ export interface BoardDoc {
   viewport: { x: number; y: number; zoom: number };
   createdAt: string;
   updatedAt: string;
+  revision?: number;
 }
 
 export interface BoardNode {
@@ -62,6 +63,7 @@ export interface AssetRef {
   createdAt: string;
   provenance: {
     projectId: string;
+    displayName?: string;
     nodeId?: string;
     runId?: string;
     providerId?: string;

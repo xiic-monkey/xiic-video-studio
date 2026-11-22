@@ -1,5 +1,5 @@
-use rusqlite::Connection;
-use std::path::Path;
+use rusqlite::{Connection, TransactionBehavior};
+use std::{path::Path, time::Duration};
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE IF NOT EXISTS projects (
@@ -47,8 +47,14 @@ CREATE TABLE IF NOT EXISTS provider_profiles (
 );
 "#;
 
+const PRODUCTION_SCHEMA: &str = include_str!("db/migration_2.sql");
+const SCHEMA_VERSION: i64 = 5;
+
 pub fn open(path: &Path) -> Result<Connection, String> {
     let mut connection = Connection::open(path).map_err(|error| error.to_string())?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(|error| error.to_string())?;
     connection
         .execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
         .map_err(|error| error.to_string())?;
@@ -60,22 +66,77 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
-    if version < 1 {
-        let transaction = connection.transaction().map_err(|error| error.to_string())?;
-        transaction.execute_batch(MIGRATION_1).map_err(|error| error.to_string())?;
-        transaction
-            .pragma_update(None, "user_version", 1)
-            .map_err(|error| error.to_string())?;
-        transaction.commit().map_err(|error| error.to_string())?;
+    if version > SCHEMA_VERSION {
+        return Err(format!(
+            "Database version {version} is newer than this application supports"
+        ));
     }
-    // 旧库可能早于 voice 列存在；重复添加会报错，忽略即可。
-    let _ = connection.execute("ALTER TABLE provider_settings ADD COLUMN voice TEXT", []);
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    let current: i64 = transaction
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    if current == SCHEMA_VERSION {
+        return transaction.commit().map_err(|error| error.to_string());
+    }
+    if current > SCHEMA_VERSION {
+        return Err(format!(
+            "Database version {current} is newer than this application supports"
+        ));
+    }
+    transaction
+        .execute_batch("PRAGMA defer_foreign_keys = ON;")
+        .map_err(|error| error.to_string())?;
+    let tables = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        rows
+    };
+    for table in tables {
+        let quoted = table.replace('"', "\"\"");
+        transaction
+            .execute_batch(&format!("DROP TABLE \"{quoted}\";"))
+            .map_err(|error| error.to_string())?;
+    }
+    transaction
+        .execute_batch(MIGRATION_1)
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute_batch(PRODUCTION_SCHEMA)
+        .map_err(|error| error.to_string())?;
+    transaction
+        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn v1_fixture(path: &Path) -> Connection {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        connection.execute_batch(MIGRATION_1).unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        connection
+    }
 
     #[test]
     fn creates_schema_and_is_idempotent() {
@@ -85,10 +146,22 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 1);
-        for table in ["studio_projects", "boards", "runs", "jobs", "assets", "provider_profiles", "projects"] {
+        assert_eq!(version, SCHEMA_VERSION);
+        for table in [
+            "studio_projects",
+            "boards",
+            "runs",
+            "jobs",
+            "assets",
+            "provider_profiles",
+            "projects",
+        ] {
             let count: i64 = connection
-                .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1", [table], |row| row.get(0))
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
                 .expect("table count");
             assert_eq!(count, 1, "missing table {table}");
         }
@@ -97,6 +170,54 @@ mod tests {
         let version: i64 = reopened
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 1);
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn replaces_unreleased_v1_data_with_current_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("frameforge.sqlite3");
+        let old = v1_fixture(&path);
+        old.execute("INSERT INTO studio_projects (id,name,payload,created_at,updated_at) VALUES ('old','Old','{}','2026-01-01','2026-01-01')", []).unwrap();
+        old.execute(
+            "INSERT INTO runs (id,project_id,board_id,node_id,status,cache_key,payload,created_at,updated_at) VALUES ('r1','p2','b2','n','succeeded','c',?1,'2026-01-01','2026-01-01')",
+            [json!({"inputAssetIds": ["shared"], "outputAssetIds": []}).to_string()],
+        ).unwrap();
+        let migrated = open(&path).unwrap();
+        assert_eq!(
+            migrated
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            migrated
+                .query_row("SELECT COUNT(*) FROM studio_projects", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            migrated
+                .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            migrated
+                .query_row("SELECT COUNT(*) FROM project_assets", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(migrated);
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row("SELECT COUNT(*) FROM studio_projects", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 }

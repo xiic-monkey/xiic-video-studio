@@ -30,7 +30,8 @@ export function ReferencePicker({ projectId, selected, onToggle }: ReferencePick
     const missing = assets.filter((item) => !thumbs[item.id]).slice(0, 12);
     if (!missing.length) return;
     void Promise.all(missing.map(async (item) => {
-      const url = await assetThumbUrl(item.id);
+      if (!projectId) return [item.id, ''] as const;
+      const url = await assetThumbUrl(projectId, item.id);
       return [item.id, url] as const;
     })).then((entries) => {
       if (alive) setThumbs((items) => ({ ...items, ...Object.fromEntries(entries) }));

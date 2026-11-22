@@ -44,7 +44,7 @@ export function MaskEditor({ sourceAssetId, nodeId, projectId, onClose, onSaved 
 
   useEffect(() => {
     let alive = true;
-    void assetUrl(sourceAssetId).then((url) => {
+    void assetUrl(projectId, sourceAssetId).then((url) => {
       const image = new Image();
       image.onload = () => {
         if (!alive) return;
@@ -65,7 +65,7 @@ export function MaskEditor({ sourceAssetId, nodeId, projectId, onClose, onSaved 
       image.src = url;
     }).catch(() => { if (alive) setError('源图加载失败'); });
     return () => { alive = false; };
-  }, [sourceAssetId]);
+  }, [projectId, sourceAssetId]);
 
   function point(event: ReactPointerEvent<HTMLCanvasElement>): Point {
     const rect = event.currentTarget.getBoundingClientRect();

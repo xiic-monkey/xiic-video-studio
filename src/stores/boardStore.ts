@@ -160,9 +160,15 @@ export const useBoardStore = create<BoardState>((set, get) => ({
     if (!snapshot || !get().dirty || get().saving) return;
     set({ saving: true, saveError: undefined });
     try {
-      await saveBoard(snapshot);
+      const result = await saveBoard(snapshot);
       const stillCurrent = get().board === snapshot;
+      const current = get().board;
+      // revision 属于服务端那一行，不属于这次快照：即使保存期间又发生了编辑，
+      // 也必须把后端返回的新修订号写回，否则本地永远拿着旧修订号，
+      // 下一次保存必然撞上 PRODUCTION_REVISION_CONFLICT 且无法自愈。
+      const sameBoard = current && current.id === snapshot.id;
       set({
+        board: sameBoard && result.revision ? { ...current, revision: result.revision } : current,
         saving: false,
         dirty: stillCurrent ? false : get().dirty,
         lastSavedAt: new Date().toISOString(),

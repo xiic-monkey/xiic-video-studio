@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
-import { FileAudio, FileText, Film, Image as ImageIcon } from 'lucide-react';
-import { assetThumbUrl, listAssets } from '../services/tauri';
+import { FileAudio, FileText, Film, Image as ImageIcon, Upload } from 'lucide-react';
+import { assetThumbUrl, importMedia, listAssets } from '../services/tauri';
+import { createNode } from '../domain/nodes/definitions';
+import { useBoardStore } from '../stores/boardStore';
 import type { AssetRef } from '../domain/types';
 
 const KIND_LABEL: Record<string, string> = {
@@ -25,6 +27,9 @@ export function AssetLibrary({ projectId }: { projectId?: string }) {
   const [kind, setKind] = useState('');
   const [selectedId, setSelectedId] = useState<string>();
   const [thumbnails, setThumbnails] = useState<Record<string, string>>({});
+  const [refresh, setRefresh] = useState(0);
+  const [importing, setImporting] = useState(false);
+  const [message, setMessage] = useState('');
 
   useEffect(() => {
     let alive = true;
@@ -34,7 +39,24 @@ export function AssetLibrary({ projectId }: { projectId?: string }) {
       if (alive) setAssets([]);
     });
     return () => { alive = false; };
-  }, [projectId]);
+  }, [projectId, refresh]);
+
+  async function importFiles() {
+    if (!projectId || importing) return;
+    setImporting(true);
+    setMessage('');
+    try {
+      const task = await importMedia(projectId);
+      if (task) {
+        setRefresh((value) => value + 1);
+        setMessage(task.status === 'succeeded' ? '素材已导入' : '没有可导入的素材');
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setImporting(false);
+    }
+  }
 
   const visible = useMemo(
     () => (kind ? assets.filter((item) => item.kind === kind) : assets),
@@ -48,7 +70,8 @@ export function AssetLibrary({ projectId }: { projectId?: string }) {
       .slice(0, 24);
     if (!missing.length) return;
     void Promise.all(missing.map(async (item) => {
-      const url = await assetThumbUrl(item.id);
+      if (!projectId) return [item.id, ''] as const;
+      const url = await assetThumbUrl(projectId, item.id);
       return [item.id, url] as const;
     })).then((entries) => {
       if (alive) setThumbnails((items) => ({ ...items, ...Object.fromEntries(entries) }));
@@ -57,6 +80,16 @@ export function AssetLibrary({ projectId }: { projectId?: string }) {
   }, [visible, thumbnails]);
 
   const selected = assets.find((item) => item.id === selectedId);
+  function addSelectedToCanvas() {
+    if (!selected) return;
+    const boardState = useBoardStore.getState();
+    const board = boardState.board;
+    if (!board) return;
+    const sourceNode = createNode('media_source', { x: 120, y: 120 }, { assetId: selected.id, kind: selected.kind, displayName: selected.provenance.displayName ?? selected.id });
+    boardState.apply({ type: 'addNode', node: sourceNode });
+    boardState.select(sourceNode.id);
+    boardState.notify('已添加到画布');
+  }
   const counts = useMemo(() => {
     const map = new Map<string, number>();
     assets.forEach((item) => map.set(item.kind, (map.get(item.kind) ?? 0) + 1));
@@ -66,6 +99,10 @@ export function AssetLibrary({ projectId }: { projectId?: string }) {
   return (
     <section className="asset-library">
       <h2>资产库</h2>
+      <button type="button" disabled={!projectId || importing} onClick={() => void importFiles()}>
+        <Upload size={14} /> {importing ? '正在导入…' : '导入本地素材'}
+      </button>
+      {message && <span role="status">{message}</span>}
       <div className="asset-kinds">
         {KINDS.map((value) => (
           <button
@@ -109,6 +146,7 @@ export function AssetLibrary({ projectId }: { projectId?: string }) {
           {selected.width && selected.height && <span>{selected.width}×{selected.height}</span>}
           {typeof selected.provenance?.model === 'string' && <span>模型：{selected.provenance.model}</span>}
           {typeof selected.provenance?.nodeId === 'string' && <span>节点：{selected.provenance.nodeId.slice(-8)}</span>}
+          <button type="button" onClick={addSelectedToCanvas}>添加到画布</button>
         </div>
       )}
     </section>

@@ -1,4 +1,5 @@
 import { computeCacheKey, latestSucceededRun, selectedAssetOf } from '../graph/cacheKey';
+import { resolveNodeOutput } from '../graph/output';
 import { getNodeDefinition } from '../nodes/definitions';
 import { isMaskNode, maskAssetIdOf } from '../nodes/mask';
 import { instructionFor } from '../nodes/templates';
@@ -24,6 +25,8 @@ export interface RunRequestDraft {
   projectId: string;
   boardId: string;
   nodeId: string;
+  entityId?: string;
+  action?: string;
   capability: string;
   providerId: string;
   model: string;
@@ -79,7 +82,8 @@ function inboundAssets(doc: BoardDoc, nodeId: string, runs: RunRecord[], assets:
   const items: Inbound[] = [];
   for (const edge of Object.values(doc.edges)) {
     if (edge.target !== nodeId) continue;
-    const assetId = selectedAssetOf(latestSucceededRun(runs, edge.source));
+    const source = doc.nodes[edge.source];
+    const assetId = source ? resolveNodeOutput(source, edge.sourcePort, runs) : undefined;
     if (!assetId) continue;
     const stored = assets[assetId];
     const port = def?.inputs.find((item) => item.key === edge.targetPort);

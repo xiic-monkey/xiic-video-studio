@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { FolderKanban, Plus, Save, Settings } from 'lucide-react';
+import { Film, FolderKanban, Plus, Save, Settings } from 'lucide-react';
 import { ProjectLibrary } from './ProjectLibrary';
 import { AssetLibrary } from './AssetLibrary';
 import { CanvasView } from '../canvas/CanvasView';
@@ -12,6 +12,8 @@ import { useStudioStore } from '../stores/studioStore';
 import { useBoardStore } from '../stores/boardStore';
 import { useProviderStore } from '../stores/providerStore';
 import { useRunStore } from '../stores/runStore';
+import { TimelineDrawer } from '../media/TimelineDrawer';
+import { ProductionWorkspace } from '../production/ProductionWorkspace';
 
 export function StudioApp() {
   const boot = useStudioStore((state) => state.boot);
@@ -38,6 +40,7 @@ export function StudioApp() {
     Object.values(state.runs).filter((item) => item.status === 'queued' || item.status === 'running').length,
   );
   const [newBoardName, setNewBoardName] = useState('');
+  const [workspaceTab, setWorkspaceTab] = useState<'canvas' | 'production'>('canvas');
 
   useEffect(() => {
     void boot();
@@ -146,6 +149,13 @@ export function StudioApp() {
             </form>
           </section>
           <AssetLibrary projectId={currentProjectId ?? undefined} />
+          <section className="studio-rail-section">
+            <h2>工作区</h2>
+            <div className="studio-list">
+              <button className={workspaceTab === 'canvas' ? 'active' : ''} type="button" onClick={() => setWorkspaceTab('canvas')}><FolderKanban size={12} /><span>画布与时间线</span></button>
+              <button className={workspaceTab === 'production' ? 'active' : ''} type="button" onClick={() => setWorkspaceTab('production')}><Film size={12} /><span>剧本与镜头</span></button>
+            </div>
+          </section>
           <div className="studio-rail-foot">
             <button className="studio-button secondary" onClick={() => { void useBoardStore.getState().flush(); }}>
               <Save size={13} /> 立即保存
@@ -154,8 +164,13 @@ export function StudioApp() {
         </aside>
 
         <main className="studio-main">
-          {board ? (
-            <CanvasView key={board.id} />
+          {board && workspaceTab === 'canvas' ? (
+            <>
+              <CanvasView key={board.id} />
+              <TimelineDrawer projectId={currentProjectId ?? undefined} boardId={board.id} />
+            </>
+          ) : workspaceTab === 'production' ? (
+            <ProductionWorkspace projectId={currentProjectId ?? undefined} boardId={currentBoardId ?? undefined} />
           ) : (
             <ProjectLibrary onOpenBoard={(id) => { void openBoard(id); }} />
           )}

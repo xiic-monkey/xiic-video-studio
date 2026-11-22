@@ -43,4 +43,11 @@ describe('computeCacheKey', () => {
     expect(selectedAssetOf(run({ selectedAssetId: 'asset_b', outputAssetIds: ['asset_a', 'asset_b'] }))).toBe('asset_b');
     expect(selectedAssetOf(run({ selectedAssetId: undefined, outputAssetIds: ['asset_a'] }))).toBe('asset_a');
   });
+
+  it('survives a dangling edge whose source node was deleted', () => {
+    const doc = makeDoc([node('b', 'image')], [edge('e1', 'a', 'b')]);
+    // 悬空边按「缺输入」处理，不能让整块画布崩掉。
+    expect(() => computeCacheKey(doc, 'b', ctx)).not.toThrow();
+    expect(typeof computeCacheKey(doc, 'b', ctx)).toBe('string');
+  });
 });

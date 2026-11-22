@@ -16,6 +16,7 @@ export const nodeTypes: NodeTypes = {
   video: MemoNodeCard,
   audio: MemoNodeCard,
   script: MemoNodeCard,
+  media_source: MemoNodeCard,
   character: MemoNodeCard,
   storyboard: MemoNodeCard,
   expression: MemoNodeCard,

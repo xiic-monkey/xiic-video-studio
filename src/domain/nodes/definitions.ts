@@ -161,6 +161,23 @@ function scriptNode(): NodeDefinition<ScriptNodeData> {
   };
 }
 
+function mediaSourceNode(): NodeDefinition<Record<string, unknown>> {
+  return {
+    type: 'media_source', typeVersion: 1, title: '本地素材', category: 'media',
+    inputs: [],
+    outputs: [{ key: 'output', label: '素材', dataType: 'any' }],
+    fields: [
+      { key: 'assetId', label: '素材 ID', type: 'text', help: '从项目素材库添加后自动绑定' },
+      { key: 'kind', label: '素材类型', type: 'select', options: [
+        { label: '视频', value: 'video' }, { label: '图片', value: 'image' }, { label: '音频', value: 'audio' },
+      ] },
+    ],
+    createDefaults: () => ({ assetId: '', kind: 'video' }),
+    validate: (node) => String(node.data.assetId ?? '').trim() ? [] : [missing('MEDIA_SOURCE_EMPTY', '请选择项目内素材')],
+    actions: [],
+  };
+}
+
 function noteNode(): NodeDefinition<NoteNodeData> {
   return {
     type: 'note', typeVersion: 1, title: '备注', category: 'utility',
@@ -404,6 +421,7 @@ const registry = new Map<string, NodeDefinition<any>>([
   ['video', videoNode()],
   ['audio', audioNode()],
   ['script', scriptNode()],
+  ['media_source', mediaSourceNode()],
   ['character', characterNode()],
   ['storyboard', storyboardNode()],
   ['expression', expressionNode()],

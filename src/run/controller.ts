@@ -4,7 +4,7 @@ import {
 } from '../domain/run/prepare';
 import type { BoardDoc, CostEstimate } from '../domain/types';
 import type { Issue } from '../domain/nodes/types';
-import { cancelRun as cancelRemoteRun, readAssetText, startRun } from '../services/tauri';
+import { cancelRun as cancelRemoteRun, preparePaidRun, readAssetText, startPaidRun } from '../services/tauri';
 import { useBoardStore } from '../stores/boardStore';
 import { useProviderStore } from '../stores/providerStore';
 import { useRunStore } from '../stores/runStore';
@@ -14,6 +14,7 @@ export interface PendingRun {
   boardId: string;
   nodeId: string;
   request: RunRequestDraft;
+  preview: Awaited<ReturnType<typeof preparePaidRun>>;
   label: RunLabel;
   cost?: CostEstimate;
   warnings: Issue[];
@@ -23,7 +24,7 @@ export interface PendingRun {
 interface RunControllerState {
   busy: Record<string, boolean>;
   pending?: PendingRun;
-  requestRun(nodeId: string): Promise<void>;
+  requestRun(nodeId: string, association?: { entityId: string; action: string }): Promise<void>;
   confirmRun(): Promise<void>;
   dismissRun(): void;
   cancelRun(nodeId: string): Promise<void>;
@@ -40,7 +41,9 @@ async function readTexts(assetIds: string[]): Promise<Record<string, string>> {
       return;
     }
     try {
-      const value = await readAssetText(assetId);
+      const projectId = useStudioStore.getState().currentProjectId;
+      if (!projectId) throw new Error('当前项目不存在');
+      const value = await readAssetText(projectId, assetId);
       textCache.set(assetId, value);
       out[assetId] = value;
     } catch (error) {
@@ -81,14 +84,23 @@ function messageOf(error: unknown): string {
 export const useRunController = create<RunControllerState>((set, get) => ({
   busy: {},
 
-  async requestRun(nodeId) {
+  async requestRun(nodeId, association) {
     // 确认框打开期间不再接受新的运行请求：背景里的「运行」按钮此时是失效的，
     // 避免 Enter 之类的按键重复发起运行、替换掉正在等待确认的那一次。
     if (get().pending) return;
-    const doc = useBoardStore.getState().board;
-    if (!doc) return;
+    if (!useBoardStore.getState().board) return;
     set((state) => ({ busy: { ...state.busy, [nodeId]: true } }));
     try {
+      // 运行前先把画布落库：后端按服务端画布校验节点与修订号，
+      // 刚添加还没保存的节点会被判成「未知节点」。
+      if (useBoardStore.getState().dirty) {
+        await useBoardStore.getState().flush();
+        const saveError = useBoardStore.getState().saveError;
+        if (saveError) throw new Error(saveError);
+        if (useBoardStore.getState().dirty) throw new Error('画布正在保存，请稍后再运行');
+      }
+      const doc = useBoardStore.getState().board;
+      if (!doc) return;
       const deps = snapshotDeps(doc);
       const texts = await readTexts(inboundTextAssetIds(doc, nodeId, deps.runs, deps.assets));
       const outcome = prepareRun(doc, nodeId, { ...deps, texts });
@@ -96,8 +108,21 @@ export const useRunController = create<RunControllerState>((set, get) => ({
         notify(outcome.issues.map((issue) => issue.message).join('；'));
         return;
       }
-      if (outcome.cached) {
-        const run = await startRun(outcome.request);
+      const request = association
+        ? {
+            ...outcome.request,
+            entityId: association.entityId,
+            action: association.action,
+            cacheKey: `${outcome.request.cacheKey}:production:${association.entityId}:${association.action}`,
+            cachedAssetId: undefined,
+          }
+        : outcome.request;
+      const preview = await preparePaidRun(request.projectId, request.boardId, doc.revision ?? 0, request);
+      // 生产动作（镜头重拍等）带自己的 cacheKey 后缀，后端不可能命中缓存，
+      // 也不会复用已选候选：这里必须走确认流程，不能拿「缓存命中」的名义
+      // 静默发起一次真实付费运行。
+      if (outcome.cached && !association) {
+        const run = await startPaidRun(preview, request);
         // 只回写这条运行记录：load() 会清空素材表（assets），不能在这里调用。
         useRunStore.getState().upsertRun(run);
         notify('缓存命中，未产生费用');
@@ -107,11 +132,12 @@ export const useRunController = create<RunControllerState>((set, get) => ({
         pending: {
           boardId: doc.id,
           nodeId,
-          request: outcome.request,
+          request,
+          preview,
           label: outcome.label,
           cost: outcome.cost,
           warnings: outcome.warnings,
-          inputCount: outcome.request.inputs.length,
+          inputCount: request.inputs.length,
         },
       });
     } catch (error) {
@@ -133,7 +159,7 @@ export const useRunController = create<RunControllerState>((set, get) => ({
     }
     set({ pending: undefined, busy: { ...get().busy, [pending.nodeId]: true } });
     try {
-      const run = await startRun(pending.request);
+      const run = await startPaidRun(pending.preview, pending.request);
       useRunStore.getState().upsertRun(run);
     } catch (error) {
       notify(messageOf(error));
