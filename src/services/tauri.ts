@@ -217,11 +217,6 @@ export async function cancelMediaTask(projectId: string, jobId: string): Promise
   return invoke<MediaTask>('cancel_media_task', { projectId, jobId });
 }
 
-export async function listProductionEntities(projectId: string, kind?: string): Promise<Array<{ id: string; kind: string; revision: number; schemaVersion: number; payload: unknown; updatedAt: string }>> {
-  if (!isTauri()) return [];
-  return invoke('list_production_entities', { projectId, kind: kind ?? null });
-}
-
 export async function applyProductionChange(projectId: string, changeId: string, expectedRevisions: Record<string, number>, operations: unknown[]): Promise<{ changeId: string; revisionMap: Record<string, number>; affectedIds: string[] }> {
   if (!isTauri()) throw new Error('制作变更只能在桌面应用中保存');
   return invoke('apply_production_change', { projectId, changeId, expectedRevisions, operations });

@@ -149,7 +149,9 @@ function ScriptPanel({ projectId, scripts, shots, busy, onImport, onRefresh }: {
   async function saveScript() {
     if (!projectId || !current) return;
     setSaving(true);
+    setDraftError('');
     try { await applyProductionChange(projectId, crypto.randomUUID(), { [current.id]: current.revision }, [{ id: current.id, kind: 'script', payload: { ...current.payload, title, body, revision: Number(current.payload.revision ?? 1) + 1 } }]); await onRefresh(); if (draftRef.current) setDraftStale(true); }
+    catch (reason) { setDraftError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setSaving(false); }
   }
   async function prepareLocalDraft() {
@@ -234,14 +236,17 @@ function SubjectLibrary({ projectId, subjects, busy, onAdd, onRefresh }: { proje
 function SubjectVersionForm({ projectId, subject, onRefresh }: { projectId?: string; subject: ProductionEntity; onRefresh: () => void }) {
   const [descriptor, setDescriptor] = useState('');
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
   async function save() {
     if (!projectId || !descriptor.trim()) return;
     const ordinal = Number(subject.payload.currentVersion ?? 1) + 1;
     setSaving(true);
+    setError('');
     try { await applyProductionChange(projectId, crypto.randomUUID(), { [subject.id]: subject.revision }, [{ id: subject.id, kind: 'subject', op: 'createSubjectVersion', payload: { ...subject.payload, version: { ordinal, descriptor: descriptor.trim(), references: [] } } }]); setDescriptor(''); onRefresh(); }
+    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setSaving(false); }
   }
-  return <div className="subject-version-form"><textarea aria-label="新版本身份描述" value={descriptor} onChange={(event) => setDescriptor(event.target.value)} placeholder="新版本身份描述" /><button type="button" onClick={() => void save()} disabled={saving || !descriptor.trim()}>保存 v{Number(subject.payload.currentVersion ?? 1) + 1}</button></div>;
+  return <div className="subject-version-form"><textarea aria-label="新版本身份描述" value={descriptor} onChange={(event) => setDescriptor(event.target.value)} placeholder="新版本身份描述" /><button type="button" onClick={() => void save()} disabled={saving || !descriptor.trim()}>保存 v{Number(subject.payload.currentVersion ?? 1) + 1}</button>{error && <p className="production-error" role="alert">{error}</p>}</div>;
 }
 
 function ShotList({ projectId, boardId, entities, shots, subjects, busy, onAdd, onRefresh }: { projectId?: string; boardId?: string; entities: ProductionEntity[]; shots: ProductionEntity[]; subjects: ProductionEntity[]; busy: boolean; onAdd: () => void; onRefresh: () => void }) {
@@ -381,6 +386,7 @@ function ShotCard({ shot, projectId, subjects, assets, runs, scenes, siblingShot
   async function save() {
     setSaving(true);
     try { await applyProductionChange(projectId, crypto.randomUUID(), { [shot.id]: shot.revision }, [{ id: shot.id, kind: 'shot', op: 'setShotBindings', payload: { ...shot.payload, title, action, bindings: subjectId ? [{ bindingId: `${shot.id}:${subjectId}`, subjectId, version: subjectVersion }] : [] } }]); onRefresh(); }
+    catch (reason) { setPreview(reason instanceof Error ? reason.message : String(reason)); }
     finally { setSaving(false); }
   }
   async function previewAction(actionName: string) {

@@ -14,8 +14,6 @@ use tauri::{
     AppHandle, Manager, Runtime,
 };
 
-const MAX_FULL_MEDIA_RESPONSE: u64 = 32 * 1024 * 1024;
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum Rendition {
@@ -108,12 +106,6 @@ pub(crate) fn serve_media_request<R: Runtime>(
     let Some(range) = range else {
         return failure(StatusCode::RANGE_NOT_SATISFIABLE);
     };
-    if request.method() == Method::GET
-        && request.headers().get(header::RANGE).is_none()
-        && media.bytes > MAX_FULL_MEDIA_RESPONSE
-    {
-        return failure(StatusCode::RANGE_NOT_SATISFIABLE);
-    }
     let length = range.end.saturating_sub(range.start);
     let mut response = Response::builder()
         .status(if request.headers().contains_key(header::RANGE) {
