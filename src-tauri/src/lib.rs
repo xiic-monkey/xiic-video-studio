@@ -1289,69 +1289,6 @@ fn list_breakdown_drafts(project_id: String, script_id: String, state: State<'_,
     production::breakdown::list_drafts(&connection, &project_id, &script_id)
 }
 
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ShotRunPreviewView {
-    preview_id: String,
-    fingerprint: String,
-    shot_id: String,
-    action: String,
-    intent: String,
-    warnings: Vec<String>,
-}
-
-#[tauri::command]
-fn prepare_shot_run(
-    project_id: String,
-    shot_id: String,
-    action: String,
-    intent: String,
-    overrides: Option<Value>,
-    state: State<'_, AppState>,
-) -> Result<ShotRunPreviewView, String> {
-    if !matches!(action.as_str(), "storyboard" | "firstFrame" | "lastFrame" | "video" | "dialogue") {
-        return Err("SHOT_ACTION_INVALID".into());
-    }
-    if !matches!(intent.as_str(), "normal" | "regenerate") { return Err("SHOT_INTENT_INVALID".into()); }
-    let path = state.db_path.lock().map_err(|_| "db lock".to_string())?.clone();
-    let connection = db::open(&path)?;
-    let payload: String = connection.query_row("SELECT payload FROM project_entities WHERE id=?1 AND project_id=?2 AND kind='shot' AND archived_at IS NULL", params![shot_id, project_id], |row| row.get(0)).map_err(|_| "SHOT_NOT_FOUND".to_string())?;
-    let shot: Value = serde_json::from_str(&payload).map_err(|_| "SHOT_INVALID".to_string())?;
-    let mut subject_version_ids = Vec::new();
-    let mut generic_reference_ids = Vec::new();
-    for binding in shot["bindings"].as_array().into_iter().flatten() {
-        let subject_id = binding["subjectId"].as_str().ok_or("SHOT_BINDING_INVALID")?;
-        let ordinal = binding["version"].as_i64().ok_or("SHOT_BINDING_INVALID")?;
-        let owner: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM project_entities WHERE id=?1 AND project_id=?2 AND kind='subject' AND archived_at IS NULL)", params![subject_id,project_id], |row| row.get(0)).map_err(|error| error.to_string())?;
-        if !owner { return Err("SHOT_SUBJECT_NOT_IN_PROJECT".into()); }
-        let version_payload: String = connection.query_row("SELECT payload FROM subject_versions WHERE subject_id=?1 AND ordinal=?2", params![subject_id,ordinal], |row| row.get(0)).map_err(|_| "SHOT_SUBJECT_VERSION_NOT_FOUND".to_string())?;
-        let version: Value = serde_json::from_str(&version_payload).map_err(|_| "SHOT_SUBJECT_VERSION_INVALID".to_string())?;
-        subject_version_ids.push(format!("{subject_id}@{ordinal}"));
-        generic_reference_ids.extend(version["references"].as_array().into_iter().flatten().filter_map(|value| value["assetId"].as_str().map(str::to_string)));
-    }
-    generic_reference_ids.extend(shot["genericReferenceIds"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
-    let selected = &shot["selected"];
-    let reference_input = production::references::ShotReferenceInput {
-        subject_version_ids,
-        generic_reference_ids,
-        first_frame_id: selected["firstFrame"]["assetId"].as_str().map(str::to_string),
-        last_frame_id: selected["lastFrame"]["assetId"].as_str().map(str::to_string),
-        previous_tail_frame_id: shot["previousTail"]["frameAssetId"].as_str().map(str::to_string),
-    };
-    let resolved = production::references::resolve_shot_references(&reference_input);
-    for reference in &resolved.ordered_inputs {
-        if !reference.contains('@') {
-            production::repository::require_project_asset(&connection, &project_id, reference).map_err(|_| "SHOT_REFERENCE_NOT_IN_PROJECT")?;
-        }
-    }
-    let mut draft = json!({"projectId":project_id,"shotId":shot_id,"action":action,"intent":intent,"shot":shot,"referenceFingerprint":resolved.fingerprint,"referenceAssetIds":resolved.ordered_inputs});
-    if let Some(overrides) = overrides { draft["overrides"] = overrides; }
-    let prepared = run_authorization::prepare(draft["projectId"].as_str().unwrap_or_default(), "production", &draft);
-    let mut warnings = prepared.warnings;
-    warnings.extend(resolved.excluded_inputs.iter().map(|item| format!("{}:{}", item.id, item.reason)));
-    Ok(ShotRunPreviewView { preview_id: prepared.preview_id, fingerprint: prepared.fingerprint, shot_id, action, intent, warnings })
-}
-
 fn production_operation(
     project_id: String,
     change_id: String,
@@ -1793,7 +1730,6 @@ pub fn run() {
             apply_production_change,
             save_breakdown_draft,
             list_breakdown_drafts,
-            prepare_shot_run,
             adopt_shot_media,
             record_production_review,
             assemble_episode,

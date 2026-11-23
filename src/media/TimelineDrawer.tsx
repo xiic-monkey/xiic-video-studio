@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown, ArrowUp, Captions, Film, Music2, Plus, Scissors, Trash2 } from 'lucide-react';
 import { assetUrl, commitTimelineEdit, createLocalComposeEntity, importSubtitleDocument, listAssets, listMediaTasks, listProductionEntityPage, pickExportTarget, pickSubtitleFile, prepareMediaExport, replaceTimelineClip, startMediaExport, type MediaTask } from '../services/tauri';
 import { applyTimelineEdit, formatSrt, parseSrt, previewClipReplacement, removeAudioTrack, TICKS_PER_SECOND, updateAudioTrack, type TimelineAudioTrack, type TimelineData, type TimelineEdit } from '../domain/media/timeline';
@@ -31,6 +31,24 @@ export function TimelineDrawer({ projectId, boardId }: { projectId?: string; boa
   const [audioGainDraft, setAudioGainDraft] = useState<Record<string, number>>({});
   const [numberDrafts, setNumberDrafts] = useState<Record<string, string>>({});
 
+  // 时间线写入必须串行：数字输入框连续失焦时，后一次提交要在前一次落库后、
+  // 基于最新的 timeline 与 revision 计算，否则会用旧修订冲突或覆盖前一次改动。
+  // ref 始终是「已提交状态」的唯一真相，state 仅用于渲染。
+  const timelineRef = useRef<TimelineData | undefined>(undefined);
+  const revisionRef = useRef(0);
+  const writeChain = useRef<Promise<void>>(Promise.resolve());
+  function enqueue(task: () => Promise<void>): Promise<void> {
+    const run = writeChain.current.then(task, task);
+    writeChain.current = run.then(() => undefined, () => undefined);
+    return run;
+  }
+  function setLoaded(next: TimelineData | undefined, rev: number) {
+    timelineRef.current = next;
+    revisionRef.current = rev;
+    setTimeline(next);
+    setRevision(rev);
+  }
+
   useEffect(() => {
     let active = true;
     if (!projectId) { setAssets([]); setTimeline(undefined); return; }
@@ -41,12 +59,10 @@ export function TimelineDrawer({ projectId, boardId }: { projectId?: string; boa
         ?? entities.find((entity) => entity.id === `${projectId}:${boardId}:compose`)
         ?? entities.find((entity) => entity.payload.boardId === boardId && entity.payload.assemblyScope === 'episode');
       if (existing) {
-        setTimeline(existing.payload as unknown as TimelineData);
-        setRevision(existing.revision);
+        setLoaded(existing.payload as unknown as TimelineData, existing.revision);
         setCueText(formatSrt(((existing.payload as unknown as TimelineData).subtitleCues ?? [])));
       } else {
-        setTimeline(undefined);
-        setRevision(0);
+        setLoaded(undefined, 0);
       }
     }).catch((reason) => { if (active) setError(String(reason)); });
     return () => { active = false; };
@@ -85,36 +101,35 @@ export function TimelineDrawer({ projectId, boardId }: { projectId?: string; boa
     });
   }
 
-  async function save(next: TimelineData): Promise<boolean> {
-    if (!projectId || !timeline) return false;
-    const validation = validateTimelineForSave(next, probedAssets);
-    if (validation.errors.length) {
-      setError(`时间线有 ${validation.errors.length} 个问题，未保存：${validation.errors.join('、')}`);
-      setSaved('');
-      return false;
-    }
-    setBusy(true); setError(''); setSaved('');
-    try {
-      const result = await commitTimelineEdit(projectId, next.id, revision, next as unknown as Record<string, unknown>);
-      setTimeline(next);
-      setRevision(result.revisionMap[next.id] ?? revision + 1);
-      setSaved('已保存');
-      if (validation.warnings.length) setError(`已保存，但有提示：${validation.warnings.join('、')}`);
-      return true;
-    } catch (reason) {
-      setError(describeSaveError(reason));
-      return false;
-    } finally { setBusy(false); }
+  /** 提交一次编辑：在串行队列里基于最新 timeline/revision 计算并落库。 */
+  function save(mutate: (current: TimelineData) => TimelineData): Promise<boolean> {
+    let ok = false;
+    const task = async () => {
+      const current = timelineRef.current;
+      if (!projectId || !current) return;
+      const next = mutate(current);
+      const validation = validateTimelineForSave(next, probedAssets);
+      if (validation.errors.length) {
+        setError(`时间线有 ${validation.errors.length} 个问题，未保存：${validation.errors.join('、')}`);
+        setSaved('');
+        return;
+      }
+      setBusy(true); setError(''); setSaved('');
+      try {
+        const result = await commitTimelineEdit(projectId, next.id, revisionRef.current, next as unknown as Record<string, unknown>);
+        setLoaded(next, result.revisionMap[next.id] ?? revisionRef.current + 1);
+        setSaved('已保存');
+        if (validation.warnings.length) setError(`已保存，但有提示：${validation.warnings.join('、')}`);
+        ok = true;
+      } catch (reason) {
+        setError(describeSaveError(reason));
+      } finally { setBusy(false); }
+    };
+    return enqueue(task).then(() => ok);
   }
 
-  async function apply(edit: TimelineEdit): Promise<boolean> {
-    if (!timeline) return false;
-    try {
-      return await save(applyTimelineEdit(timeline, edit));
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-      return false;
-    }
+  function apply(edit: TimelineEdit): Promise<boolean> {
+    return save((current) => applyTimelineEdit(current, edit));
   }
 
   /** 数字输入框：本地草稿受控，失焦提交；未修改不提交，失败保留草稿。 */
@@ -127,16 +142,19 @@ export function TimelineDrawer({ projectId, boardId }: { projectId?: string; boa
   }
 
   async function replaceClip(clipId: string, assetId: string, sourceInTicks: number, sourceOutTicks: number, acknowledgeShorter: boolean) {
-    if (!projectId || !timeline) return;
-    setBusy(true); setError('');
-    try {
-      const result = await replaceTimelineClip(projectId, timeline.id, revision, clipId, assetId, sourceInTicks, sourceOutTicks, acknowledgeShorter);
-      const next = { ...timeline, clips: timeline.clips.map((clip) => clip.id === clipId ? { ...clip, assetId, sourceInTicks, sourceOutTicks } : clip), revision: timeline.revision + 1 };
-      setTimeline(next);
-      setRevision(result.revisionMap[timeline.id] ?? revision + 1);
-      setSaved('已替换镜头素材');
-    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
-    finally { setBusy(false); }
+    if (!projectId) return;
+    await enqueue(async () => {
+      const current = timelineRef.current;
+      if (!current) return;
+      setBusy(true); setError('');
+      try {
+        const result = await replaceTimelineClip(projectId, current.id, revisionRef.current, clipId, assetId, sourceInTicks, sourceOutTicks, acknowledgeShorter);
+        const next = { ...current, clips: current.clips.map((clip) => clip.id === clipId ? { ...clip, assetId, sourceInTicks, sourceOutTicks } : clip), revision: current.revision + 1 };
+        setLoaded(next, result.revisionMap[current.id] ?? revisionRef.current + 1);
+        setSaved('已替换镜头素材');
+      } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+      finally { setBusy(false); }
+    });
   }
 
   async function createCompose() {
@@ -147,21 +165,20 @@ export function TimelineDrawer({ projectId, boardId }: { projectId?: string; boa
       const validation = validateTimelineForSave(next, probedAssets);
       if (validation.errors.length) { setError(`合成时间线有问题，未创建：${validation.errors.join('、')}`); return; }
       const result = await createLocalComposeEntity(projectId, boardId, next as unknown as Record<string, unknown>);
-      setTimeline(next); setRevision(result.revisionMap[next.id] ?? 1); setCueText(''); setSaved('合成时间线已创建');
+      setLoaded(next, result.revisionMap[next.id] ?? 1); setCueText(''); setSaved('合成时间线已创建');
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setBusy(false); }
   }
 
   async function importSrt() {
-    if (!projectId || !timeline) return;
+    if (!projectId) return;
     try {
       const grant = await pickSubtitleFile(projectId);
       if (!grant) return;
       const document = await importSubtitleDocument(projectId, grant.id);
       const cues = parseSrt(document.text);
-      const next = { ...timeline, subtitleCues: cues, revision: timeline.revision + 1 };
       setCueText(formatSrt(cues));
-      await save(next);
+      await save((current) => ({ ...current, subtitleCues: cues, revision: current.revision + 1 }));
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
   }
 
@@ -172,16 +189,16 @@ export function TimelineDrawer({ projectId, boardId }: { projectId?: string; boa
   }
 
   async function saveCues() {
-    if (!timeline) return;
-    try { await save({ ...timeline, subtitleCues: parseSrt(cueText), revision: timeline.revision + 1 }); }
+    try { await save((current) => ({ ...current, subtitleCues: parseSrt(cueText), revision: current.revision + 1 })); }
     catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
   }
 
   async function exportNow() {
-    if (!projectId || !timeline || busy) return;
+    const current = timelineRef.current;
+    if (!projectId || !current || busy) return;
     setBusy(true); setError('');
     try {
-      const preview = await prepareMediaExport(projectId, timeline.id, revision);
+      const preview = await prepareMediaExport(projectId, current.id, revisionRef.current);
       if (preview.issues.length) throw new Error(`导出预检未通过：${preview.issues.join('、')}`);
       // 阻断级问题必须先修好；必须明确确认级的问题逐条列出来，
       // 用户确认后才继续交付（设计 §9.3）。
@@ -239,10 +256,13 @@ export function TimelineDrawer({ projectId, boardId }: { projectId?: string; boa
                       const midpoint = clip.sourceInTicks + Math.floor((clip.sourceOutTicks - clip.sourceInTicks) / 2 / 8_000) * 8_000;
                       const first = { ...clip, sourceOutTicks: midpoint };
                       const second = { ...clip, id: `${clip.id}_split_${Date.now()}`, sourceInTicks: midpoint };
-                      const clips = [...timeline.clips.slice(0, index), first, second, ...timeline.clips.slice(index + 1)];
-                      void save({ ...timeline, clips, revision: timeline.revision + 1 });
+                      void save((current) => {
+                        const at = current.clips.findIndex((item) => item.id === clip.id);
+                        if (at < 0) return current;
+                        return { ...current, clips: [...current.clips.slice(0, at), first, second, ...current.clips.slice(at + 1)], revision: current.revision + 1 };
+                      });
                     }}><Scissors size={13} /></button>
-                    <button type="button" title="删除片段" aria-label="删除片段" disabled={busy} onClick={() => void save({ ...timeline, clips: timeline.clips.filter((item) => item.id !== clip.id), revision: timeline.revision + 1 })}><Trash2 size={13} /></button>
+                    <button type="button" title="删除片段" aria-label="删除片段" disabled={busy} onClick={() => void save((current) => ({ ...current, clips: current.clips.filter((item) => item.id !== clip.id), revision: current.revision + 1 }))}><Trash2 size={13} /></button>
                     <label>替换素材<select aria-label={`替换片段 ${index + 1} 素材`} value="" disabled={busy} onChange={(event) => {
                       const replacement = videoAssets.find((item) => item.id === event.currentTarget.value);
                       if (!replacement) return;
@@ -259,15 +279,15 @@ export function TimelineDrawer({ projectId, boardId }: { projectId?: string; boa
             })}
             <label className="timeline-add-clip"><Plus size={14} /> 添加视频<select aria-label="添加视频片段" value="" disabled={busy} onChange={(event) => {
               const asset = assets.find((item) => item.id === event.currentTarget.value);
-              if (!asset || !timeline) return;
+              if (!asset) return;
               const clip = { id: `clip_${crypto.randomUUID()}`, assetId: asset.id, sourceInTicks: 0, sourceOutTicks: Math.round((asset.duration ?? 0) * TICKS_PER_SECOND) };
-              void save({ ...timeline, clips: [...timeline.clips, clip], revision: timeline.revision + 1 });
+              void save((current) => ({ ...current, clips: [...current.clips, clip], revision: current.revision + 1 }));
             }}><option value="" disabled>选择视频</option>{videoAssets.map((asset) => <option key={asset.id} value={asset.id}>{asset.provenance.displayName ?? asset.id}</option>)}</select></label>
             <label className="timeline-add-clip"><Music2 size={14} /> 添加音轨<select aria-label="添加音频轨道" value="" disabled={busy} onChange={(event) => {
               const asset = assets.find((item) => item.id === event.currentTarget.value);
-              if (!asset || !timeline) return;
-              const audioTracks = [...(timeline.audioTracks ?? []), { id: `audio_${crypto.randomUUID()}`, assetId: asset.id, sourceInTicks: 0, sourceOutTicks: Math.round((asset.duration ?? 0) * TICKS_PER_SECOND), timelineInTicks: 0, gain: 1 }];
-              void save({ ...timeline, audioTracks, revision: timeline.revision + 1 });
+              if (!asset) return;
+              const audioTrack = { id: `audio_${crypto.randomUUID()}`, assetId: asset.id, sourceInTicks: 0, sourceOutTicks: Math.round((asset.duration ?? 0) * TICKS_PER_SECOND), timelineInTicks: 0, gain: 1 };
+              void save((current) => ({ ...current, audioTracks: [...(current.audioTracks ?? []), audioTrack], revision: current.revision + 1 }));
             }}><option value="" disabled>选择音频</option>{assets.filter((asset) => asset.kind === 'audio').map((asset) => <option key={asset.id} value={asset.id}>{asset.provenance.displayName ?? asset.id}</option>)}</select></label>
           </div>
           {(timeline.audioTracks ?? []).map((track, index) => {
@@ -277,8 +297,7 @@ export function TimelineDrawer({ projectId, boardId }: { projectId?: string; boa
             const startKey = timelineNumberDraftKey('audio', track.id, 'timelineIn');
             const update = async (patch: Partial<TimelineAudioTrack>, draftKey?: string): Promise<boolean> => {
               try {
-                const next = updateAudioTrack(timeline, track.id, patch);
-                const ok = await save(next);
+                const ok = await save((current) => updateAudioTrack(current, track.id, patch));
                 if (!ok) return false;
                 if (draftKey) clearNumberDraft(draftKey);
                 else setAudioGainDraft((draft) => { const nextDraft = { ...draft }; delete nextDraft[track.id]; return nextDraft; });
@@ -287,7 +306,7 @@ export function TimelineDrawer({ projectId, boardId }: { projectId?: string; boa
               catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); return false; }
             };
             return <article className="timeline-audio-track" key={track.id}>
-              <header><b><Music2 size={13} /> {asset?.provenance.displayName ?? `音轨 ${index + 1}`}</b><button type="button" aria-label={`删除音轨 ${index + 1}`} title="删除音轨" disabled={busy} onClick={() => void save(removeAudioTrack(timeline, track.id))}><Trash2 size={13} /></button></header>
+              <header><b><Music2 size={13} /> {asset?.provenance.displayName ?? `音轨 ${index + 1}`}</b><button type="button" aria-label={`删除音轨 ${index + 1}`} title="删除音轨" disabled={busy} onClick={() => void save((current) => removeAudioTrack(current, track.id))}><Trash2 size={13} /></button></header>
               <label>源入点<input aria-label={`音轨 ${index + 1} 源入点`} type="number" min="0" step="0.001" value={numberDrafts[inKey] ?? seconds(track.sourceInTicks)} onChange={(event) => setNumberDrafts((draft) => ({ ...draft, [inKey]: event.currentTarget.value }))} onBlur={(event) => void commitNumber(inKey, event.currentTarget.value, track.sourceInTicks, (nextTicks) => update({ sourceInTicks: nextTicks }, inKey), `音轨 ${index + 1} 源入点`)} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} /></label>
               <label>源出点<input aria-label={`音轨 ${index + 1} 源出点`} type="number" min="0" step="0.001" value={numberDrafts[outKey] ?? seconds(track.sourceOutTicks)} onChange={(event) => setNumberDrafts((draft) => ({ ...draft, [outKey]: event.currentTarget.value }))} onBlur={(event) => void commitNumber(outKey, event.currentTarget.value, track.sourceOutTicks, (nextTicks) => update({ sourceOutTicks: nextTicks }, outKey), `音轨 ${index + 1} 源出点`)} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} /></label>
               <label>时间线起点<input aria-label={`音轨 ${index + 1} 时间线起点`} type="number" min="0" step="0.001" value={numberDrafts[startKey] ?? seconds(track.timelineInTicks)} onChange={(event) => setNumberDrafts((draft) => ({ ...draft, [startKey]: event.currentTarget.value }))} onBlur={(event) => void commitNumber(startKey, event.currentTarget.value, track.timelineInTicks, (nextTicks) => update({ timelineInTicks: nextTicks }, startKey), `音轨 ${index + 1} 时间线起点`)} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} /></label>

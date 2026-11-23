@@ -232,20 +232,6 @@ export async function listBreakdownDrafts(projectId: string, scriptId: string): 
   return invoke<unknown[]>('list_breakdown_drafts', { projectId, scriptId });
 }
 
-export interface ShotRunPreview {
-  previewId: string;
-  fingerprint: string;
-  shotId: string;
-  action: string;
-  intent: string;
-  warnings: string[];
-}
-
-export async function prepareShotRun(projectId: string, shotId: string, action: string, intent: 'normal' | 'regenerate' = 'normal', overrides?: Record<string, unknown>): Promise<ShotRunPreview> {
-  if (!isTauri()) throw new Error('镜头生成预览仅支持桌面应用');
-  return invoke('prepare_shot_run', { projectId, shotId, action, intent, overrides: overrides ?? null });
-}
-
 export async function adoptShotMedia(projectId: string, changeId: string, expectedRevisions: Record<string, number>, shotId: string, slot: string, assetId: string, specHash: string): Promise<{ changeId: string; revisionMap: Record<string, number>; affectedIds: string[] }> {
   if (!isTauri()) throw new Error('镜头采纳仅支持桌面应用');
   return invoke('adopt_shot_media', { projectId, changeId, expectedRevisions, shotId, slot, assetId, specHash });
