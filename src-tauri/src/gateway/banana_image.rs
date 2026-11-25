@@ -8,8 +8,10 @@ use super::{
 use serde_json::{json, Value};
 
 const LABEL: &str = "Nano Banana";
-/// Gemini 支持的画面比例。
-const RATIO_NAMES: [&str; 5] = ["9:16", "16:9", "1:1", "3:4", "4:3"];
+/// Gemini 支持的画面比例：标准 10 种 + 4 种超宽幅（Nano Banana 2 起）。
+const RATIO_NAMES: [&str; 14] = [
+    "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9", "1:4", "4:1", "1:8", "8:1",
+];
 
 pub async fn execute(
     client: &reqwest::Client,
@@ -37,20 +39,27 @@ pub async fn execute(
         &runtime.profile.base_url,
         &format!("/v1beta/models/{}:generateContent", request.model),
     );
-    let response = client
-        .post(url)
-        .header("x-goog-api-key", &runtime.api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| super::map_reqwest(error, LABEL))?;
-    let value = read_json(response, LABEL).await?;
-    let outputs = image_outputs(&value)?;
+    // Nano Banana 每次只返回一张图：要多张就得发多次请求再把结果合并。
+    let count = request.params.get("count").and_then(Value::as_u64).unwrap_or(1).clamp(1, 4);
+    let mut outputs = Vec::new();
+    let mut raw: Option<Value> = None;
+    for _ in 0..count {
+        let response = client
+            .post(url.clone())
+            .header("x-goog-api-key", &runtime.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| super::map_reqwest(error, LABEL))?;
+        let value = read_json(response, LABEL).await?;
+        outputs.extend(image_outputs(&value)?);
+        raw = Some(value);
+    }
     Ok(AdapterResult {
         status: "succeeded".to_string(),
         outputs,
         task_id: None,
-        raw: Some(value),
+        raw,
     })
 }
 
@@ -164,11 +173,11 @@ fn parse_size(size: &str) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
-/// 图片分辨率只允许 1K / 2K。
+/// 图片分辨率只允许 1K / 2K / 4K。
 fn image_size(resolution: Option<&str>) -> String {
     let value = resolution.unwrap_or("").trim().to_ascii_uppercase();
-    if value == "2K" {
-        return "2K".to_string();
+    if value == "2K" || value == "4K" {
+        return value;
     }
     "1K".to_string()
 }
@@ -289,9 +298,39 @@ mod tests {
             .await
             .expect("submit");
         assert_eq!(result.status, "succeeded");
-        assert_eq!(result.outputs.len(), 1);
+        // Nano Banana 一次只出一张：count=2 要发两次请求再合并结果。
+        assert_eq!(result.outputs.len(), 2);
         assert_eq!(result.outputs[0].data.as_deref(), Some("aGVsbG8="));
         assert_eq!(result.outputs[0].mime, "image/png");
+    }
+
+    /// 4K 是 Nano Banana 2.1 起支持的档位。
+    #[tokio::test]
+    async fn supports_4k_resolution() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/test-model:generateContent"))
+            .and(body_partial_json(json!({
+                "generationConfig": {
+                    "imageConfig": { "imageSize": "4K" }
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "candidates": [{
+                    "content": { "parts": [
+                        { "inlineData": { "mimeType": "image/png", "data": "aGVsbG8=" } }
+                    ] }
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let mut request = request();
+        request.params["resolution"] = json!("4K");
+        request.params["count"] = json!(1);
+        let result = execute(&reqwest::Client::new(), &runtime(&server.uri()), &request)
+            .await
+            .expect("4K");
+        assert_eq!(result.outputs.len(), 1);
     }
 
     #[tokio::test]

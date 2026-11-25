@@ -1230,7 +1230,7 @@ mod tests {
             "enabled": true,
             "schemaVersion": 2,
             "models": [{
-                "id": "gpt-image-1",
+                "id": "gpt-image-2.6-flare",
                 "displayName": "GPT Image 1",
                 "params": [{ "key": "quality", "label": "质量", "type": "select" }],
                 "capabilities": [{

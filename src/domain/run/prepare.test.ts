@@ -56,7 +56,7 @@ describe('prepareRun', () => {
     expect(outcome.request.capability).toBe('image.generate');
     // 自动路由：供应商留空，由后端按模型下的供应商顺序逐家尝试。
     expect(outcome.request.providerId).toBe('');
-    expect(outcome.request.model).toBe('gpt-image-1');
+    expect(outcome.request.model).toBe('gpt-image-2.6-flare');
     expect(outcome.request.inputs).toEqual([]);
   });
 
@@ -291,7 +291,7 @@ describe('prepareRun', () => {
     const seedance: ProviderProfile = {
       ...TEST_PROFILES[1],
       models: [{
-        id: 'doubao-seedance-1-0-pro-250528',
+        id: 'doubao-seedance-2-5-260628',
         displayName: 'Seedance 1.0 Pro',
         capabilities: [{
           capability: 'video.generate',
@@ -321,14 +321,14 @@ describe('prepareRun', () => {
     const seedance: ProviderProfile = {
       ...TEST_PROFILES[1],
       models: [{
-        id: 'doubao-seedance-1-0-pro-250528',
-        displayName: 'Seedance 1.0 Pro',
+        id: 'doubao-seedance-2-5-260628',
+        displayName: 'Seedance 2.5',
         capabilities: [{
           capability: 'video.generate',
           modes: ['t2v', 'firstLast', 'reference'],
           durations: { min: 4, max: 30, step: 1 },
           ratios: ['16:9', '9:16'],
-          resolutions: ['480p', '720p', '1080p'],
+          resolutions: ['480p', '720p', '1080p', '4k'],
           inputTransport: ['publicUrl'],
           async: true,
         }],
@@ -341,7 +341,8 @@ describe('prepareRun', () => {
     }));
     if (!outcome.ok) throw new Error(outcome.issues.map((issue) => issue.message).join('；'));
     expect(outcome.request.params.resolution).toBe('720p');
-    expect(outcome.request.params.generateAudio).toBe(false);
+    // Seedance 2.x 默认生成有声视频。
+    expect(outcome.request.params.generateAudio).toBe(true);
   });
 
   it('estimates cost from the priced capability', () => {

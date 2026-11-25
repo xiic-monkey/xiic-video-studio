@@ -44,6 +44,8 @@ export const TEXT_PROTOCOL_PARAM_MAP: Record<string, string[]> = {
   'anthropic-messages': ['temperature', 'maxTokens'],
 };
 
+const RATIO_OPTIONS = (ratios: string[]) => ratios.map((value) => ({ label: value, value }));
+
 const IMAGE_PARAMS: ParamDef[] = [
   {
     key: 'size', label: '尺寸', type: 'select',
@@ -57,17 +59,66 @@ const IMAGE_PARAMS: ParamDef[] = [
   { key: 'count', label: '生成数量', type: 'number', min: 1, max: 4, step: 1, default: 2 },
 ];
 
-/** Nano Banana 的图片分辨率档位与适配器 image_size 对齐（只认 1K / 2K）。 */
-const BANANA_PARAMS: ParamDef[] = [
+/**
+ * GPT Image 系列的参数。
+ *
+ * complexity 是 GPT-Image-2.6 起才有的字段（控制渲染前的规划深度）：
+ * 默认 auto 表示不下发，避免旧模型收到不认识的字段直接报错。
+ */
+const GPT_IMAGE_PARAMS: ParamDef[] = [
   ...IMAGE_PARAMS,
+  {
+    // gpt-image 系列的合法档位是 low / medium / high / auto。
+    key: 'quality', label: '质量', type: 'select',
+    options: [
+      { label: 'auto（服务端默认）', value: 'auto' },
+      { label: '低', value: 'low' },
+      { label: '中', value: 'medium' },
+      { label: '高', value: 'high' },
+    ],
+    default: 'auto',
+  },
+  {
+    key: 'complexity', label: '复杂度', type: 'select',
+    options: [
+      { label: 'auto（服务端默认）', value: 'auto' },
+      { label: '低', value: 'low' },
+      { label: '中', value: 'medium' },
+      { label: '高', value: 'high' },
+    ],
+    default: 'auto',
+    help: '画面文字密集、布局复杂时提高复杂度，只换背景时调低可省 token。',
+  },
+];
+
+/** Nano Banana 支持的画面比例：标准 10 种 + 4 种超宽幅。 */
+const BANANA_RATIOS = [
+  '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9',
+  '1:4', '4:1', '1:8', '8:1',
+];
+
+/**
+ * Nano Banana 的图片参数。
+ *
+ * Nano Banana 每次只返回一张图：count 大于 1 时由适配器发多次请求再合并。
+ * 分辨率档位 1K / 2K / 4K 与适配器 image_size 对齐。
+ */
+const BANANA_PARAMS: ParamDef[] = [
   {
     key: 'resolution', label: '分辨率', type: 'select',
     options: [
       { label: '1K', value: '1K' },
       { label: '2K', value: '2K' },
+      { label: '4K', value: '4K' },
     ],
     default: '1K',
   },
+  {
+    key: 'aspectRatio', label: '画面比例', type: 'select',
+    options: RATIO_OPTIONS(BANANA_RATIOS),
+    default: '1:1',
+  },
+  { key: 'count', label: '生成数量', type: 'number', min: 1, max: 4, step: 1, default: 1 },
 ];
 
 const VIDEO_PARAMS: ParamDef[] = [
@@ -110,20 +161,62 @@ const MIMO_AUDIO_PARAMS: ParamDef[] = AUDIO_PARAMS.map((param) => (
   param.key === 'voice' ? { ...param, default: 'mimo_default' } : param
 ));
 
-const RATIO_OPTIONS = (ratios: string[]) => ratios.map((value) => ({ label: value, value }));
+/** Seedance 的画面比例：首尾帧/编辑/延长任务由适配器强制 adaptive。 */
+const SEEDANCE_RATIOS = ['21:9', '16:9', '4:3', '1:1', '3:4', '9:16', 'adaptive'];
+
+/**
+ * Seedance 的参数。
+ *
+ * taskType 对应接口的 omni_reference_task_type：auto（模型自动判定）/
+ * reference（参考生视频）/ edit（视频编辑）/ extend（视频延长）。
+ * edit 与 extend 必须带参考视频，适配器会做前置校验。
+ */
+const SEEDANCE_PARAMS: ParamDef[] = [
+  { key: 'duration', label: '时长（秒）', type: 'number', min: 4, max: 30, step: 1, default: 5 },
+  {
+    key: 'resolution', label: '分辨率', type: 'select',
+    options: [
+      { label: '480p', value: '480p' },
+      { label: '720p', value: '720p' },
+      { label: '1080p', value: '1080p' },
+      { label: '4K', value: '4k' },
+    ],
+    default: '720p',
+  },
+  {
+    key: 'aspectRatio', label: '画面比例', type: 'select',
+    options: RATIO_OPTIONS(SEEDANCE_RATIOS),
+    default: '9:16',
+  },
+  { key: 'generateAudio', label: '生成原生音频', type: 'toggle', default: true },
+  {
+    key: 'taskType', label: '任务类型', type: 'select',
+    options: [
+      { label: '自动判定', value: 'auto' },
+      { label: '参考生视频', value: 'reference' },
+      { label: '视频编辑', value: 'edit' },
+      { label: '视频延长', value: 'extend' },
+    ],
+    default: 'auto',
+    help: '视频编辑/视频延长需要接入参考视频；首尾帧任务会自动改用自适应比例。',
+  },
+];
 
 /**
  * 内置模型目录。新增模型只改这里，不改适配器代码。
+ *
+ * 目录里的 id 一律用官方 API 的真实模型 ID：目录同时是「创建供应商」时的
+ * 建议值，填错 id 会直接调用失败。
  */
 export const CATALOG: CatalogModel[] = [
   {
-    id: 'gpt-4o-mini',
-    displayName: 'GPT-4o mini',
+    id: 'gpt-6-astra',
+    displayName: 'GPT-6 Astra',
     vendor: 'OpenAI',
     capabilities: [
       {
         capability: 'text.chat',
-        maxPromptChars: 128000,
+        maxPromptChars: 1050000,
         inputTransport: ['dataUrl'],
         async: false,
         protocols: ['openai-chat', 'openai-responses'],
@@ -135,13 +228,13 @@ export const CATALOG: CatalogModel[] = [
     ],
   },
   {
-    id: 'gpt-4.1',
-    displayName: 'GPT-4.1',
+    id: 'gpt-5.5',
+    displayName: 'GPT-5.5',
     vendor: 'OpenAI',
     capabilities: [
       {
         capability: 'text.chat',
-        maxPromptChars: 1048576,
+        maxPromptChars: 1000000,
         inputTransport: ['dataUrl'],
         async: false,
         protocols: ['openai-chat', 'openai-responses'],
@@ -153,13 +246,31 @@ export const CATALOG: CatalogModel[] = [
     ],
   },
   {
-    id: 'claude-sonnet-4',
-    displayName: 'Claude Sonnet 4',
+    id: 'gpt-5.4-mini',
+    displayName: 'GPT-5.4 mini',
+    vendor: 'OpenAI',
+    capabilities: [
+      {
+        capability: 'text.chat',
+        maxPromptChars: 400000,
+        inputTransport: ['dataUrl'],
+        async: false,
+        protocols: ['openai-chat', 'openai-responses'],
+      },
+    ],
+    params: [...TEXT_PARAMS],
+    suggestedProviders: [
+      { name: 'OpenAI', baseUrl: 'https://api.openai.com', protocol: 'openai-chat' },
+    ],
+  },
+  {
+    id: 'claude-opus-5-5',
+    displayName: 'Claude Opus 5.5',
     vendor: 'Anthropic',
     capabilities: [
       {
         capability: 'text.chat',
-        maxPromptChars: 200000,
+        maxPromptChars: 1000000,
         inputTransport: ['dataUrl'],
         async: false,
         protocols: ['anthropic-messages'],
@@ -171,13 +282,49 @@ export const CATALOG: CatalogModel[] = [
     ],
   },
   {
-    id: 'deepseek-chat',
-    displayName: 'DeepSeek Chat',
+    id: 'claude-sonnet-5-5',
+    displayName: 'Claude Sonnet 5.5',
+    vendor: 'Anthropic',
+    capabilities: [
+      {
+        capability: 'text.chat',
+        maxPromptChars: 1000000,
+        inputTransport: ['dataUrl'],
+        async: false,
+        protocols: ['anthropic-messages'],
+      },
+    ],
+    params: [...TEXT_PARAMS],
+    suggestedProviders: [
+      { name: 'Anthropic', baseUrl: 'https://api.anthropic.com', protocol: 'anthropic-messages', authType: 'header' },
+    ],
+  },
+  {
+    id: 'claude-haiku-5-5',
+    displayName: 'Claude Haiku 5.5',
+    vendor: 'Anthropic',
+    capabilities: [
+      {
+        capability: 'text.chat',
+        maxPromptChars: 1000000,
+        inputTransport: ['dataUrl'],
+        async: false,
+        protocols: ['anthropic-messages'],
+      },
+    ],
+    params: [...TEXT_PARAMS],
+    suggestedProviders: [
+      { name: 'Anthropic', baseUrl: 'https://api.anthropic.com', protocol: 'anthropic-messages', authType: 'header' },
+    ],
+  },
+  {
+    id: 'deepseek-v4-pro',
+    displayName: 'DeepSeek V4 Pro',
     vendor: 'DeepSeek',
     capabilities: [
       {
         capability: 'text.chat',
-        maxPromptChars: 64000,
+        maxPromptChars: 1000000,
         inputTransport: ['dataUrl'],
         async: false,
         protocols: ['openai-chat'],
@@ -189,8 +336,26 @@ export const CATALOG: CatalogModel[] = [
     ],
   },
   {
-    id: 'mimo-v2.5',
-    displayName: 'MiMo V2.5',
+    id: 'deepseek-v4-flash',
+    displayName: 'DeepSeek V4 Flash',
+    vendor: 'DeepSeek',
+    capabilities: [
+      {
+        capability: 'text.chat',
+        maxPromptChars: 1000000,
+        inputTransport: ['dataUrl'],
+        async: false,
+        protocols: ['openai-chat'],
+      },
+    ],
+    params: [...TEXT_PARAMS],
+    suggestedProviders: [
+      { name: 'DeepSeek', baseUrl: 'https://api.deepseek.com', protocol: 'openai-chat' },
+    ],
+  },
+  {
+    id: 'mimo-v2.6-pro',
+    displayName: 'MiMo V2.6 Pro',
     vendor: '小米 MiMo',
     capabilities: [
       {
@@ -207,13 +372,31 @@ export const CATALOG: CatalogModel[] = [
     ],
   },
   {
-    id: 'qwen-max',
-    displayName: '通义千问 Max',
+    id: 'mimo-v2.6-flash',
+    displayName: 'MiMo V2.6 Flash',
+    vendor: '小米 MiMo',
+    capabilities: [
+      {
+        capability: 'text.chat',
+        maxPromptChars: 1000000,
+        inputTransport: ['dataUrl'],
+        async: false,
+        protocols: ['openai-chat', 'anthropic-messages'],
+      },
+    ],
+    params: [...TEXT_PARAMS],
+    suggestedProviders: [
+      { name: '小米 MiMo', baseUrl: 'https://api.xiaomimimo.com', protocol: 'openai-chat' },
+    ],
+  },
+  {
+    id: 'qwen4-max',
+    displayName: '通义千问 4 Max',
     vendor: '阿里通义千问',
     capabilities: [
       {
         capability: 'text.chat',
-        maxPromptChars: 32000,
+        maxPromptChars: 1000000,
         inputTransport: ['dataUrl'],
         async: false,
         protocols: ['openai-chat'],
@@ -225,8 +408,8 @@ export const CATALOG: CatalogModel[] = [
     ],
   },
   {
-    id: 'gpt-image-1',
-    displayName: 'GPT Image 1',
+    id: 'gpt-image-2.6-flare',
+    displayName: 'GPT Image 2.6 Flare',
     vendor: 'OpenAI',
     capabilities: [
       {
@@ -244,31 +427,51 @@ export const CATALOG: CatalogModel[] = [
         protocols: ['openai-images'],
       },
     ],
-    params: [
-      ...IMAGE_PARAMS,
-      {
-        // gpt-image 系列的合法档位是 low / medium / high / auto。
-        key: 'quality', label: '质量', type: 'select',
-        options: [
-          { label: 'auto（服务端默认）', value: 'auto' },
-          { label: '低', value: 'low' },
-          { label: '中', value: 'medium' },
-          { label: '高', value: 'high' },
-        ],
-        default: 'auto',
-      },
-    ],
+    params: [...GPT_IMAGE_PARAMS],
     suggestedProviders: [
       { name: 'OpenAI', baseUrl: 'https://api.openai.com', protocol: 'openai-images' },
     ],
   },
   {
-    id: 'nano-banana',
-    displayName: 'Nano Banana',
+    id: 'gpt-image-2.6-sunburst',
+    displayName: 'GPT Image 2.6 Sunburst',
+    vendor: 'OpenAI',
+    capabilities: [
+      {
+        capability: 'image.generate',
+        inputTransport: ['dataUrl', 'multipart'],
+        async: false,
+        protocols: ['openai-images'],
+      },
+      {
+        capability: 'image.edit',
+        maxReferenceImages: 4,
+        supportsMask: true,
+        inputTransport: ['dataUrl', 'multipart'],
+        async: false,
+        protocols: ['openai-images'],
+      },
+    ],
+    params: [...GPT_IMAGE_PARAMS],
+    suggestedProviders: [
+      { name: 'OpenAI', baseUrl: 'https://api.openai.com', protocol: 'openai-images' },
+    ],
+  },
+  {
+    id: 'gemini-nano-banana-2.1',
+    displayName: 'Nano Banana 2.1',
     vendor: 'Google Gemini',
     capabilities: [
       {
         capability: 'image.generate',
+        maxReferenceImages: 14,
+        inputTransport: ['dataUrl'],
+        async: false,
+        protocols: ['banana-image'],
+      },
+      {
+        capability: 'image.edit',
+        maxReferenceImages: 14,
         inputTransport: ['dataUrl'],
         async: false,
         protocols: ['banana-image'],
@@ -280,8 +483,33 @@ export const CATALOG: CatalogModel[] = [
     ],
   },
   {
-    id: 'qwen-image',
-    displayName: '通义万相 Qwen Image',
+    id: 'gemini-3-pro-image',
+    displayName: 'Nano Banana Pro',
+    vendor: 'Google Gemini',
+    capabilities: [
+      {
+        capability: 'image.generate',
+        maxReferenceImages: 14,
+        inputTransport: ['dataUrl'],
+        async: false,
+        protocols: ['banana-image'],
+      },
+      {
+        capability: 'image.edit',
+        maxReferenceImages: 14,
+        inputTransport: ['dataUrl'],
+        async: false,
+        protocols: ['banana-image'],
+      },
+    ],
+    params: [...BANANA_PARAMS],
+    suggestedProviders: [
+      { name: 'Google Gemini', baseUrl: 'https://generativelanguage.googleapis.com', protocol: 'banana-image' },
+    ],
+  },
+  {
+    id: 'qwen-image-3.0',
+    displayName: '通义万相 Qwen Image 3.0',
     vendor: '阿里通义万相',
     capabilities: [
       {
@@ -305,8 +533,33 @@ export const CATALOG: CatalogModel[] = [
     ],
   },
   {
-    id: 'seedream-4.0',
-    displayName: 'Seedream 4.0',
+    id: 'qwen-image-3.0-pro',
+    displayName: '通义万相 Qwen Image 3.0 Pro',
+    vendor: '阿里通义万相',
+    capabilities: [
+      {
+        capability: 'image.generate',
+        maxReferenceImages: 3,
+        inputTransport: ['dataUrl', 'publicUrl'],
+        async: true,
+        protocols: ['qwen-image'],
+      },
+      {
+        capability: 'image.edit',
+        maxReferenceImages: 3,
+        inputTransport: ['dataUrl', 'publicUrl'],
+        async: true,
+        protocols: ['qwen-image'],
+      },
+    ],
+    params: [...IMAGE_PARAMS],
+    suggestedProviders: [
+      { name: '阿里百炼', baseUrl: 'https://dashscope.aliyuncs.com', protocol: 'qwen-image' },
+    ],
+  },
+  {
+    id: 'doubao-seedream-5-5-261028',
+    displayName: 'Seedream 5.5',
     vendor: '字节 即梦',
     capabilities: [
       {
@@ -376,58 +629,101 @@ export const CATALOG: CatalogModel[] = [
     ],
   },
   {
-    id: 'doubao-seedance-1-0-pro-250528',
-    displayName: 'Seedance 1.0 Pro',
+    id: 'doubao-seedance-2-5-260628',
+    displayName: 'Seedance 2.5',
     vendor: '火山方舟',
     capabilities: [
       {
         capability: 'video.generate',
         modes: ['t2v', 'firstLast', 'reference'],
-        maxReferenceImages: 10,
-        // Seedance 协议只接受图片参考，视频/音频参考必须拦下并提示，不能静默丢弃。
-        maxReferenceVideos: 0,
-        maxReferenceAudios: 0,
+        // Seedance 2.5 系列：参考图 0–30 张、参考视频 0–10 个、参考音频 0–10 段。
+        maxReferenceImages: 30,
+        maxReferenceVideos: 10,
+        maxReferenceAudios: 10,
         supportsFirstFrame: true,
         supportsLastFrame: true,
-        supportsNativeAudio: false,
+        supportsNativeAudio: true,
         durations: { min: 4, max: 30, step: 1 },
-        ratios: ['21:9', '16:9', '4:3', '1:1', '3:4', '9:16', 'adaptive'],
-        resolutions: ['480p', '720p', '1080p'],
+        ratios: SEEDANCE_RATIOS,
+        resolutions: ['480p', '720p', '1080p', '4k'],
         maxPromptChars: 2000,
         inputTransport: ['publicUrl'],
         async: true,
         protocols: ['seedance-video'],
       },
     ],
-    params: [
-      { key: 'duration', label: '时长（秒）', type: 'number', min: 4, max: 30, step: 1, default: 5 },
-      {
-        key: 'resolution', label: '分辨率', type: 'select',
-        options: [
-          { label: '480p', value: '480p' },
-          { label: '720p', value: '720p' },
-          { label: '1080p', value: '1080p' },
-        ],
-        default: '720p',
-      },
-      {
-        key: 'aspectRatio', label: '画面比例', type: 'select',
-        options: RATIO_OPTIONS(['21:9', '16:9', '4:3', '1:1', '3:4', '9:16', 'adaptive']),
-        default: '16:9',
-      },
-      { key: 'generateAudio', label: '生成原生音频', type: 'toggle', default: false },
-    ],
+    params: [...SEEDANCE_PARAMS],
     defaults: {
       submitPath: '/api/v3/contents/generations/tasks',
       pollPath: '/api/v3/contents/generations/tasks/{task_id}',
+      seedance: {
+        // 2.5 起支持 omni_reference_task_type，也允许只传音频。
+        taskType: true,
+        audioOnly: true,
+      },
     },
     suggestedProviders: [
       { name: '火山方舟', baseUrl: 'https://ark.cn-beijing.volces.com', protocol: 'seedance-video' },
     ],
   },
   {
-    id: 'speech-02-hd',
-    displayName: 'Speech 02 HD',
+    id: 'doubao-seedance-2-0-260128',
+    displayName: 'Seedance 2.0',
+    vendor: '火山方舟',
+    capabilities: [
+      {
+        capability: 'video.generate',
+        modes: ['t2v', 'firstLast', 'reference'],
+        // Seedance 2.0 系列：参考图 0–9 张、参考视频 0–3 个、参考音频 0–3 段。
+        maxReferenceImages: 9,
+        maxReferenceVideos: 3,
+        maxReferenceAudios: 3,
+        supportsFirstFrame: true,
+        supportsLastFrame: true,
+        supportsNativeAudio: true,
+        durations: { min: 4, max: 15, step: 1 },
+        ratios: SEEDANCE_RATIOS,
+        resolutions: ['480p', '720p', '1080p', '4k'],
+        maxPromptChars: 2000,
+        inputTransport: ['publicUrl'],
+        async: true,
+        protocols: ['seedance-video'],
+      },
+    ],
+    params: [...SEEDANCE_PARAMS],
+    defaults: {
+      submitPath: '/api/v3/contents/generations/tasks',
+      pollPath: '/api/v3/contents/generations/tasks/{task_id}',
+      seedance: {
+        // 2.0 没有 omni_reference_task_type，也不允许只传音频。
+        taskType: false,
+        audioOnly: false,
+      },
+    },
+    suggestedProviders: [
+      { name: '火山方舟', baseUrl: 'https://ark.cn-beijing.volces.com', protocol: 'seedance-video' },
+    ],
+  },
+  {
+    id: 'speech-2.8-hd',
+    displayName: 'Speech 2.8 HD',
+    vendor: 'MiniMax',
+    capabilities: [
+      {
+        capability: 'audio.tts',
+        inputTransport: [],
+        async: false,
+        protocols: ['minimax-tts'],
+      },
+    ],
+    params: [...AUDIO_PARAMS],
+    suggestedProviders: [
+      { name: 'MiniMax', baseUrl: 'https://api.minimax.io', protocol: 'minimax-tts' },
+    ],
+  },
+  {
+    id: 'speech-2.8-turbo',
+    displayName: 'Speech 2.8 Turbo',
     vendor: 'MiniMax',
     capabilities: [
       {

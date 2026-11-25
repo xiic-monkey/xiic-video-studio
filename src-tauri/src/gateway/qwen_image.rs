@@ -8,10 +8,20 @@ use super::{
 use serde_json::{json, Value};
 
 const LABEL: &str = "通义万相";
-/// 百炼异步文生图 / 图生图提交端点。
+/// 百炼异步文生图 / 图生图提交端点（qwen-image 首发系列的 image-synthesis 接口）。
 const SUBMIT_PATH: &str = "/api/v1/services/aigc/text2image/image-synthesis";
+/// 3.0 / 2.1 系列换用 image-generation 提交端点，异步查询地址不变。
+const MULTIMODAL_SUBMIT_PATH: &str = "/api/v1/services/aigc/image-generation/generation";
 /// 异步任务查询端点前缀。
 const TASK_PATH: &str = "/api/v1/tasks";
+
+/**
+ * 3.0 / 2.1 系列换了端点和请求体：走 multimodal-generation 的 messages 结构，
+ * 老的 qwen-image 仍然用 image-synthesis 的 prompt/images 结构。
+ */
+fn uses_multimodal_generation(model: &str) -> bool {
+    model.starts_with("qwen-image-3") || model.starts_with("qwen-image-2.1")
+}
 
 pub async fn execute(
     client: &reqwest::Client,
@@ -21,31 +31,55 @@ pub async fn execute(
     let size = dash_size(request.params.get("size").and_then(Value::as_str));
     let count = request.params.get("count").and_then(Value::as_u64).unwrap_or(1).clamp(1, 4);
 
-    let mut input = json!({ "prompt": request.prompt });
-    // 图生图：参考图放 input.images，没有参考图就不带这个字段。
-    let images: Vec<Value> = request
-        .inputs
-        .iter()
-        .filter(|item| item.kind == "image")
-        .map(|item| json!({ "image": item.value }))
-        .collect();
-    if !images.is_empty() {
-        input["images"] = Value::Array(images);
-    }
-
-    let body = json!({
-        "model": request.model,
-        "input": input,
-        "parameters": {
-            "size": size,
-            "n": count,
-            "prompt_extend": false,
-            "watermark": false
+    let body = if uses_multimodal_generation(&request.model) {
+        // 参考图放 content 里，和提示词一起作为一条 user 消息。
+        let mut content = vec![json!({ "text": request.prompt })];
+        for input in request.inputs.iter().filter(|item| item.kind == "image") {
+            content.push(json!({ "image": input.value }));
         }
-    });
+        json!({
+            "model": request.model,
+            "input": { "messages": [ { "role": "user", "content": content } ] },
+            "parameters": {
+                "size": size,
+                "n": count,
+                // 百炼这两个字段的官方默认就是开着的。
+                "prompt_extend": true,
+                "watermark": false
+            }
+        })
+    } else {
+        let mut input = json!({ "prompt": request.prompt });
+        // 图生图：参考图放 input.images，没有参考图就不带这个字段。
+        let images: Vec<Value> = request
+            .inputs
+            .iter()
+            .filter(|item| item.kind == "image")
+            .map(|item| json!({ "image": item.value }))
+            .collect();
+        if !images.is_empty() {
+            input["images"] = Value::Array(images);
+        }
+        json!({
+            "model": request.model,
+            "input": input,
+            "parameters": {
+                "size": size,
+                "n": count,
+                "prompt_extend": false,
+                "watermark": false
+            }
+        })
+    };
+
+    let submit_path = if uses_multimodal_generation(&request.model) {
+        MULTIMODAL_SUBMIT_PATH
+    } else {
+        SUBMIT_PATH
+    };
 
     let response = client
-        .post(join_path(&runtime.profile.base_url, SUBMIT_PATH))
+        .post(join_path(&runtime.profile.base_url, submit_path))
         .bearer_auth(&runtime.api_key)
         .header("X-DashScope-Async", "enable")
         .json(&body)
@@ -185,14 +219,48 @@ fn result_urls(value: &Value) -> Vec<String> {
         .pointer("/output/results")
         .and_then(Value::as_array)
         .or_else(|| value.get("results").and_then(Value::as_array));
-    let Some(items) = items else { return Vec::new() };
-    items
-        .iter()
-        .filter(|item| result_code_ok(item))
-        .filter_map(|item| item.get("url").and_then(Value::as_str))
-        .filter(|url| !url.is_empty())
-        .map(|url| url.to_string())
-        .collect()
+    if let Some(items) = items {
+        let urls: Vec<String> = items
+            .iter()
+            .filter(|item| result_code_ok(item))
+            .filter_map(|item| item.get("url").and_then(Value::as_str))
+            .filter(|url| !url.is_empty())
+            .map(|url| url.to_string())
+            .collect();
+        if !urls.is_empty() {
+            return urls;
+        }
+    }
+    choice_urls(value)
+}
+
+/// 3.0 / 2.1 系列：图片在 output.choices[].message.content[].image。
+fn choice_urls(value: &Value) -> Vec<String> {
+    let Some(choices) = value
+        .pointer("/output/choices")
+        .and_then(Value::as_array)
+        .or_else(|| value.get("choices").and_then(Value::as_array))
+    else {
+        return Vec::new();
+    };
+    let mut urls = Vec::new();
+    for choice in choices {
+        let Some(content) = choice
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .or_else(|| choice.get("content").and_then(Value::as_array))
+        else {
+            continue;
+        };
+        for part in content {
+            if let Some(url) = part.get("image").and_then(Value::as_str) {
+                if !url.is_empty() {
+                    urls.push(url.to_string());
+                }
+            }
+        }
+    }
+    urls
 }
 
 /// 百炼在失败结果上带 code，非 200 的结果不是可用图片。
@@ -354,6 +422,68 @@ mod tests {
             .await
             .expect_err("auth");
         assert_eq!(error.code, "AUTH_UNAUTHORIZED");
+    }
+
+    /// 3.0 系列换了提交端点和请求体：messages 结构 + image-generation 端点。
+    #[tokio::test]
+    async fn qwen_image_3_uses_the_multimodal_generation_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/services/aigc/image-generation/generation"))
+            .and(body_partial_json(json!({
+                "model": "qwen-image-3.0",
+                "input": {
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            { "text": "雨夜街头" },
+                            { "image": "https://cdn.example.com/ref.png" }
+                        ]
+                    }]
+                },
+                "parameters": { "size": "1024*1536", "n": 2 }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "output": { "task_status": "PENDING", "task_id": "task-abc" }
+            })))
+            .mount(&server)
+            .await;
+        let mut request = request();
+        request.model = "qwen-image-3.0".to_string();
+        let result = execute(&reqwest::Client::new(), &runtime(&server.uri()), &request)
+            .await
+            .expect("submit");
+        assert_eq!(result.task_id.as_deref(), Some("task-abc"));
+    }
+
+    /// 3.0 系列的图片在 output.choices[].message.content[].image。
+    #[tokio::test]
+    async fn poll_reads_the_choice_content_shape() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/tasks/task-abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "output": {
+                    "task_status": "SUCCEEDED",
+                    "choices": [{
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{
+                                "type": "image",
+                                "image": "https://cdn.example.com/out.png"
+                            }]
+                        }
+                    }]
+                }
+            })))
+            .mount(&server)
+            .await;
+        let status = poll(&reqwest::Client::new(), &runtime(&server.uri()), &model(), "task-abc")
+            .await
+            .expect("poll");
+        assert_eq!(status.status, "succeeded");
+        assert_eq!(status.outputs[0].url.as_deref(), Some("https://cdn.example.com/out.png"));
     }
 
     #[tokio::test]

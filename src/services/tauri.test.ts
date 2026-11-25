@@ -77,7 +77,7 @@ describe('tauri bridge', () => {
         nodeId: run.nodeId,
         capability: 'image.generate',
         providerId: 'provider_1',
-        model: 'gpt-image-1',
+        model: 'gpt-image-2.6-flare',
         promptSnapshot: run.promptSnapshot,
         params: {},
         inputs: [],

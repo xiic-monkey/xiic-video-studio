@@ -132,19 +132,19 @@ describe('effectiveCapability', () => {
   it('returns undefined when the binding does not declare the capability', () => {
     // 与后端一致：绑定里没有的能力项，后端会跳过这个供应商。
     const binding = {
-      id: 'gpt-image-1',
-      displayName: 'GPT Image 1',
+      id: 'gpt-image-2.6-flare',
+      displayName: 'GPT Image 2.6 Flare',
       capabilities: [{
         capability: 'image.generate',
         inputTransport: ['dataUrl'] as ModelCapability['inputTransport'],
         async: false,
       }],
     };
-    expect(effectiveCapability('gpt-image-1', binding, 'image.edit')).toBeUndefined();
+    expect(effectiveCapability('gpt-image-2.6-flare', binding, 'image.edit')).toBeUndefined();
     // 目录里有这项能力也不行：以前前端会把它列成可用，后端却直接跳过。
-    expect(catalogCapability('gpt-image-1', 'image.edit')).toBeTruthy();
+    expect(catalogCapability('gpt-image-2.6-flare', 'image.edit')).toBeTruthy();
     // 只有没有绑定对象时才回落目录基线。
-    expect(effectiveCapability('gpt-image-1', undefined, 'image.edit')).toBeTruthy();
+    expect(effectiveCapability('gpt-image-2.6-flare', undefined, 'image.edit')).toBeTruthy();
   });
 });
 

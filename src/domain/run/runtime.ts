@@ -199,11 +199,16 @@ export function nodeParams(
       const ratios = limit?.ratios;
       const resolutions = limit?.resolutions;
       const duration = Number(node.data.duration ?? durations?.min ?? 5);
-      const resolution = String(node.data.resolution ?? '').trim()
-        || String(catalog.resolution ?? '').trim()
-        || resolutions?.[0]
-        || '768P';
-      const ratio = String(node.data.aspectRatio ?? (ratios?.includes('9:16') ? '9:16' : ratios?.[0] ?? '9:16'));
+      // 换模型后节点里留下的旧分辨率/比例可能这个模型根本不认
+      // （MiniMax 是 768P，Seedance 是 720p）：不在模型支持列表里就退回目录默认值。
+      const pickedResolution = String(node.data.resolution ?? '').trim();
+      const resolution = (pickedResolution && (!resolutions || resolutions.includes(pickedResolution)))
+        ? pickedResolution
+        : (String(catalog.resolution ?? '').trim() || resolutions?.[0] || '768P');
+      const pickedRatio = String(node.data.aspectRatio ?? '').trim();
+      const ratio = (pickedRatio && (!ratios || ratios.includes(pickedRatio)))
+        ? pickedRatio
+        : (ratios?.includes('9:16') ? '9:16' : ratios?.[0] ?? '9:16');
       return {
         ...catalog,
         mode: String(node.data.mode ?? 't2v'),

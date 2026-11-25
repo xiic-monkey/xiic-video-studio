@@ -29,11 +29,11 @@ describe('resolveModel', () => {
     // 自动路由时 providerId 留空：调用顺序由模型下各供应商的优先级决定。
     expect(result.ok && result.resolved.providerId).toBe('');
     expect(result.ok && result.resolved.providerName).toBe('自动路由');
-    expect(result.ok && result.resolved.modelId).toBe('gpt-4o-mini');
+    expect(result.ok && result.resolved.modelId).toBe('gpt-5.4-mini');
   });
 
   it('pins the provider when the node selected one', () => {
-    const doc = makeDoc([node('t', 'text', { prompt: '写一段开场', model: 'gpt-4o-mini', providerId: 'openai-compatible' })], []);
+    const doc = makeDoc([node('t', 'text', { prompt: '写一段开场', model: 'gpt-5.4-mini', providerId: 'openai-compatible' })], []);
     const result = resolveModel(TEST_PROFILES, TEST_KEYS, doc.nodes.t, 'text.chat');
     expect(result.ok && result.resolved.providerId).toBe('openai-compatible');
     expect(result.ok && result.resolved.providerName).toBe('OpenAI 兼容中转');
@@ -47,7 +47,7 @@ describe('resolveModel', () => {
   });
 
   it('rejects an explicit model that lacks the capability', () => {
-    const doc = makeDoc([node('i', 'image', { providerId: 'openai-compatible', model: 'gpt-4o-mini' })], []);
+    const doc = makeDoc([node('i', 'image', { providerId: 'openai-compatible', model: 'gpt-5.4-mini' })], []);
     const result = resolveModel(TEST_PROFILES, TEST_KEYS, doc.nodes.i, 'image.generate');
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.issue.code).toBe('PARAM_MODEL_INVALID');
@@ -84,7 +84,7 @@ describe('resolveModel', () => {
         hasSecret: true,
       }],
     };
-    const doc = makeDoc([node('t', 'text', { prompt: '写一段开场', model: 'gpt-4o-mini', providerId: 'openai-compatible' })], []);
+    const doc = makeDoc([node('t', 'text', { prompt: '写一段开场', model: 'gpt-5.4-mini', providerId: 'openai-compatible' })], []);
     const result = resolveModel([cooling], TEST_KEYS, doc.nodes.t, 'text.chat');
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.issue.code).toBe('PROVIDER_KEY_COOLING');
@@ -104,7 +104,7 @@ describe('resolveModel', () => {
         hasSecret: true,
       }],
     };
-    const doc = makeDoc([node('t', 'text', { prompt: '写一段开场', model: 'gpt-4o-mini', providerId: 'openai-compatible' })], []);
+    const doc = makeDoc([node('t', 'text', { prompt: '写一段开场', model: 'gpt-5.4-mini', providerId: 'openai-compatible' })], []);
     const result = resolveModel([expired], TEST_KEYS, doc.nodes.t, 'text.chat');
     expect(result.ok).toBe(true);
   });
@@ -146,16 +146,16 @@ describe('nodeParams', () => {
 
   it('carries the catalog params rendered in the Inspector', () => {
     const audio = makeDoc([node('a', 'audio', { text: '你好', speed: 1.5 })], []);
-    expect(nodeParams(audio.nodes.a, 'audio.tts', { id: 'speech-02-hd' })).toMatchObject({ speed: 1.5 });
+    expect(nodeParams(audio.nodes.a, 'audio.tts', { id: 'speech-2.8-hd' })).toMatchObject({ speed: 1.5 });
     const image = makeDoc([node('i', 'image', { count: 1 })], []);
-    expect(nodeParams(image.nodes.i, 'image.generate', { id: 'gpt-image-1' })).toMatchObject({
+    expect(nodeParams(image.nodes.i, 'image.generate', { id: 'gpt-image-2.6-flare' })).toMatchObject({
       quality: 'auto',
     });
   });
 
   it('only sends the text params the protocol can read', () => {
     const doc = makeDoc([node('t', 'text', { prompt: 'hi' })], []);
-    expect(nodeParams(doc.nodes.t, 'text.chat', { id: 'gpt-4o-mini' })).toEqual({
+    expect(nodeParams(doc.nodes.t, 'text.chat', { id: 'gpt-5.4-mini' })).toEqual({
       system: '', temperature: 0.7, maxTokens: 4096,
     });
     // 目录里没有的模型没有协议契约：读不到的参数不下发，免得白让缓存失效。
@@ -164,22 +164,22 @@ describe('nodeParams', () => {
 
   it('falls back to the catalog voice default', () => {
     const doc = makeDoc([node('a', 'audio', { text: '你好' })], []);
-    expect(nodeParams(doc.nodes.a, 'audio.tts', { id: 'speech-02-hd' }).voice).toBe('male-qn-qingse');
+    expect(nodeParams(doc.nodes.a, 'audio.tts', { id: 'speech-2.8-hd' }).voice).toBe('male-qn-qingse');
     expect(nodeParams(doc.nodes.a, 'audio.tts', { id: 'mimo-v2.5-tts' }).voice).toBe('mimo_default');
     // 节点里填了音色就用节点的。
     const custom = makeDoc([node('a', 'audio', { text: '你好', voice: 'Chelsie' })], []);
-    expect(nodeParams(custom.nodes.a, 'audio.tts', { id: 'speech-02-hd' }).voice).toBe('Chelsie');
+    expect(nodeParams(custom.nodes.a, 'audio.tts', { id: 'speech-2.8-hd' }).voice).toBe('Chelsie');
   });
 
   it('takes the native audio switch from the catalog default', () => {
     const doc = makeDoc([videoNode('v')], []);
     expect(nodeParams(doc.nodes.v, 'video.generate', { id: 'MiniMax-H3' }).generateAudio).toBe(true);
-    expect(nodeParams(doc.nodes.v, 'video.generate', { id: 'doubao-seedance-1-0-pro-250528' }).generateAudio).toBe(false);
+    expect(nodeParams(doc.nodes.v, 'video.generate', { id: 'doubao-seedance-2-5-260628' }).generateAudio).toBe(true);
   });
 
   it('takes the resolution from the catalog default', () => {
     const doc = makeDoc([videoNode('v')], []);
-    const seedance = nodeParams(doc.nodes.v, 'video.generate', { id: 'doubao-seedance-1-0-pro-250528' });
+    const seedance = nodeParams(doc.nodes.v, 'video.generate', { id: 'doubao-seedance-2-5-260628' });
     expect(seedance.resolution).toBe('720p');
   });
 });
@@ -190,7 +190,7 @@ describe('buildCacheContext', () => {
     const ctx = buildCacheContext({ doc, runs: [], profiles: TEST_PROFILES, hasKeys: TEST_KEYS, styleGuide: emptyStyleGuide() });
     // 自动路由不进缓存键：换一家供应商不该让缓存失效。
     expect(ctx.runtime.t).toEqual({
-      providerId: '', model: 'gpt-4o-mini',
+      providerId: '', model: 'gpt-5.4-mini',
       params: { system: '', temperature: 0.7, maxTokens: 4096 },
     });
     expect(ctx.runtime.note).toBeUndefined();

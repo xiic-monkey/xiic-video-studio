@@ -22,6 +22,16 @@ fn quality_of(request: &CapabilityRequest) -> Option<String> {
     Some(quality.to_string())
 }
 
+/// 复杂度档位：GPT-Image-2.6 起支持，控制渲染前的规划深度。
+/// auto 同样不下发，避免旧版 gpt-image 收到不认识的字段直接报错。
+fn complexity_of(request: &CapabilityRequest) -> Option<String> {
+    let complexity = request.params.get("complexity").and_then(Value::as_str)?.trim();
+    if complexity.is_empty() || complexity == "auto" {
+        return None;
+    }
+    Some(complexity.to_string())
+}
+
 /// 图片接口的端点：绑定里配了 `defaults.submitPath` 就用它（火山方舟是 /api/v3/...），
 /// 否则按 OpenAI 兼容的 /v1 路径拼。
 fn image_endpoint(runtime: &ProviderRuntime, model_id: &str, fallback: &str) -> String {
@@ -48,6 +58,9 @@ fn image_extra_fields(request: &CapabilityRequest) -> Vec<(String, String)> {
         let mut fields = vec![("output_format".to_string(), "png".to_string())];
         if let Some(quality) = quality_of(request) {
             fields.push(("quality".to_string(), quality));
+        }
+        if let Some(complexity) = complexity_of(request) {
+            fields.push(("complexity".to_string(), complexity));
         }
         return fields;
     }
@@ -355,7 +368,7 @@ mod tests {
     #[test]
     fn gpt_image_uses_output_format_instead_of_response_format() {
         let mut request = request("image.generate");
-        request.model = "gpt-image-1".to_string();
+        request.model = "gpt-image-2.6-flare".to_string();
         request.params["quality"] = json!("high");
         let fields = image_extra_fields(&request);
         assert!(fields.contains(&("output_format".to_string(), "png".to_string())));
@@ -367,10 +380,23 @@ mod tests {
     #[test]
     fn auto_quality_is_left_to_the_provider() {
         let mut request = request("image.generate");
-        request.model = "gpt-image-1".to_string();
+        request.model = "gpt-image-2.6-flare".to_string();
         request.params["quality"] = json!("auto");
         let fields = image_extra_fields(&request);
         assert!(!fields.iter().any(|(key, _)| key == "quality"));
+    }
+
+    /// complexity 是 GPT-Image-2.6 的字段：auto 不发，选了档位才发。
+    #[test]
+    fn complexity_is_only_sent_when_picked() {
+        let mut request = request("image.generate");
+        request.model = "gpt-image-2.6-flare".to_string();
+        request.params["complexity"] = json!("auto");
+        let fields = image_extra_fields(&request);
+        assert!(!fields.iter().any(|(key, _)| key == "complexity"));
+        request.params["complexity"] = json!("high");
+        let fields = image_extra_fields(&request);
+        assert!(fields.contains(&("complexity".to_string(), "high".to_string())));
     }
 
     /// dall-e-3 / seedream 仍走 response_format。
@@ -394,7 +420,7 @@ mod tests {
             .mount(&server)
             .await;
         let mut req = request("image.generate");
-        req.model = "gpt-image-1".to_string();
+        req.model = "gpt-image-2.6-flare".to_string();
         let result = image_generate(&reqwest::Client::new(), &runtime(&server.uri()), &req)
             .await
             .expect("image");

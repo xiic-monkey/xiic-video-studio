@@ -15,7 +15,7 @@ function run(partial: Partial<RunRecord>): RunRecord {
 
 const ctx: CacheContext = {
   runs: [run({ nodeId: 'a' })],
-  runtime: { b: { providerId: 'openai-compatible', model: 'gpt-image-1', params: { size: '1024x1536' } } },
+  runtime: { b: { providerId: 'openai-compatible', model: 'gpt-image-2.6-flare', params: { size: '1024x1536' } } },
   promptHashes: { b: 'prompt-hash' },
 };
 

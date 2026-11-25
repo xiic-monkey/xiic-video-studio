@@ -1,6 +1,10 @@
 //! 火山方舟 Doubao-Seedance 视频生成适配器。
 //!
 //! 协议 `seedance-video`：异步协议，提交返回任务 id，再轮询任务状态取回视频地址。
+//!
+//! Seedance 2.x 的 content 是带 role 的内容列表：
+//! `image_url`（reference_image / first_frame / last_frame）、
+//! `video_url`（reference_video）、`audio_url`（reference_audio）。
 use super::{
     join_path, read_json, AdapterResult, AppError, AssetPayload, CapabilityRequest, JobStatus,
     ModelConfig, ProviderRuntime,
@@ -11,6 +15,32 @@ const LABEL: &str = "火山方舟视频";
 const DEFAULT_SUBMIT_PATH: &str = "/api/v3/contents/generations/tasks";
 const DEFAULT_POLL_PATH: &str = "/api/v3/contents/generations/tasks/{task_id}";
 
+/// Seedance 各版本的能力差异（从模型 defaults.seedance 读）。
+struct SeedanceOptions {
+    /// 是否支持 omni_reference_task_type：Seedance 2.5 起才有。
+    task_type: bool,
+    /// 是否允许只传参考音频：Seedance 2.5 起才有（2.0 必须搭配图或视频）。
+    audio_only: bool,
+}
+
+impl Default for SeedanceOptions {
+    fn default() -> Self {
+        // 绑定里没写 seedance 配置时按 2.0 的保守能力处理。
+        Self { task_type: false, audio_only: false }
+    }
+}
+
+fn options(model: Option<&ModelConfig>) -> SeedanceOptions {
+    let Some(model) = model else { return SeedanceOptions::default() };
+    let Some(config) = model.defaults.get("seedance") else {
+        return SeedanceOptions::default();
+    };
+    SeedanceOptions {
+        task_type: config.get("taskType").and_then(Value::as_bool).unwrap_or(false),
+        audio_only: config.get("audioOnly").and_then(Value::as_bool).unwrap_or(false),
+    }
+}
+
 pub async fn execute(
     client: &reqwest::Client,
     runtime: &ProviderRuntime,
@@ -20,41 +50,118 @@ pub async fn execute(
     let submit_path = model
         .and_then(|item| default_string(&item.defaults, "submitPath"))
         .unwrap_or_else(|| DEFAULT_SUBMIT_PATH.to_string());
+    let options = options(model);
 
-    // content 第一项必须是文本提示词，其后按输入顺序追加图片。
+    // content 第一项必须是文本提示词，其后按输入顺序追加图片/视频/音频。
     let mut content = vec![json!({ "type": "text", "text": request.prompt })];
+    let mut has_frame = false;
+    let mut has_image = false;
+    let mut has_video = false;
+    let mut has_audio = false;
     for input in &request.inputs {
-        // Seedance 协议只接受图片参考。视频/音频参考必须显式失败：
-        // 静默 continue 会让用户花钱跑完却拿到完全没用上参考素材的结果。
-        if matches!(input.role.as_str(), "reference_video" | "reference_audio") {
-            return Err(AppError::new(
-                "CAP_UNSUPPORTED_INPUT",
-                "Seedance 不支持参考视频或参考音频输入",
-                false,
-            ));
+        match input.role.as_str() {
+            "first_frame" => {
+                content.push(json!({
+                    "type": "image_url",
+                    "role": "first_frame",
+                    "image_url": { "url": input.value }
+                }));
+                has_frame = true;
+                has_image = true;
+            }
+            "last_frame" => {
+                content.push(json!({
+                    "type": "image_url",
+                    "role": "last_frame",
+                    "image_url": { "url": input.value }
+                }));
+                has_frame = true;
+                has_image = true;
+            }
+            "reference_image" => {
+                content.push(json!({
+                    "type": "image_url",
+                    "role": "reference_image",
+                    "image_url": { "url": input.value }
+                }));
+                has_image = true;
+            }
+            "reference_video" => {
+                content.push(json!({
+                    "type": "video_url",
+                    "role": "reference_video",
+                    "video_url": { "url": input.value }
+                }));
+                has_video = true;
+            }
+            "reference_audio" => {
+                content.push(json!({
+                    "type": "audio_url",
+                    "role": "reference_audio",
+                    "audio_url": { "url": input.value }
+                }));
+                has_audio = true;
+            }
+            _ => continue,
         }
-        if !matches!(
-            input.role.as_str(),
-            "first_frame" | "last_frame" | "reference_image"
-        ) {
-            continue;
-        }
-        content.push(json!({
-            "type": "image_url",
-            "image_url": { "url": input.value }
-        }));
+    }
+
+    let task_type = task_type_of(request)?;
+    if task_type != "auto" && !options.task_type {
+        return Err(AppError::new(
+            "PARAM_TASK_TYPE_INVALID",
+            "该 Seedance 版本不支持指定任务类型，请改用自动判定",
+            false,
+        ));
+    }
+    if matches!(task_type.as_str(), "edit" | "extend") && !has_video {
+        return Err(AppError::new(
+            "PARAM_TASK_TYPE_INVALID",
+            "视频编辑/视频延长任务需要至少一个参考视频",
+            false,
+        ));
+    }
+    if has_audio && !has_image && !has_video && !options.audio_only {
+        return Err(AppError::new(
+            "CAP_UNSUPPORTED_INPUT",
+            "该 Seedance 版本不支持只传参考音频，至少要搭配参考图或参考视频",
+            false,
+        ));
+    }
+
+    let mut ratio = request
+        .params
+        .get("ratio")
+        .and_then(Value::as_str)
+        .unwrap_or("adaptive")
+        .trim()
+        .to_string();
+    let mut duration = request.params.get("duration").and_then(Value::as_i64).unwrap_or(5);
+    // 首尾帧、视频编辑、视频延长三类任务，接口只接受 adaptive 比例：
+    // 模型会自动保持输出与首帧图片 / 待编辑视频的宽高比一致。
+    if has_frame || matches!(task_type.as_str(), "edit" | "extend") {
+        ratio = "adaptive".to_string();
+    }
+    // 视频编辑任务要求 duration = -1，实际时长由模型按原视频决定。
+    if task_type == "edit" {
+        duration = -1;
     }
 
     let mut body = json!({
         "model": request.model,
         "content": content,
-        "ratio": request.params.get("ratio").and_then(Value::as_str).unwrap_or("9:16"),
-        "duration": request.params.get("duration").and_then(Value::as_i64).unwrap_or(5),
-        "generate_audio": request.params.get("generateAudio").and_then(Value::as_bool).unwrap_or(false)
+        "ratio": ratio,
+        "duration": duration,
+        "generate_audio": request.params.get("generateAudio").and_then(Value::as_bool).unwrap_or(true)
     });
     // 分辨率：目录里选的值要真的发出去，否则 1080p 会被悄悄降级。
     if let Some(resolution) = request.params.get("resolution").and_then(Value::as_str) {
         body["resolution"] = json!(resolution);
+    }
+    // 显式指定子任务类型时下发：接口会在提交阶段就校验参数限制，
+    // 不符合要求会同步报错，而不是等任务跑起来才异步失败。
+    if task_type != "auto" {
+        body["omni_reference_task_type"] = json!(task_type);
     }
 
     let response = client
@@ -76,6 +183,25 @@ pub async fn execute(
         task_id: Some(task_id),
         raw: Some(value),
     })
+}
+
+/// 任务类型（omni_reference_task_type）。非法值直接报错，不要静默降级成 auto。
+fn task_type_of(request: &CapabilityRequest) -> Result<String, AppError> {
+    let raw = request
+        .params
+        .get("taskType")
+        .and_then(Value::as_str)
+        .unwrap_or("auto")
+        .trim()
+        .to_string();
+    if matches!(raw.as_str(), "auto" | "reference" | "edit" | "extend") {
+        return Ok(raw);
+    }
+    Err(AppError::new(
+        "PARAM_TASK_TYPE_INVALID",
+        format!("Seedance 不支持任务类型 {raw}"),
+        false,
+    ))
 }
 
 pub async fn poll(
@@ -137,6 +263,18 @@ pub async fn poll(
             outputs: Vec::new(),
             raw_status: Some(raw_status),
             error: None,
+        }),
+        // 任务超时（超过 execution_expires_after）也是终态：
+        // 当成轮询中会一直挂着，节点永远不结束。
+        "expired" | "timeout" => Ok(JobStatus {
+            status: "failed".to_string(),
+            progress: None,
+            outputs: Vec::new(),
+            raw_status: Some(raw_status),
+            error: Some(
+                AppError::new("TASK_FAILED", "视频任务已超时过期", false)
+                    .with_raw(value.to_string()),
+            ),
         }),
         _ => Ok(JobStatus {
             status: "polling".to_string(),
@@ -226,7 +364,8 @@ mod tests {
             capabilities: Vec::new(),
             defaults: json!({
                 "submitPath": "/api/v3/contents/generations/tasks",
-                "pollPath": "/api/v3/contents/generations/tasks/{task_id}"
+                "pollPath": "/api/v3/contents/generations/tasks/{task_id}",
+                "seedance": { "taskType": true, "audioOnly": true }
             }),
             protocols: std::collections::HashMap::new(),
             priority: None,
@@ -235,9 +374,29 @@ mod tests {
         }
     }
 
+    fn model_2_0() -> crate::gateway::ModelConfig {
+        let mut item = model();
+        item.defaults = json!({
+            "submitPath": "/api/v3/contents/generations/tasks",
+            "pollPath": "/api/v3/contents/generations/tasks/{task_id}",
+            "seedance": { "taskType": false, "audioOnly": false }
+        });
+        item
+    }
+
     fn runtime(base_url: &str) -> ProviderRuntime {
         let mut profile = test_profile("bytedance-video", base_url);
         profile.models = vec![model()];
+        ProviderRuntime {
+            profile,
+            api_key: "test-key".to_string(),
+            protocol: "seedance-video".to_string(),
+        }
+    }
+
+    fn runtime_with(base_url: &str, model: crate::gateway::ModelConfig) -> ProviderRuntime {
+        let mut profile = test_profile("bytedance-video", base_url);
+        profile.models = vec![model];
         ProviderRuntime {
             profile,
             api_key: "test-key".to_string(),
@@ -251,7 +410,7 @@ mod tests {
             model: "test-model".to_string(),
             prompt: "雨夜街头".to_string(),
             negative: None,
-            params: json!({ "duration": 6, "resolution": "768P", "ratio": "9:16", "generateAudio": true }),
+            params: json!({ "duration": 6, "resolution": "720p", "ratio": "9:16", "generateAudio": true }),
             inputs: vec![PreparedInput {
                 role: "first_frame".to_string(),
                 kind: "image".to_string(),
@@ -271,9 +430,8 @@ mod tests {
                 "model": "test-model",
                 "content": [
                     { "type": "text", "text": "雨夜街头" },
-                    { "type": "image_url", "image_url": { "url": "https://cdn.example.com/frame.png" } }
+                    { "type": "image_url", "role": "first_frame", "image_url": { "url": "https://cdn.example.com/frame.png" } }
                 ],
-                "ratio": "9:16",
                 "duration": 6,
                 "generate_audio": true
             })))
@@ -286,6 +444,156 @@ mod tests {
         assert_eq!(result.status, "queued");
         assert_eq!(result.task_id.as_deref(), Some("task-123"));
         assert!(result.outputs.is_empty());
+    }
+
+    /// 首帧/首尾帧任务：接口只接受 adaptive 比例，
+    /// 照抄用户选的 9:16 会被服务端直接拒掉。
+    #[tokio::test]
+    async fn first_frame_forces_adaptive_ratio() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/contents/generations/tasks"))
+            .and(body_partial_json(json!({ "ratio": "adaptive" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "task-123" })))
+            .mount(&server)
+            .await;
+        execute(&reqwest::Client::new(), &runtime(&server.uri()), &request())
+            .await
+            .expect("submit");
+    }
+
+    /// 文生视频没有首帧：用户选的比例要原样发出去。
+    #[tokio::test]
+    async fn text_to_video_keeps_the_chosen_ratio() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/contents/generations/tasks"))
+            .and(body_partial_json(json!({ "ratio": "9:16" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "task-123" })))
+            .mount(&server)
+            .await;
+        let mut req = request();
+        req.inputs.clear();
+        execute(&reqwest::Client::new(), &runtime(&server.uri()), &req)
+            .await
+            .expect("submit");
+    }
+
+    /// 参考视频/音频要按 Seedance 2.x 的 content 结构带 role 发出去。
+    #[tokio::test]
+    async fn reference_video_and_audio_use_role_tagged_content() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/contents/generations/tasks"))
+            .and(body_partial_json(json!({
+                "content": [
+                    { "type": "text", "text": "雨夜街头" },
+                    { "type": "video_url", "role": "reference_video", "video_url": { "url": "https://cdn.example.com/ref.mp4" } },
+                    { "type": "audio_url", "role": "reference_audio", "audio_url": { "url": "https://cdn.example.com/ref.mp3" } }
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "task-1" })))
+            .mount(&server)
+            .await;
+        let mut req = request();
+        req.inputs = vec![
+            PreparedInput {
+                role: "reference_video".to_string(),
+                kind: "video".to_string(),
+                mime: "video/mp4".to_string(),
+                value: "https://cdn.example.com/ref.mp4".to_string(),
+            },
+            PreparedInput {
+                role: "reference_audio".to_string(),
+                kind: "audio".to_string(),
+                mime: "audio/mpeg".to_string(),
+                value: "https://cdn.example.com/ref.mp3".to_string(),
+            },
+        ];
+        execute(&reqwest::Client::new(), &runtime(&server.uri()), &req)
+            .await
+            .expect("参考视频与音频要能发出去");
+    }
+
+    /// 视频编辑任务：必须带参考视频，且比例强制 adaptive、时长交给模型决定。
+    #[tokio::test]
+    async fn edit_task_forces_adaptive_ratio_and_auto_duration() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/contents/generations/tasks"))
+            .and(body_partial_json(json!({
+                "ratio": "adaptive",
+                "duration": -1,
+                "omni_reference_task_type": "edit"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "task-1" })))
+            .mount(&server)
+            .await;
+        let mut req = request();
+        req.params["taskType"] = json!("edit");
+        req.inputs = vec![PreparedInput {
+            role: "reference_video".to_string(),
+            kind: "video".to_string(),
+            mime: "video/mp4".to_string(),
+            value: "https://cdn.example.com/ref.mp4".to_string(),
+        }];
+        execute(&reqwest::Client::new(), &runtime(&server.uri()), &req)
+            .await
+            .expect("编辑任务");
+    }
+
+    /// 视频编辑任务没有参考视频：提交前就要拦下。
+    #[tokio::test]
+    async fn edit_task_without_reference_video_is_rejected() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/contents/generations/tasks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "task-1" })))
+            .mount(&server)
+            .await;
+        let mut req = request();
+        req.params["taskType"] = json!("edit");
+        let error = execute(&reqwest::Client::new(), &runtime(&server.uri()), &req)
+            .await
+            .expect_err("没有参考视频不能提交编辑任务");
+        assert_eq!(error.code, "PARAM_TASK_TYPE_INVALID");
+    }
+
+    /// Seedance 2.0 不支持 omni_reference_task_type：不能静默忽略用户的设置。
+    #[tokio::test]
+    async fn task_type_is_rejected_on_models_without_support() {
+        let server = MockServer::start().await;
+        let mut req = request();
+        req.params["taskType"] = json!("edit");
+        let error = execute(
+            &reqwest::Client::new(),
+            &runtime_with(&server.uri(), model_2_0()),
+            &req,
+        )
+        .await
+        .expect_err("2.0 不支持任务类型");
+        assert_eq!(error.code, "PARAM_TASK_TYPE_INVALID");
+    }
+
+    /// Seedance 2.0 不允许只传音频：静默发出去会异步失败。
+    #[tokio::test]
+    async fn audio_only_input_is_rejected_on_models_without_support() {
+        let server = MockServer::start().await;
+        let mut req = request();
+        req.inputs = vec![PreparedInput {
+            role: "reference_audio".to_string(),
+            kind: "audio".to_string(),
+            mime: "audio/mpeg".to_string(),
+            value: "https://cdn.example.com/ref.mp3".to_string(),
+        }];
+        let error = execute(
+            &reqwest::Client::new(),
+            &runtime_with(&server.uri(), model_2_0()),
+            &req,
+        )
+        .await
+        .expect_err("只传音频要报错");
+        assert_eq!(error.code, "CAP_UNSUPPORTED_INPUT");
     }
 
     #[tokio::test]
@@ -330,6 +638,25 @@ mod tests {
         assert_eq!(error.message, "内容审核未通过");
     }
 
+    /// 过期是终态：当成轮询中会让节点永远挂着。
+    #[tokio::test]
+    async fn poll_maps_expired_to_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/contents/generations/tasks/task-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "task-123",
+                "status": "expired"
+            })))
+            .mount(&server)
+            .await;
+        let status = poll(&reqwest::Client::new(), &runtime(&server.uri()), &model(), "task-123")
+            .await
+            .expect("poll");
+        assert_eq!(status.status, "failed");
+        assert_eq!(status.raw_status.as_deref(), Some("expired"));
+    }
+
     #[tokio::test]
     async fn poll_reports_running_as_polling() {
         let server = MockServer::start().await;
@@ -360,31 +687,6 @@ mod tests {
             .await
             .expect_err("auth");
         assert_eq!(error.code, "AUTH_UNAUTHORIZED");
-    }
-
-    /// 参考视频/音频不能静默丢弃：必须显式失败并说明原因，
-    /// 否则用户连了参考素材、花了钱，结果却完全没用上它们。
-    #[tokio::test]
-    async fn reference_video_and_audio_are_rejected_not_ignored() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/v3/contents/generations/tasks"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "task-1" })))
-            .mount(&server)
-            .await;
-        for role in ["reference_video", "reference_audio"] {
-            let mut req = request();
-            req.inputs = vec![PreparedInput {
-                role: role.to_string(),
-                kind: role.strip_prefix("reference_").unwrap().to_string(),
-                mime: "application/octet-stream".to_string(),
-                value: "https://cdn.example.com/ref".to_string(),
-            }];
-            let error = execute(&reqwest::Client::new(), &runtime(&server.uri()), &req)
-                .await
-                .expect_err("不支持的参考类型必须报错");
-            assert_eq!(error.code, "CAP_UNSUPPORTED_INPUT");
-        }
     }
 
     #[tokio::test]

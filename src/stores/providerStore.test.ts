@@ -12,8 +12,8 @@ function profile(capabilities: ModelCapability[]): ProviderProfile {
     enabled: true,
     schemaVersion: 2,
     models: [{
-      id: 'gpt-image-1',
-      displayName: 'GPT Image 1',
+      id: 'gpt-image-2.6-flare',
+      displayName: 'GPT Image 2.6 Flare',
       capabilities,
     }],
   };

@@ -12,13 +12,13 @@ export const TEST_PROFILES: ProviderProfile[] = [
     schemaVersion: 1,
     models: [
       {
-        id: 'gpt-4o-mini',
-        displayName: 'GPT-4o mini',
+        id: 'gpt-5.4-mini',
+        displayName: 'GPT-5.4 mini',
         capabilities: [{ capability: 'text.chat', inputTransport: ['dataUrl'], async: false }],
       },
       {
-        id: 'gpt-image-1',
-        displayName: 'GPT Image 1',
+        id: 'gpt-image-2.6-flare',
+        displayName: 'GPT Image 2.6 Flare',
         capabilities: [
           {
             capability: 'image.generate',
@@ -120,7 +120,7 @@ export function succeededRun(nodeId: string, assetId: string, cacheKey = 'cache-
     cacheKey,
     status: 'succeeded',
     providerId: 'openai-compatible',
-    model: 'gpt-image-1',
+    model: 'gpt-image-2.6-flare',
     promptSnapshot: { text: 'x', segments: [], hash: 'h', locked: false },
     params: {},
     inputAssetIds: [],
