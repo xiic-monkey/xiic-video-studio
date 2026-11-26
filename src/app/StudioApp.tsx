@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { Film, FolderKanban, Plus, Save, Settings } from 'lucide-react';
+import { useCallback, useEffect, useState } from 'react';
+import { Film, FolderKanban, Images, LayoutGrid, Plus, Save, Settings, Trash2 } from 'lucide-react';
 import { ProjectLibrary } from './ProjectLibrary';
 import { AssetLibrary } from './AssetLibrary';
 import { CanvasView } from '../canvas/CanvasView';
@@ -8,12 +8,23 @@ import { SettingsDialog } from '../settings/SettingsDialog';
 import { LegacyImportDialog } from '../import/LegacyImportDialog';
 import { attachRunEvents } from '../run/events';
 import { RunConfirmDialog } from '../run/RunConfirmDialog';
+import { RunQueue } from '../run/RunQueue';
+import { resumeJobs, loadBoard } from '../services/tauri';
 import { useStudioStore } from '../stores/studioStore';
 import { useBoardStore } from '../stores/boardStore';
 import { useProviderStore } from '../stores/providerStore';
 import { useRunStore } from '../stores/runStore';
+import { useAssetStore } from '../stores/assetStore';
 import { TimelineDrawer } from '../media/TimelineDrawer';
 import { ProductionWorkspace } from '../production/ProductionWorkspace';
+import { ConfirmHost } from '../ui/ConfirmHost';
+import { confirmAction } from '../ui/confirmStore';
+import { Dialog } from '../ui/Dialog';
+import { ToastHost } from '../ui/ToastHost';
+import { useFlushOnClose } from './useFlushOnClose';
+
+/** 主区域的三种视图：项目总览、画布与时间线、剧本与镜头。 */
+type WorkspaceView = 'library' | 'canvas' | 'production';
 
 export function StudioApp() {
   const boot = useStudioStore((state) => state.boot);
@@ -26,12 +37,12 @@ export function StudioApp() {
   const selectProject = useStudioStore((state) => state.selectProject);
   const selectBoard = useStudioStore((state) => state.selectBoard);
   const createBoard = useStudioStore((state) => state.createBoard);
+  const removeBoard = useStudioStore((state) => state.removeBoard);
   const legacyImportOpen = useStudioStore((state) => state.legacyImportOpen);
   const closeLegacyImport = useStudioStore((state) => state.closeLegacyImport);
   const board = useBoardStore((state) => state.board);
   const dirty = useBoardStore((state) => state.dirty);
   const saving = useBoardStore((state) => state.saving);
-  const saveError = useBoardStore((state) => state.saveError);
   const lastSavedAt = useBoardStore((state) => state.lastSavedAt);
   const bootProviders = useProviderStore((state) => state.boot);
   const openSettings = useProviderStore((state) => state.openSettings);
@@ -39,8 +50,14 @@ export function StudioApp() {
   const activeRuns = useRunStore((state) =>
     Object.values(state.runs).filter((item) => item.status === 'queued' || item.status === 'running').length,
   );
+  const assetCount = useAssetStore((state) => state.assets.length);
+  const loadAssets = useAssetStore((state) => state.load);
+  const [view, setView] = useState<WorkspaceView>('canvas');
+  const [assetOpen, setAssetOpen] = useState(false);
+  const [creating, setCreating] = useState(false);
   const [newBoardName, setNewBoardName] = useState('');
-  const [workspaceTab, setWorkspaceTab] = useState<'canvas' | 'production'>('canvas');
+  const [queueOpen, setQueueOpen] = useState(false);
+  const [resumedJobs, setResumedJobs] = useState(0);
 
   useEffect(() => {
     void boot();
@@ -49,6 +66,20 @@ export function StudioApp() {
   useEffect(() => {
     void bootProviders();
   }, [bootProviders]);
+
+  // 素材跟着项目走：切项目就重新拉，左栏入口的计数才不会串项目。
+  useEffect(() => {
+    void loadAssets(currentProjectId);
+  }, [currentProjectId, loadAssets]);
+
+  // 启动时恢复上次中断的任务：崩溃或重启后，导出、导入等任务不会自己回来。
+  useEffect(() => {
+    let alive = true;
+    void resumeJobs().then((count) => {
+      if (alive) setResumedJobs(count);
+    }).catch(() => undefined);
+    return () => { alive = false; };
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -63,35 +94,92 @@ export function StudioApp() {
     };
   }, []);
 
+  // 关窗前先落库，避免最后 700ms 的改动随窗口一起消失。
+  useFlushOnClose();
+
+  // 换画布后从服务端重新取一份，而不是用 studioStore 里的快照：
+  // 快照的 revision 可能早于服务端那一份，拿它保存会撞修订冲突。
   useEffect(() => {
     if (!booted || !currentBoardId) return;
     if (useBoardStore.getState().board?.id === currentBoardId) return;
-    const snapshot = boards.find((item) => item.id === currentBoardId);
-    if (snapshot) useBoardStore.getState().load(snapshot);
-  }, [booted, currentBoardId, boards]);
+    let alive = true;
+    void loadBoard(currentBoardId).then((fresh) => {
+      if (!alive || !fresh) return;
+      useBoardStore.getState().load(fresh);
+    }).catch(() => undefined);
+    return () => { alive = false; };
+  }, [booted, currentBoardId]);
 
   const project = projects.find((item) => item.id === currentProjectId);
 
-  async function openBoard(id: string) {
+  const openBoard = useCallback(async (id: string) => {
     await useBoardStore.getState().flush();
     const next = await selectBoard(id);
-    if (next) useBoardStore.getState().load(next);
-  }
+    if (next) {
+      useBoardStore.getState().load(next);
+      setView('canvas');
+    }
+  }, [selectBoard]);
 
-  async function changeProject(id: string) {
+  const changeProject = useCallback(async (id: string) => {
     await useBoardStore.getState().flush();
     await selectProject(id);
-  }
+  }, [selectProject]);
 
-  async function addBoard(event: React.FormEvent) {
+  const addBoard = useCallback(async (event: React.FormEvent) => {
     event.preventDefault();
     await useBoardStore.getState().flush();
     const next = await createBoard(newBoardName);
     setNewBoardName('');
-    if (next) useBoardStore.getState().load(next);
-  }
+    setCreating(false);
+    if (next) {
+      useBoardStore.getState().load(next);
+      setView('canvas');
+    }
+  }, [createBoard, newBoardName]);
 
-  const saveLabel = saving ? '保存中…' : dirty ? '有未保存改动' : lastSavedAt ? `已保存 ${new Date(lastSavedAt).toLocaleTimeString('zh-CN')}` : '已保存';
+  const deleteBoardById = useCallback(async (id: string, name: string) => {
+    const confirmed = await confirmAction({
+      title: '删除画布',
+      message: `确定删除画布「${name}」？`,
+      detail: '画布上的节点与连线会一并删除，此操作不可撤销。',
+      tone: 'danger',
+      confirmText: '删除画布',
+    });
+    if (!confirmed) return;
+    // 删的是当前画布时，先把未保存内容落库，避免误把别的画布的改动写进去。
+    if (useBoardStore.getState().board?.id === id) await useBoardStore.getState().flush();
+    try {
+      await removeBoard(id);
+    } catch (issue) {
+      useStudioStore.getState().setError(issue instanceof Error ? issue.message : String(issue));
+    }
+  }, [removeBoard]);
+
+  // Cmd/Ctrl+S 立即保存：防抖保存最长要等 700ms，用户主动保存时不该再等。
+  // 上次保存失败过就走重试路径：取回服务端最新修订号重新落库，而不是又撞一次同样的冲突。
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (!(event.metaKey || event.ctrlKey)) return;
+      if (event.key.toLowerCase() !== 's') return;
+      event.preventDefault();
+      const store = useBoardStore.getState();
+      if (store.saveError) void store.retrySave();
+      else void store.flush();
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+
+  // 顶栏只报状态：保存中 / 有未保存改动 / 已保存。
+  // 失败详情走右下角悬浮提示，不占顶栏常驻。
+  const saveLabel = saving
+    ? '保存中…'
+    : dirty
+      ? '有未保存改动'
+      : lastSavedAt
+        ? `已保存 ${new Date(lastSavedAt).toLocaleTimeString('zh-CN')}`
+        : '已保存';
 
   return (
     <div className="studio-shell">
@@ -108,54 +196,95 @@ export function StudioApp() {
           <Settings size={15} />
         </button>
         <span className={`studio-save-state ${saving ? 'saving' : dirty ? 'dirty' : ''}`}>
-          <span className="dot" /> {saveError ? `保存失败：${saveError}` : saveLabel}
+          <span className="dot" /> {saveLabel}
         </span>
       </header>
 
       <div className="studio-body">
         <aside className="studio-rail">
-          <section>
+          {/* 视图切换放在最上面：它是整个应用的一级入口，压在资产库下面会被埋掉。 */}
+          <nav className="rail-nav" aria-label="视图切换">
+            <button type="button" className={view === 'library' ? 'active' : ''} onClick={() => setView('library')}>
+              <LayoutGrid size={13} /><span>项目总览</span>
+            </button>
+            <button type="button" className={view === 'canvas' ? 'active' : ''} onClick={() => setView('canvas')}>
+              <FolderKanban size={13} /><span>画布与时间线</span>
+            </button>
+            <button type="button" className={view === 'production' ? 'active' : ''} onClick={() => setView('production')}>
+              <Film size={13} /><span>剧本与镜头</span>
+            </button>
+          </nav>
+
+          <section className="rail-block">
             <h2>项目</h2>
-            <label className="studio-field">
-              <span>当前项目</span>
-              <select
-                value={currentProjectId ?? ''}
-                onChange={(event) => { void changeProject(event.target.value); }}
-                disabled={!projects.length}
-              >
-                {!projects.length && <option value="">尚无项目</option>}
-                {projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
-              </select>
-            </label>
-          </section>
-          <section>
-            <h2>画布</h2>
-            <div className="studio-list">
-              {boards.map((item) => (
-                <button
-                  key={item.id}
-                  className={item.id === currentBoardId ? 'active' : ''}
-                  onClick={() => { void openBoard(item.id); }}
-                >
-                  <Plus size={12} />
-                  <span>{item.name}</span>
-                </button>
-              ))}
+            <select
+              className="rail-select"
+              value={currentProjectId ?? ''}
+              aria-label="当前项目"
+              onChange={(event) => { void changeProject(event.target.value); }}
+              disabled={!projects.length}
+            >
+              {!projects.length && <option value="">尚无项目</option>}
+              {projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+            </select>
+
+            <span className="rail-sublabel">画布</span>
+            <div className="rail-boards">
+              {boards.map((item) => {
+                // 当前画布用 store 里的实时文档，节点数才不是快照里的旧值。
+                const live = item.id === board?.id ? board : item;
+                return (
+                  <div key={item.id} className={`rail-board-row ${item.id === currentBoardId ? 'active' : ''}`}>
+                    <button
+                      type="button"
+                      className="rail-board-name"
+                      title={live.name}
+                      onClick={() => { void openBoard(item.id); }}
+                    >
+                      <span>{live.name}</span>
+                      <small>{Object.keys(live.nodes ?? {}).length} 节点</small>
+                    </button>
+                    <button
+                      type="button"
+                      className="rail-remove"
+                      title={`删除画布「${item.name}」`}
+                      aria-label={`删除画布 ${item.name}`}
+                      onClick={() => { void deleteBoardById(item.id, item.name); }}
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </div>
+                );
+              })}
               {!boards.length && <span className="studio-badge">暂无画布</span>}
             </div>
-            <form className="studio-board-create" onSubmit={addBoard}>
-              <input value={newBoardName} onChange={(event) => setNewBoardName(event.target.value)} placeholder="新画布名称" />
-              <button className="studio-button secondary" type="submit" aria-label="新建画布"><Plus size={14} /></button>
-            </form>
+
+            {creating ? (
+              <form className="rail-create" onSubmit={addBoard}>
+                <input
+                  value={newBoardName}
+                  onChange={(event) => setNewBoardName(event.target.value)}
+                  placeholder="新画布名称"
+                  autoFocus
+                  aria-label="新画布名称"
+                />
+                <button className="studio-button secondary" type="submit">确定</button>
+                <button className="studio-button secondary" type="button" onClick={() => { setCreating(false); setNewBoardName(''); }}>取消</button>
+              </form>
+            ) : (
+              <button type="button" className="rail-add" onClick={() => setCreating(true)}>
+                <Plus size={12} /> 新建画布
+              </button>
+            )}
           </section>
-          <AssetLibrary projectId={currentProjectId ?? undefined} />
-          <section className="studio-rail-section">
-            <h2>工作区</h2>
-            <div className="studio-list">
-              <button className={workspaceTab === 'canvas' ? 'active' : ''} type="button" onClick={() => setWorkspaceTab('canvas')}><FolderKanban size={12} /><span>画布与时间线</span></button>
-              <button className={workspaceTab === 'production' ? 'active' : ''} type="button" onClick={() => setWorkspaceTab('production')}><Film size={12} /><span>剧本与镜头</span></button>
-            </div>
-          </section>
+
+          {/* 素材网格体量大，放进窄侧栏会把导航挤到看不见。改成入口 + 左侧抽屉。 */}
+          <button type="button" className="rail-entry" onClick={() => setAssetOpen(true)}>
+            <Images size={13} />
+            <span>资产库</span>
+            <span className="studio-badge">{assetCount}</span>
+          </button>
+
           <div className="studio-rail-foot">
             <button className="studio-button secondary" onClick={() => { void useBoardStore.getState().flush(); }}>
               <Save size={13} /> 立即保存
@@ -164,13 +293,13 @@ export function StudioApp() {
         </aside>
 
         <main className="studio-main">
-          {board && workspaceTab === 'canvas' ? (
+          {view === 'production' ? (
+            <ProductionWorkspace projectId={currentProjectId ?? undefined} boardId={currentBoardId ?? undefined} />
+          ) : view === 'canvas' && board ? (
             <>
               <CanvasView key={board.id} />
               <TimelineDrawer projectId={currentProjectId ?? undefined} boardId={board.id} />
             </>
-          ) : workspaceTab === 'production' ? (
-            <ProductionWorkspace projectId={currentProjectId ?? undefined} boardId={currentBoardId ?? undefined} />
           ) : (
             <ProjectLibrary onOpenBoard={(id) => { void openBoard(id); }} />
           )}
@@ -183,16 +312,38 @@ export function StudioApp() {
 
       <RunConfirmDialog />
 
+      {/* 全局确认框：替代原生 window.confirm，样式与焦点行为和应用内弹窗一致。 */}
+      <ConfirmHost />
+
+      {/* 悬浮提示：保存失败这类临时信息走右下角，几秒后自动消失。 */}
+      <ToastHost />
+
+      {/* 资产库抽屉：贴左侧展开，Esc 或点遮罩关闭，焦点行为与其它弹窗一致。 */}
+      <Dialog
+        open={assetOpen}
+        onClose={() => setAssetOpen(false)}
+        placement="left"
+        label="资产库"
+        className="asset-drawer"
+      >
+        <AssetLibrary projectId={currentProjectId ?? undefined} onClose={() => setAssetOpen(false)} />
+      </Dialog>
+
       {/* 导入对话框挂在应用壳上：导入完成后画布会替换项目库，对话框留在壳里才能继续展示告警。 */}
       <LegacyImportDialog open={legacyImportOpen} onClose={closeLegacyImport} />
 
       <footer className="studio-dock">
-        <span>{board ? `board ${board.id.slice(-8)}` : 'no-board'}</span>
-        <span>{Object.keys(board?.nodes ?? {}).length} nodes</span>
-        <span>{Object.keys(board?.edges ?? {}).length} edges</span>
-        {activeRuns > 0 && <span className="busy">{activeRuns} 个任务进行中</span>}
+        <span>{board ? board.name : '未打开画布'}</span>
+        <span>{Object.keys(board?.nodes ?? {}).length} 个节点</span>
+        <span>{Object.keys(board?.edges ?? {}).length} 条连线</span>
+        <button type="button" className="studio-dock-link" onClick={() => setQueueOpen(true)}>
+          {activeRuns > 0 ? `${activeRuns} 个任务进行中` : '任务面板'}
+        </button>
+        {resumedJobs > 0 && <span className="busy">已恢复 {resumedJobs} 个中断任务</span>}
         {error && <span className="error">{error}</span>}
       </footer>
+
+      <RunQueue open={queueOpen} onClose={() => setQueueOpen(false)} />
     </div>
   );
 }

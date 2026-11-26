@@ -64,6 +64,7 @@ export function providerKeysUnavailable(providerName: string, keys: ProviderKey[
 
 export function runCapability(doc: BoardDoc, node: BoardNode): string | undefined {
   if (node.type === 'text') return 'text.chat';
+  if (node.type === 'script') return 'text.chat';
   if (node.type === 'audio') return 'audio.tts';
   if (node.type === 'video') return 'video.generate';
   if (EDIT_ONLY_NODES.has(node.type)) return 'image.edit';

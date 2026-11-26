@@ -1,6 +1,7 @@
 import type { GraphCommand } from '../domain/graph/commands';
 import { compilePrompt } from '../domain/prompts/compile';
 import { effectiveCapability } from '../domain/providers/routing';
+import { isProviderConnected } from '../domain/providers/providerCatalog';
 import type { BoardDoc, BoardNode, PromptSnapshot, ProviderProfile, StyleGuide } from '../domain/types';
 
 export type CandidateKind = 'image' | 'video' | 'audio' | 'text';
@@ -30,7 +31,7 @@ export function pruneCommandsForMode(doc: BoardDoc, nodeId: string, mode: VideoM
 export function candidateKind(nodeType: string): CandidateKind {
   if (nodeType === 'video') return 'video';
   if (nodeType === 'audio') return 'audio';
-  if (nodeType === 'text') return 'text';
+  if (nodeType === 'text' || nodeType === 'script') return 'text';
   return 'image';
 }
 
@@ -55,10 +56,18 @@ export interface ModelOption {
   modelName: string;
 }
 
+/**
+ * 可选模型：只取已接入供应商提供的那些。
+ *
+ * 没保存 Key 的供应商不参与：模型列表里摆一个跑不起来的选项，
+ * 用户选完才在运行时报「没有可用供应商」，等于把问题往后拖。
+ * 口径与 OpenCode 一致：模型选择器只显示已连接供应商的模型。
+ */
 export function modelOptions(profiles: ProviderProfile[], capability: string): ModelOption[] {
   const options: ModelOption[] = [];
   for (const profile of profiles) {
     if (!profile.enabled) continue;
+    if (!isProviderConnected(profile)) continue;
     for (const model of profile.models) {
       if (model.enabled === false) continue;
       if (!effectiveCapability(model.id, model, capability)) continue;

@@ -1,7 +1,8 @@
 import { computeCacheKey, latestSucceededRun, selectedAssetOf } from '../graph/cacheKey';
-import { resolveNodeOutput } from '../graph/output';
+import { resolveInlineText, resolveNodeOutput } from '../graph/output';
 import { getNodeDefinition } from '../nodes/definitions';
 import { isMaskNode, maskAssetIdOf } from '../nodes/mask';
+import { scriptTextForPort } from '../nodes/scriptContent';
 import { instructionFor } from '../nodes/templates';
 import type { Issue, NodeContext } from '../nodes/types';
 import { capabilityOf, estimateCost } from '../providers/capabilities';
@@ -65,9 +66,14 @@ export type PrepareOutcome =
 
 interface Inbound {
   edge: BoardEdge;
-  assetId: string;
+  /** 产物资产 id。内联文本源可能没有资产。 */
+  assetId?: string;
   kind: AssetRef['kind'];
   mime: string;
+  /** 节点里直接写着的文本（剧本节点的正文/节拍），不需要运行就有。 */
+  inlineText?: string;
+  /** 文本来自运行产物时，要按源端口从剧本 JSON 里取字段。 */
+  extractByPort?: boolean;
 }
 
 function kindForPort(dataType?: DataType): AssetRef['kind'] {
@@ -84,10 +90,21 @@ function inboundAssets(doc: BoardDoc, nodeId: string, runs: RunRecord[], assets:
     if (edge.target !== nodeId) continue;
     const source = doc.nodes[edge.source];
     const assetId = source ? resolveNodeOutput(source, edge.sourcePort, runs) : undefined;
-    if (!assetId) continue;
-    const stored = assets[assetId];
+    const inlineText = source ? resolveInlineText(source, edge.sourcePort) : undefined;
+    if (!assetId && inlineText === undefined) continue;
+    const stored = assetId ? assets[assetId] : undefined;
     const port = def?.inputs.find((item) => item.key === edge.targetPort);
-    items.push({ edge, assetId, kind: stored?.kind ?? kindForPort(port?.dataType), mime: stored?.mime ?? '' });
+    const kind: AssetRef['kind'] = inlineText !== undefined
+      ? 'text'
+      : stored?.kind ?? kindForPort(port?.dataType);
+    items.push({
+      edge,
+      assetId,
+      kind,
+      mime: stored?.mime ?? '',
+      inlineText,
+      extractByPort: source?.type === 'script',
+    });
   }
   return items;
 }
@@ -99,8 +116,8 @@ export function inboundTextAssetIds(
   assets: Record<string, AssetRef>,
 ): string[] {
   const ids = inboundAssets(doc, nodeId, runs, assets)
-    .filter((item) => item.kind === 'text' || item.kind === 'json')
-    .map((item) => item.assetId);
+    .filter((item) => (item.kind === 'text' || item.kind === 'json') && Boolean(item.assetId))
+    .map((item) => item.assetId as string);
   return [...new Set(ids)];
 }
 
@@ -158,7 +175,11 @@ export function prepareRun(doc: BoardDoc, nodeId: string, deps: PrepareDeps): Pr
 
   for (const item of items) {
     if (item.kind === 'text' || item.kind === 'json') {
-      const value = (deps.texts[item.assetId] ?? '').trim();
+      // 剧本节点这类内联源直接用节点里的文字；其余文本来自上游运行产物。
+      const inline = item.inlineText?.trim() ? item.inlineText : undefined;
+      const assetText = deps.texts[item.assetId ?? ''] ?? '';
+      const raw = inline ?? (item.extractByPort ? scriptTextForPort(assetText, item.edge.sourcePort) : assetText);
+      const value = raw.trim();
       if (!value) {
         // 上游文本读取失败或为空：花钱前拦住，并且不把这条变量写进 prompt。
         const sourceTitle = getNodeDefinition(doc.nodes[item.edge.source]?.type ?? '')?.title ?? item.edge.source;
@@ -170,7 +191,7 @@ export function prepareRun(doc: BoardDoc, nodeId: string, deps: PrepareDeps): Pr
       if (key === 'prompt') variables.text = variables.prompt;
       continue;
     }
-    mediaInputs.push({ role: item.edge.role, assetId: item.assetId, kind: item.kind, mime: item.mime });
+    mediaInputs.push({ role: item.edge.role, assetId: item.assetId as string, kind: item.kind, mime: item.mime });
   }
 
   // 局部重绘：蒙版是节点级资产，不混进连线输入；模型必须支持蒙版。
@@ -187,6 +208,11 @@ export function prepareRun(doc: BoardDoc, nodeId: string, deps: PrepareDeps): Pr
 
   for (const edge of Object.values(doc.edges)) {
     if (edge.target !== nodeId) continue;
+    const source = doc.nodes[edge.source];
+    // 内联文本源（剧本节点）不要求先跑过：有正文就能用。
+    if (source && resolveInlineText(source, edge.sourcePort) !== undefined) continue;
+    // 静态素材源（图片素材 / 本地素材）同样不要求先跑过：选好的那张图就是它的产出。
+    if (source && resolveNodeOutput(source, edge.sourcePort, deps.runs)) continue;
     if (!selectedAssetOf(latestSucceededRun(deps.runs, edge.source))) {
       const sourceTitle = getNodeDefinition(doc.nodes[edge.source]?.type ?? '')?.title ?? edge.source;
       issues.push({
@@ -329,7 +355,7 @@ export function prepareRun(doc: BoardDoc, nodeId: string, deps: PrepareDeps): Pr
     promptSnapshot: snapshot,
     params,
     inputs: mediaInputs,
-    inputAssetIds: items.map((item) => item.assetId),
+    inputAssetIds: items.map((item) => item.assetId).filter((id): id is string => Boolean(id)),
     cacheKey,
     cachedAssetId,
     referenceAssetIds,

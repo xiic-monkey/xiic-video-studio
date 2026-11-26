@@ -8,7 +8,7 @@ vi.mock('@tauri-apps/api/core', () => ({
   convertFileSrc: (path: string) => `file://${path}`,
 }));
 
-import { assetUrl, importLegacyProject, listBoards, listRuns, listBreakdownDrafts, saveBreakdownDraft, saveAssetHost, startPaidRun } from './tauri';
+import { assetUrl, importLegacyProject, listBoards, listRuns, listBreakdownDrafts, saveBreakdownDraft, saveAssetHost, startPaidRun, exportProject } from './tauri';
 
 function enableTauri() {
   (globalThis as unknown as { window?: unknown }).window = { __TAURI_INTERNALS__: {} };
@@ -133,5 +133,33 @@ describe('tauri bridge', () => {
     delete (globalThis as unknown as { window?: unknown }).window;
     await expect(importLegacyProject('/tmp/legacy.json')).rejects.toThrow('旧项目导入只能在桌面应用中运行');
     expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('passes the includeAssets flag to the export command', async () => {
+    invoke.mockResolvedValue({
+      path: '/tmp/bundle/project.json',
+      projectId: 'p1',
+      boards: 1,
+      runs: 2,
+      assets: 3,
+      assetBodiesIncluded: true,
+      bundlePath: '/tmp/bundle',
+    });
+
+    await exportProject('p1', '/tmp/bundle');
+    expect(invoke).toHaveBeenCalledWith('export_project', {
+      projectId: 'p1',
+      path: '/tmp/bundle',
+      includeAssets: false,
+    });
+
+    const summary = await exportProject('p1', '/tmp/bundle', { includeAssets: true });
+    expect(invoke).toHaveBeenLastCalledWith('export_project', {
+      projectId: 'p1',
+      path: '/tmp/bundle',
+      includeAssets: true,
+    });
+    expect(summary.assetBodiesIncluded).toBe(true);
+    expect(summary.bundlePath).toBe('/tmp/bundle');
   });
 });

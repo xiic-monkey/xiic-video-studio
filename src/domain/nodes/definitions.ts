@@ -140,6 +140,13 @@ function audioNode(): NodeDefinition<AudioNodeData> {
   };
 }
 
+/**
+ * 剧本节点。
+ *
+ * 它是「内容节点」：正文与节拍写在节点里，可以直接连给下游的文本输入端口，
+ * 不需要先跑一次。跑一次（text.chat）则让模型按「创作要求」重写正文与节拍，
+ * 运行结果会回填到这两个字段里，下游随即拿到新内容。
+ */
 function scriptNode(): NodeDefinition<ScriptNodeData> {
   return {
     type: 'script', typeVersion: 1, title: '剧本', category: 'script',
@@ -153,27 +160,122 @@ function scriptNode(): NodeDefinition<ScriptNodeData> {
     ],
     fields: [
       { key: 'title', label: '标题', type: 'text' },
-      { key: 'body', label: '正文', type: 'textarea' },
+      { key: 'prompt', label: '创作要求', type: 'textarea', placeholder: '题材、时长、主角、风格；留空则只用上游灵感' },
+      { key: 'body', label: '正文', type: 'textarea', placeholder: '剧本正文，可直接连给下游节点' },
+      { key: 'beats', label: '节拍', type: 'textarea', placeholder: '每行一个节拍；可留空，由模型生成' },
     ],
-    createDefaults: () => ({ title: '', body: '' }),
-    validate: () => [],
+    createDefaults: () => ({ title: '', prompt: '', body: '', beats: '', providerId: '', model: '' }),
+    validate: (node) => {
+      const issues: Issue[] = [];
+      if (!String(node.data.body ?? '').trim() && !String(node.data.beats ?? '').trim()) {
+        issues.push({
+          code: 'SCRIPT_EMPTY',
+          message: '正文与节拍都是空的：连给下游前请先填写，或运行一次让模型生成',
+          severity: 'warning',
+        });
+      }
+      return issues;
+    },
+    actions: [{ key: 'generate', label: '生成剧本', capability: 'text.chat' }],
+  };
+}
+
+/**
+ * 素材节点：图片 / 视频 / 音频各一个。
+ *
+ * 素材进画布只有一种姿势——先变成节点，再连给下游。对标 ComfyUI 的
+ * Load Image 与 TapCanvas 的拖图导入：只输出、不输入，选好素材就能接线。
+ *
+ * 三个节点分开而不是一个「素材」节点带类型下拉：端口类型（image / video /
+ * audio）要一开始就确定，连线时才能做类型校验，也不会出现「输出 any、
+ * 靠字段猜类型」那种连错也不知道的情况。
+ */
+type SourceKind = 'image' | 'video' | 'audio';
+
+const SOURCE_META: Record<SourceKind, {
+  title: string;
+  portLabel: string;
+  role: EdgeRole;
+  placeholder: string;
+  emptyHint: string;
+}> = {
+  image: {
+    title: '图片素材',
+    portLabel: '图片',
+    role: 'reference_image',
+    placeholder: '这张图是什么（例如：角色定妆照）',
+    emptyHint: '还没有图片：把图片拖到画布上，或在这里选一张',
+  },
+  video: {
+    title: '视频素材',
+    portLabel: '视频',
+    role: 'reference_video',
+    placeholder: '这段视频是什么（例如：动作参考）',
+    emptyHint: '还没有视频：把视频文件拖到画布上，或在这里选一段',
+  },
+  audio: {
+    title: '音频素材',
+    portLabel: '音频',
+    role: 'reference_audio',
+    placeholder: '这段音频是什么（例如：背景音乐）',
+    emptyHint: '还没有音频：把音频文件拖到画布上，或在这里选一段',
+  },
+};
+
+export function sourceNodeType(kind: SourceKind): string {
+  return `${kind}_source`;
+}
+
+/** 素材类型 → 节点类型。拖文件进来时按扩展名判断用哪一种。 */
+export function sourceNodeKindFor(nodeType: string): SourceKind | undefined {
+  if (nodeType === 'image_source') return 'image';
+  if (nodeType === 'video_source') return 'video';
+  if (nodeType === 'audio_source') return 'audio';
+  return undefined;
+}
+
+function sourceNode(kind: SourceKind): NodeDefinition<Record<string, unknown>> {
+  const meta = SOURCE_META[kind];
+  return {
+    type: sourceNodeType(kind), typeVersion: 1, title: meta.title,
+    category: kind === 'audio' ? 'audio' : 'media',
+    inputs: [],
+    outputs: [{ key: kind, label: meta.portLabel, dataType: kind, role: meta.role }],
+    fields: [
+      { key: 'note', label: '说明', type: 'text', placeholder: meta.placeholder },
+    ],
+    createDefaults: () => ({ assetId: '', displayName: '', note: '', kind }),
+    validate: (node) => String(node.data.assetId ?? '').trim()
+      ? []
+      : [missing('SOURCE_EMPTY', `请选择${meta.portLabel}`)],
     actions: [],
   };
 }
 
-function mediaSourceNode(): NodeDefinition<Record<string, unknown>> {
+/**
+ * 文本素材：手写的常量文本，作为源连给下游。
+ *
+ * 素材体系里图片 / 视频 / 音频都能当源，只有文本不能——文本要么写进下游
+ * 节点的输入框（换一次改一处），要么连出来复用（一份设定喂多个节点）。
+ * 这里补的是后者。
+ *
+ * 和「备注」的区别：备注是给人看的，不进模型；文本素材只输出。
+ * 和「文本 / LLM」的区别：那个跑模型，这个不跑。
+ */
+function textSourceNode(): NodeDefinition<Record<string, unknown>> {
   return {
-    type: 'media_source', typeVersion: 1, title: '本地素材', category: 'media',
+    type: 'text_source', typeVersion: 1, title: '文本素材',
+    category: 'utility',
     inputs: [],
-    outputs: [{ key: 'output', label: '素材', dataType: 'any' }],
+    outputs: [{ key: 'text', label: '文本', dataType: 'text', role: 'prompt' }],
     fields: [
-      { key: 'assetId', label: '素材 ID', type: 'text', help: '从项目素材库添加后自动绑定' },
-      { key: 'kind', label: '素材类型', type: 'select', options: [
-        { label: '视频', value: 'video' }, { label: '图片', value: 'image' }, { label: '音频', value: 'audio' },
-      ] },
+      { key: 'text', label: '内容', type: 'textarea', placeholder: '要喂给下游的文本（例如：角色设定、世界观）' },
+      { key: 'note', label: '说明', type: 'text', placeholder: '这段文本是什么' },
     ],
-    createDefaults: () => ({ assetId: '', kind: 'video' }),
-    validate: (node) => String(node.data.assetId ?? '').trim() ? [] : [missing('MEDIA_SOURCE_EMPTY', '请选择项目内素材')],
+    createDefaults: () => ({ text: '', note: '' }),
+    validate: (node) => String(node.data.text ?? '').trim()
+      ? []
+      : [missing('SOURCE_EMPTY', '请输入文本')],
     actions: [],
   };
 }
@@ -421,7 +523,10 @@ const registry = new Map<string, NodeDefinition<any>>([
   ['video', videoNode()],
   ['audio', audioNode()],
   ['script', scriptNode()],
-  ['media_source', mediaSourceNode()],
+  ['image_source', sourceNode('image')],
+  ['video_source', sourceNode('video')],
+  ['audio_source', sourceNode('audio')],
+  ['text_source', textSourceNode()],
   ['character', characterNode()],
   ['storyboard', storyboardNode()],
   ['expression', expressionNode()],

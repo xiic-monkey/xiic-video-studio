@@ -622,7 +622,7 @@ async fn store_outputs(
         let asset = assets::store_bytes(&state.data_dir, &bytes, &output.kind, &mime, provenance)
             .map_err(|message| AppError::new("STORAGE_WRITE_FAILED", message, false))?;
         save_asset(state, &asset)?;
-        let _ = app.emit("asset.created", &asset);
+        let _ = app.emit("asset/created", &asset);
         assets_out.push(asset);
     }
     Ok(assets_out)
@@ -715,7 +715,7 @@ fn succeed_run(app: &AppHandle, state: &AppState, run: &RunRecord, assets_out: V
     let _ = save_run(state, &finished);
     close_jobs_for_run(state, &finished.id, "succeeded");
     let _ = app.emit(
-        "run.updated",
+        "run/updated",
         &RunUpdatedEvent {
             run: finished,
             assets: assets_out,
@@ -738,7 +738,7 @@ fn fail_run(
     let _ = save_run(state, &finished);
     close_jobs_for_run(state, &finished.id, "failed");
     let _ = app.emit(
-        "run.updated",
+        "run/updated",
         &RunUpdatedEvent {
             run: finished,
             assets: Vec::new(),

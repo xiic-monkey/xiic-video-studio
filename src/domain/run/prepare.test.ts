@@ -35,6 +35,36 @@ describe('prepareRun', () => {
     expect(outcome.request.inputs).toEqual([]);
   });
 
+  it('图片素材节点连进参考图端口：图会随运行发出，节点按图生图处理', () => {
+    const doc = makeDoc(
+      [node('p', 'image_source', { assetId: 'asset_ref' }), node('i', 'image', { prompt: '雨夜街头' })],
+      [edge('e1', 'p', 'i', 'image', 'references', 'reference_image')],
+    );
+    const outcome = prepareRun(doc, 'i', deps({
+      assets: { asset_ref: assetRef('asset_ref', 'image', 'image/png') },
+    }));
+    if (!outcome.ok) throw new Error(outcome.issues.map((issue) => issue.message).join('；'));
+    expect(outcome.request.inputs).toEqual([
+      { role: 'reference_image', assetId: 'asset_ref', kind: 'image', mime: 'image/png' },
+    ]);
+    // 连了参考图 → 能力从文生图切成图生图。
+    expect(outcome.request.capability).toBe('image.edit');
+  });
+
+  it('素材节点接进参考图端口：静态素材不用先运行', () => {
+    const doc = makeDoc(
+      [node('m', 'image_source', { kind: 'image', assetId: 'asset_local' }), node('i', 'image', { prompt: '雨夜街头' })],
+      [edge('e1', 'm', 'i', 'image', 'references', 'reference_image')],
+    );
+    const outcome = prepareRun(doc, 'i', deps({
+      assets: { asset_local: assetRef('asset_local', 'image', 'image/png') },
+    }));
+    if (!outcome.ok) throw new Error(outcome.issues.map((issue) => issue.message).join('；'));
+    expect(outcome.request.inputs).toEqual([
+      { role: 'reference_image', assetId: 'asset_local', kind: 'image', mime: 'image/png' },
+    ]);
+  });
+
   it('sends the catalog-resolved protocol so the backend does not fall back to the adapter default', () => {
     const doc = makeDoc([node('i', 'image', { prompt: '海报' })], []);
     const outcome = prepareRun(doc, 'i', deps());
@@ -435,6 +465,52 @@ describe('prepareRun', () => {
     const outcome = prepareRun(doc, 'n', deps());
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.issues.map((issue) => issue.code)).toContain('RUN_NOT_RUNNABLE');
+  });
+});
+
+describe('剧本节点的输出', () => {
+  it('feeds the script body into a downstream prompt without running the script node', () => {
+    const doc = makeDoc(
+      [node('s', 'script', { title: '雨夜', body: '第一幕：告别的雨夜' }), node('i', 'image', { prompt: '分镜' })],
+      [edge('e1', 's', 'i', 'script', 'prompt', 'prompt')],
+    );
+    const outcome = prepareRun(doc, 'i', deps());
+    if (!outcome.ok) throw new Error(outcome.issues.map((issue) => issue.message).join('；'));
+    expect(outcome.request.promptSnapshot.text).toBe('分镜\n\n第一幕：告别的雨夜');
+    // 剧本节点没有产物资产，内联正文不算连线输入。
+    expect(outcome.request.inputs).toEqual([]);
+    expect(outcome.request.inputAssetIds).toEqual([]);
+  });
+
+  it('feeds the beats field into a downstream prompt', () => {
+    const doc = makeDoc(
+      [node('s', 'script', { body: '第一幕', beats: '1. 雨夜告别\n2. 追车' }), node('i', 'image', { prompt: '分镜' })],
+      [edge('e1', 's', 'i', 'beats', 'prompt', 'prompt')],
+    );
+    const outcome = prepareRun(doc, 'i', deps());
+    if (!outcome.ok) throw new Error(outcome.issues.map((issue) => issue.message).join('；'));
+    expect(outcome.request.promptSnapshot.text).toBe('分镜\n\n1. 雨夜告别\n2. 追车');
+  });
+
+  it('blocks the run when the script node has neither body nor a result', () => {
+    const doc = makeDoc(
+      [node('s', 'script'), node('i', 'image', { prompt: '海报' })],
+      [edge('e1', 's', 'i', 'script', 'prompt', 'prompt')],
+    );
+    const outcome = prepareRun(doc, 'i', deps());
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.issues.map((issue) => issue.code)).toContain('RUN_UPSTREAM_TEXT_EMPTY');
+    }
+  });
+
+  it('runs the script node as a text generation and asks for the json contract', () => {
+    const doc = makeDoc([node('s', 'script', { title: '雨夜', prompt: '写一场告别戏' })], []);
+    const outcome = prepareRun(doc, 's', deps());
+    if (!outcome.ok) throw new Error(outcome.issues.map((issue) => issue.message).join('；'));
+    expect(outcome.request.capability).toBe('text.chat');
+    expect(outcome.request.promptSnapshot.text).toContain('"script"');
+    expect(outcome.request.promptSnapshot.text).toContain('写一场告别戏');
   });
 });
 

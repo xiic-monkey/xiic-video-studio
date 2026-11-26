@@ -406,10 +406,16 @@ pub fn apply_production_change(
             return Err(CommandError::InvalidReference);
         }
         let op = operation.get("op").and_then(Value::as_str).unwrap_or("upsertEntity");
-        if !["upsertEntity", "applyBreakdown", "createSubjectVersion", "setShotBindings", "attachPreviousLastFrame", "adoptShotMedia", "recordProductionReview", "assembleEpisode", "replaceTimelineClip", "commitTimelineEdit", "revertProductionChange"].contains(&op) {
+        if !["upsertEntity", "deleteEntity", "applyBreakdown", "createSubjectVersion", "setShotBindings", "attachPreviousLastFrame", "adoptShotMedia", "recordProductionReview", "assembleEpisode", "replaceTimelineClip", "commitTimelineEdit", "revertProductionChange"].contains(&op) {
             return Err(CommandError::InvalidReference);
         }
-        let mut payload = operation.get("payload").cloned().filter(Value::is_object).ok_or(CommandError::InvalidReference)?;
+        let mut payload = match operation.get("payload") {
+            Some(value) if value.is_object() => value.clone(),
+            // deleteEntity 只需要实体 id，载荷可为空对象或缺省。
+            Some(value) if op == "deleteEntity" && value.is_null() => json!({}),
+            None if op == "deleteEntity" => json!({}),
+            _ => return Err(CommandError::InvalidReference),
+        };
         let owner: Option<(String, String, Option<String>)> = tx
             .query_row("SELECT project_id,kind,archived_at FROM project_entities WHERE id=?1", [id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .ok();
@@ -446,6 +452,17 @@ pub fn apply_production_change(
         }
         before_payloads.insert(id.to_string(), current_payload.as_deref().and_then(|value| serde_json::from_str::<Value>(value).ok()).unwrap_or(Value::Null));
         if op == "revertProductionChange" && payload.is_null() {
+            let now = Utc::now().to_rfc3339();
+            tx.execute("UPDATE project_entities SET archived_at=?1, updated_at=?1, revision=revision+1 WHERE id=?2 AND project_id=?3", params![now, id, project_id]).map_err(|error| CommandError::Database(error.to_string()))?;
+            after_payloads.insert(id.to_string(), Value::Null);
+            let revision: i64 = tx.query_row("SELECT revision FROM project_entities WHERE id=?1 AND project_id=?2", params![id, project_id], |row| row.get(0)).map_err(|error| CommandError::Database(error.to_string()))?;
+            revision_map.insert(id.to_string(), revision);
+            affected.push(id.to_string());
+            continue;
+        }
+        if op == "deleteEntity" {
+            // 软删除：只归档不删行，和 revertProductionChange 的归档路径保持一致，历史变更仍可追溯。
+            if owner.is_none() { return Err(CommandError::InvalidReference); }
             let now = Utc::now().to_rfc3339();
             tx.execute("UPDATE project_entities SET archived_at=?1, updated_at=?1, revision=revision+1 WHERE id=?2 AND project_id=?3", params![now, id, project_id]).map_err(|error| CommandError::Database(error.to_string()))?;
             after_payloads.insert(id.to_string(), Value::Null);
@@ -1017,6 +1034,40 @@ mod tests {
         assert_eq!(apply_production_change(&mut connection, "p", "write-archived", &HashMap::from([("shot".to_string(), 2)]), &update).unwrap_err(), CommandError::ChangeConflict);
         let payload: Option<String> = connection.query_row("SELECT payload FROM project_entities WHERE id='shot'", [], |row| row.get(0)).unwrap();
         assert_eq!(serde_json::from_str::<Value>(&payload.unwrap()).unwrap()["action"], "new");
+    }
+
+    #[test]
+    fn delete_entity_archives_the_entity_instead_of_dropping_the_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut connection = db::open(&dir.path().join("db.sqlite3")).unwrap();
+        let create = vec![serde_json::json!({"id":"shot","kind":"shot","payload":{"action":"new"}})];
+        apply_production_change(&mut connection, "p", "create", &HashMap::from([("shot".to_string(), 0)]), &create).unwrap();
+        let delete = vec![serde_json::json!({"id":"shot","kind":"shot","op":"deleteEntity","payload":{}})];
+        let result = apply_production_change(&mut connection, "p", "delete", &HashMap::from([("shot".to_string(), 1)]), &delete).unwrap();
+        assert_eq!(result.affected_ids, vec!["shot"]);
+        assert_eq!(result.revision_map.get("shot"), Some(&2));
+        let archived: Option<String> = connection.query_row("SELECT archived_at FROM project_entities WHERE id='shot'", [], |row| row.get(0)).unwrap();
+        assert!(archived.is_some(), "删除实体要归档而不是删行");
+        let listed: i64 = connection.query_row("SELECT COUNT(*) FROM project_entities WHERE project_id='p' AND archived_at IS NULL", [], |row| row.get(0)).unwrap();
+        assert_eq!(listed, 0, "归档后的实体不再出现在列表查询里");
+        let revision: i64 = connection.query_row("SELECT revision FROM project_entities WHERE id='shot'", [], |row| row.get(0)).unwrap();
+        assert_eq!(revision, 2);
+    }
+
+    #[test]
+    fn delete_entity_rejects_unknown_entity_and_stale_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut connection = db::open(&dir.path().join("db.sqlite3")).unwrap();
+        let missing = vec![serde_json::json!({"id":"ghost","kind":"shot","op":"deleteEntity","payload":{}})];
+        assert_eq!(apply_production_change(&mut connection, "p", "delete-missing", &HashMap::from([("ghost".to_string(), 0)]), &missing).unwrap_err(), CommandError::InvalidReference);
+        let create = vec![serde_json::json!({"id":"shot","kind":"shot","payload":{"action":"new"}})];
+        apply_production_change(&mut connection, "p", "create", &HashMap::from([("shot".to_string(), 0)]), &create).unwrap();
+        let stale = vec![serde_json::json!({"id":"shot","kind":"shot","op":"deleteEntity","payload":{}})];
+        assert_eq!(apply_production_change(&mut connection, "p", "delete-stale", &HashMap::from([("shot".to_string(), 7)]), &stale).unwrap_err(), CommandError::RevisionConflict);
+        // 归档后不可再写：已归档实体不接受任何改动。
+        let delete = vec![serde_json::json!({"id":"shot","kind":"shot","op":"deleteEntity","payload":{}})];
+        apply_production_change(&mut connection, "p", "delete", &HashMap::from([("shot".to_string(), 1)]), &delete).unwrap();
+        assert_eq!(apply_production_change(&mut connection, "p", "delete-again", &HashMap::from([("shot".to_string(), 2)]), &delete).unwrap_err(), CommandError::ChangeConflict);
     }
 
     #[test]

@@ -94,7 +94,13 @@ export interface AudioNodeData {
 
 export interface ScriptNodeData {
   title: string;
+  /** 创作要求：运行剧本节点时发给模型的指令。 */
+  prompt: string;
   body: string;
+  /** 节拍：每行一条。 */
+  beats: string;
+  providerId?: string;
+  model?: string;
 }
 
 /** 角色三视图（业内通行版式：横版「面部特写 + 正/侧/背」，竖版 2×2 四视图）。 */

@@ -139,9 +139,28 @@ export function inpaintInstruction(node: BoardNode): string {
   ].join('');
 }
 
+/**
+ * 剧本节点的输出规范。
+ *
+ * 剧本节点一次要交出两样东西（正文与节拍），所以让模型直接输出 JSON：
+ * 解析失败时按纯文本兜底（正文=全文，节拍为空）。
+ */
+export function scriptInstruction(node: BoardNode): string {
+  const title = String((node.data as { title?: string }).title ?? '').trim();
+  return [
+    '（剧本生成规范）',
+    '只输出一个 JSON 对象，不要输出 JSON 以外的任何内容，也不要用代码块包裹。',
+    '格式：{"script": "剧本正文", "beats": ["节拍一", "节拍二"]}',
+    'script 是可直接拍摄的剧本正文，包含场次标题、动作与台词，用换行分段；',
+    'beats 是这场戏的节拍列表，每条一句话，顺序即叙事顺序；',
+    title ? `本剧标题：${title}；` : '',
+  ].join('');
+}
+
 /** 业务节点 → 追加到提示词里的规范文本。 */
 export function instructionFor(node: BoardNode): string | undefined {
   switch (node.type) {
+    case 'script': return scriptInstruction(node);
     case 'character': return characterSheetInstruction(node);
     case 'storyboard': return storyboardGridInstruction(node);
     case 'expression': return expressionSheetInstruction(node);

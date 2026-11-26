@@ -6,7 +6,7 @@ use crate::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const MAX_IMAGE_BYTES: u64 = 30 * 1024 * 1024;
 const MAX_AUDIO_BYTES: u64 = 100 * 1024 * 1024;
@@ -157,6 +157,38 @@ pub(crate) enum IngestError {
     Database(String),
 }
 
+impl IngestError {
+    /// 失败原因对外暴露的稳定代码：库内错误保留原始 MEDIA_ 前缀，其余归到 MEDIA_DB。
+    pub(crate) fn code(&self) -> String {
+        match self {
+            IngestError::TooLarge => "MEDIA_TOO_LARGE".into(),
+            IngestError::InvalidFormat => "MEDIA_FORMAT_INVALID".into(),
+            IngestError::GrantInvalid => "MEDIA_GRANT_INVALID".into(),
+            IngestError::Database(message) => {
+                if message.starts_with("MEDIA_") {
+                    message.clone()
+                } else {
+                    format!("MEDIA_DB: {message}")
+                }
+            }
+        }
+    }
+}
+
+/// 按路径导入：前端拖拽文件拿到的是裸路径，没有 grant 可用。
+pub(crate) fn ingest_path(
+    state: &AppState,
+    project_id: &str,
+    path: &Path,
+) -> Result<IngestedAsset, IngestError> {
+    let metadata = std::fs::metadata(path).map_err(|_| IngestError::InvalidFormat)?;
+    if !metadata.is_file() {
+        return Err(IngestError::InvalidFormat);
+    }
+    let file = std::fs::File::open(path).map_err(|_| IngestError::InvalidFormat)?;
+    ingest_file(state, project_id, path, file, metadata.len())
+}
+
 pub(crate) fn ingest_grant(
     state: &AppState,
     grants: &FileGrantStore,
@@ -166,18 +198,32 @@ pub(crate) fn ingest_grant(
     let file = grants
         .open_input(grant, project_id, GrantPurpose::MediaImport)
         .map_err(|_| IngestError::GrantInvalid)?;
-    let metadata = file.metadata().map_err(|_| IngestError::InvalidFormat)?;
-    let kind = kind_for_path(&grant.path).ok_or(IngestError::InvalidFormat)?;
+    let metadata_len = file
+        .metadata()
+        .map_err(|_| IngestError::InvalidFormat)?
+        .len();
+    ingest_file(state, project_id, grant.path.as_path(), file, metadata_len)
+}
+
+/// 已打开文件之后的导入流程：判定类型 → 大小校验 → 落盘 → 落库 → 登记项目成员。
+pub(crate) fn ingest_file(
+    state: &AppState,
+    project_id: &str,
+    path: &Path,
+    file: std::fs::File,
+    metadata_len: u64,
+) -> Result<IngestedAsset, IngestError> {
+    let kind = kind_for_path(path).ok_or(IngestError::InvalidFormat)?;
     let limit = match kind {
         "image" => MAX_IMAGE_BYTES,
         "audio" => MAX_AUDIO_BYTES,
         _ => MAX_VIDEO_BYTES,
     };
-    if metadata.len() > limit {
+    if metadata_len > limit {
         return Err(IngestError::TooLarge);
     }
-    let display_name = super::grants::sanitize_display_name(&grant.path);
-    let mime = mime_for_path(&grant.path, kind);
+    let display_name = super::grants::sanitize_display_name(path);
+    let mime = mime_for_path(path, kind);
     let mut probed_metadata = None;
     let mut image_dimensions = None;
     let mut asset = assets::store_reader(
@@ -188,7 +234,7 @@ pub(crate) fn ingest_grant(
         mime,
         serde_json::json!({"projectId":project_id,"displayName":display_name,"kind":"import"}),
         |staged_path, prefix| {
-            if !looks_like_kind(prefix, kind, &grant.path) {
+            if !looks_like_kind(prefix, kind, path) {
                 return Err("MEDIA_FORMAT_INVALID".into());
             }
             if kind == "image" {
@@ -235,42 +281,56 @@ pub(crate) fn ingest_grant(
         asset.duration = Some(probed.duration_ticks as f64 / 240_000.0);
     }
     let id = asset.id.clone();
-    let path = state
-        .db_path
-        .lock()
-        .map_err(|_| IngestError::Database("lock".into()))?
-        .clone();
-    let connection = db::open(&path).map_err(IngestError::Database)?;
-    let transaction = connection
-        .unchecked_transaction()
-        .map_err(|error| IngestError::Database(error.to_string()))?;
-    transaction.execute("INSERT INTO assets (id,kind,path,mime,bytes,width,height,duration,payload,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(id) DO NOTHING", rusqlite::params![asset.id,asset.kind,asset.path,asset.mime,asset.bytes,asset.width,asset.height,asset.duration,serde_json::to_string(&asset).map_err(|error| IngestError::Database(error.to_string()))?,asset.created_at]).map_err(|error| IngestError::Database(error.to_string()))?;
-    record_asset_membership(
-        &transaction,
-        project_id,
-        &asset,
-        &AssetOrigin {
-            kind: "import".into(),
-            reference: Some(display_name.clone()),
-        },
-    )
-    .map_err(|error| IngestError::Database(error.to_string()))?;
-    transaction
-        .commit()
-        .map_err(|error| IngestError::Database(error.to_string()))?;
+    register_asset(state, project_id, &asset, &display_name).map_err(IngestError::Database)?;
     Ok(IngestedAsset {
         asset_id: id,
         display_name,
-        bytes: metadata.len(),
+        bytes: metadata_len,
         kind: kind.into(),
     })
+}
+
+/// 落库并登记到项目：assets 表 + 项目素材归属。
+///
+/// 走文件导入的和走剪贴板粘贴的最终都是「一段字节 → 一个项目素材」，
+/// 所以共用这一步，免得两处各写一遍归属登记。
+pub(crate) fn register_asset(
+    state: &AppState,
+    project_id: &str,
+    asset: &assets::AssetRef,
+    display_name: &str,
+) -> Result<(), String> {
+    let path = state
+        .db_path
+        .lock()
+        .map_err(|_| "lock".to_string())?
+        .clone();
+    let connection = db::open(&path)?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    transaction.execute("INSERT INTO assets (id,kind,path,mime,bytes,width,height,duration,payload,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(id) DO NOTHING", rusqlite::params![asset.id,asset.kind,asset.path,asset.mime,asset.bytes,asset.width,asset.height,asset.duration,serde_json::to_string(asset).map_err(|error| error.to_string())?,asset.created_at]).map_err(|error| error.to_string())?;
+    record_asset_membership(
+        &transaction,
+        project_id,
+        asset,
+        &AssetOrigin {
+            kind: "import".into(),
+            reference: Some(display_name.to_string()),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    transaction
+        .commit()
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn ffprobe_path() -> Option<PathBuf> {
     super::probe::configured_ffprobe()
 }
 
-fn kind_for_path(path: &PathBuf) -> Option<&'static str> {
+fn kind_for_path(path: &Path) -> Option<&'static str> {
     match path
         .extension()
         .and_then(|value| value.to_str())
@@ -284,7 +344,7 @@ fn kind_for_path(path: &PathBuf) -> Option<&'static str> {
         _ => None,
     }
 }
-fn mime_for_path(path: &PathBuf, kind: &str) -> &'static str {
+fn mime_for_path(path: &Path, kind: &str) -> &'static str {
     match path
         .extension()
         .and_then(|value| value.to_str())
@@ -307,7 +367,7 @@ fn mime_for_path(path: &PathBuf, kind: &str) -> &'static str {
         },
     }
 }
-fn looks_like_kind(bytes: &[u8], kind: &str, path: &PathBuf) -> bool {
+fn looks_like_kind(bytes: &[u8], kind: &str, path: &Path) -> bool {
     match kind {
         "image" => match path
             .extension()
@@ -479,5 +539,47 @@ mod tests {
             .unwrap();
         assert_eq!((width, height), (1280, 720));
         assert_eq!(duration, 12.5);
+    }
+
+    #[test]
+    fn imports_a_file_by_path_without_a_grant() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dragged.png");
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([7, 8, 9, 255]),
+        ))
+        .save(&path)
+        .unwrap();
+        let state = AppState {
+            db_path: std::sync::Mutex::new(directory.path().join("db.sqlite3")),
+            data_dir: directory.path().to_path_buf(),
+        };
+        let imported = ingest_path(&state, "p1", &path).unwrap();
+        assert_eq!(imported.kind, "image");
+        assert_eq!(imported.display_name, "dragged.png");
+        assert_eq!(imported.asset_id.len(), 64);
+        assert!(imported.asset_id.chars().all(|value| value.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn path_import_rejects_missing_files_and_unsupported_extensions() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState {
+            db_path: std::sync::Mutex::new(directory.path().join("db.sqlite3")),
+            data_dir: directory.path().to_path_buf(),
+        };
+        let missing = directory.path().join("nope.png");
+        assert_eq!(
+            ingest_path(&state, "p1", &missing).unwrap_err(),
+            IngestError::InvalidFormat
+        );
+        let text = directory.path().join("notes.txt");
+        std::fs::write(&text, b"plain text").unwrap();
+        assert_eq!(
+            ingest_path(&state, "p1", &text).unwrap_err(),
+            IngestError::InvalidFormat
+        );
     }
 }

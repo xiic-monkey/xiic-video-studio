@@ -31,6 +31,10 @@ pub struct ExportSummary {
     pub boards: usize,
     pub runs: usize,
     pub assets: usize,
+    /// 是否把素材文件本体一起带出去了。
+    pub asset_bodies_included: bool,
+    /// 含素材导出时的导出目录；仅元数据导出为 None。
+    pub bundle_path: Option<String>,
 }
 
 pub fn build_package(connection: &Connection, project_id: &str) -> Result<Value, String> {
@@ -354,19 +358,115 @@ pub fn validate_destination(dest: &Path, data_dir: &Path) -> Result<PathBuf, Str
     Ok(resolved)
 }
 
+/// 含素材导出：目标是一个**目录**，目录里放 `project.json` 与 `assets/`。
+///
+/// 与 `validate_destination` 分开写：那边要求目标是 `.json` 普通文件，
+/// 这边要求目标是个目录，两条规则的校验点不一样，不能混用。
+pub fn validate_asset_bundle_destination(dest: &Path, data_dir: &Path) -> Result<PathBuf, String> {
+    if dest
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err("导出路径不合法".to_string());
+    }
+    let file_name = dest
+        .file_name()
+        .ok_or_else(|| "导出路径缺少目录名".to_string())?;
+    let parent = dest
+        .parent()
+        .ok_or_else(|| "导出路径缺少目录".to_string())?
+        .canonicalize()
+        .map_err(|_| "导出目录不存在".to_string())?;
+    let resolved = parent.join(file_name);
+    let data_root = data_dir.canonicalize().map_err(|error| error.to_string())?;
+    if resolved.starts_with(&data_root) {
+        return Err("不能导出到应用数据目录内".to_string());
+    }
+    if let Ok(metadata) = resolved.symlink_metadata() {
+        // 目标已存在时必须是普通目录：软链接会把导出重定向到别处。
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("导出目标已存在且不是目录，已拒绝".to_string());
+        }
+    }
+    Ok(resolved)
+}
+
+/// 把包清单里列出的素材文件复制进导出目录。
+///
+/// 只复制清单里有的素材：项目没引用过的素材不进包，迁移过去也没意义。
+/// 素材在磁盘上找不到时跳过并在清单里记一笔（`bodyMissing`），不让整个导出失败。
+///
+/// 返回实际复制成功的文件数。
+fn copy_asset_bodies(package: &mut Value, data_dir: &Path, bundle_dir: &Path) -> Result<usize, String> {
+    let Some(entries) = package.get_mut("assets").and_then(Value::as_array_mut) else {
+        return Ok(0);
+    };
+    let mut copied = 0usize;
+    for entry in entries.iter_mut() {
+        let Some(map) = entry.as_object_mut() else {
+            continue;
+        };
+        let relative = map
+            .get("relativePath")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        // 目标路径必须留在 bundle_dir 里：沿用 assets::absolute_path 的判定，
+        // 素材表里的路径一旦带 `..` 就不能顺着它写到目录外面去。
+        let target = if relative.is_empty() {
+            None
+        } else {
+            crate::assets::absolute_path(bundle_dir, &relative)
+                .ok()
+                .filter(|path| path.starts_with(bundle_dir))
+        };
+        let Some(target) = target else {
+            map.insert("bodyMissing".to_string(), Value::Bool(true));
+            map.insert(
+                "bodyError".to_string(),
+                Value::String("素材路径不合法".to_string()),
+            );
+            continue;
+        };
+        let Ok(source) = crate::assets::absolute_path(data_dir, &relative) else {
+            map.insert("bodyMissing".to_string(), Value::Bool(true));
+            map.insert(
+                "bodyError".to_string(),
+                Value::String("素材路径不合法".to_string()),
+            );
+            continue;
+        };
+        if !source.is_file() {
+            map.insert("bodyMissing".to_string(), Value::Bool(true));
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        std::fs::copy(&source, &target).map_err(|error| error.to_string())?;
+        copied += 1;
+    }
+    Ok(copied)
+}
+
 pub fn export_project(
     state: &AppState,
     project_id: &str,
     dest: &Path,
+    include_assets: bool,
 ) -> Result<ExportSummary, String> {
     // 先校验目标路径：路径不合法就别白读一遍数据库。
-    let resolved = validate_destination(dest, &state.data_dir)?;
+    let resolved = if include_assets {
+        validate_asset_bundle_destination(dest, &state.data_dir)?
+    } else {
+        validate_destination(dest, &state.data_dir)?
+    };
     let db_path = state
         .db_path
         .lock()
         .map_err(|_| "db lock".to_string())?
         .clone();
-    let package = {
+    let mut package = {
         let connection = db::open(&db_path)?;
         let mut package = build_package(&connection, project_id)?;
         // 精确抹掉钥匙串里的真实密钥值：修复前落库的供应商错误体可能还带着
@@ -375,8 +475,31 @@ pub fn export_project(
         redact_secret_values(&mut package, &secrets);
         package
     };
-    let raw = serde_json::to_string_pretty(&package).map_err(|error| error.to_string())?;
-    std::fs::write(&resolved, raw.as_bytes()).map_err(|error| error.to_string())?;
+
+    let (path, bundle_path) = if include_assets {
+        package["assetBodiesIncluded"] = Value::Bool(true);
+        // 目录已存在时先清掉旧产物，避免残留上一次导出的过期素材。
+        let assets_dir = resolved.join("assets");
+        if assets_dir.symlink_metadata().is_ok() {
+            std::fs::remove_dir_all(&assets_dir).map_err(|error| error.to_string())?;
+        }
+        let manifest = resolved.join("project.json");
+        if manifest.symlink_metadata().is_ok() {
+            std::fs::remove_file(&manifest).map_err(|error| error.to_string())?;
+        }
+        std::fs::create_dir_all(&resolved).map_err(|error| error.to_string())?;
+        copy_asset_bodies(&mut package, &state.data_dir, &resolved)?;
+        let raw = serde_json::to_string_pretty(&package).map_err(|error| error.to_string())?;
+        std::fs::write(&manifest, raw.as_bytes()).map_err(|error| error.to_string())?;
+        (
+            manifest.to_string_lossy().to_string(),
+            Some(resolved.to_string_lossy().to_string()),
+        )
+    } else {
+        let raw = serde_json::to_string_pretty(&package).map_err(|error| error.to_string())?;
+        std::fs::write(&resolved, raw.as_bytes()).map_err(|error| error.to_string())?;
+        (resolved.to_string_lossy().to_string(), None)
+    };
 
     let count = |key: &str| {
         package
@@ -386,11 +509,13 @@ pub fn export_project(
             .unwrap_or_default()
     };
     Ok(ExportSummary {
-        path: resolved.to_string_lossy().to_string(),
+        path,
         project_id: project_id.to_string(),
         boards: count("boards"),
         runs: count("runs"),
         assets: count("assets"),
+        asset_bodies_included: include_assets,
+        bundle_path,
     })
 }
 
@@ -513,14 +638,14 @@ mod tests {
             seed(&connection);
         }
 
-        let summary = export_project(&state, "p1", &out_dir.path().join("project.json")).unwrap();
+        let summary = export_project(&state, "p1", &out_dir.path().join("project.json"), false).unwrap();
         assert_eq!((summary.boards, summary.runs, summary.assets), (1, 1, 1));
         let text = std::fs::read_to_string(&summary.path).unwrap();
         assert!(!text.contains("sk-leak"));
         serde_json::from_str::<serde_json::Value>(&text).unwrap();
 
         // 退出标准第 3 条：导出到同一个文件名 → 覆盖成功，且文件仍是合法 JSON。
-        let again = export_project(&state, "p1", &out_dir.path().join("project.json")).unwrap();
+        let again = export_project(&state, "p1", &out_dir.path().join("project.json"), false).unwrap();
         assert_eq!(again.path, summary.path);
         let overwritten = std::fs::read_to_string(&again.path).unwrap();
         serde_json::from_str::<serde_json::Value>(&overwritten).unwrap();
@@ -530,7 +655,7 @@ mod tests {
         {
             let link = out_dir.path().join("link.json");
             std::os::unix::fs::symlink(out_dir.path().join("project.json"), &link).unwrap();
-            let error = export_project(&state, "p1", &link).expect_err("软链接必须被拒绝");
+            let error = export_project(&state, "p1", &link, false).expect_err("软链接必须被拒绝");
             assert!(error.contains("不是普通文件"), "实际错误：{error}");
         }
     }
@@ -554,7 +679,7 @@ mod tests {
             seed(&connection);
         }
 
-        let summary = export_project(&state, "p1", &out_dir.path().join("验收.json")).unwrap();
+        let summary = export_project(&state, "p1", &out_dir.path().join("验收.json"), false).unwrap();
         let text = std::fs::read_to_string(&summary.path).unwrap();
 
         // 第一条：不能出现任何密钥字段名（大小写不敏感）。
@@ -653,5 +778,243 @@ mod tests {
         let mut package = json!({ "message": "模型 abc 不可用" });
         redact_secret_values(&mut package, &["abc".to_string()]);
         assert_eq!(package["message"], json!("模型 abc 不可用"));
+    }
+
+    /// 造一个带种子数据的应用状态，并返回它。
+    fn seeded_state(data_dir: &Path) -> AppState {
+        let state = AppState {
+            db_path: std::sync::Mutex::new(data_dir.join("db.sqlite3")),
+            data_dir: data_dir.to_path_buf(),
+        };
+        {
+            let connection = crate::db::open(&data_dir.join("db.sqlite3")).unwrap();
+            seed(&connection);
+        }
+        state
+    }
+
+    /// 在应用数据目录里放一个素材文件本体。
+    fn write_source_asset(data_dir: &Path, relative: &str, bytes: &[u8]) {
+        let path = data_dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// 仅元数据导出：还是一个 JSON 文件，目录结构不变，包里明确不含素材本体。
+    #[test]
+    fn export_without_assets_writes_only_json() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let state = seeded_state(data_dir.path());
+        write_source_asset(data_dir.path(), "assets/ab/ab12.png", b"png-bytes");
+
+        let target = out_dir.path().join("project.json");
+        let summary = export_project(&state, "p1", &target, false).unwrap();
+
+        assert!(!summary.asset_bodies_included, "仅元数据导出不该声称带了素材");
+        assert!(summary.bundle_path.is_none(), "仅元数据导出没有导出目录");
+        assert_eq!(
+            PathBuf::from(&summary.path),
+            target.canonicalize().unwrap(),
+            "导出路径要和目标一致"
+        );
+        assert!(target.is_file(), "应该只写出一个 JSON 文件");
+        assert!(
+            !out_dir.path().join("assets").exists(),
+            "仅元数据导出不该建出 assets 目录"
+        );
+
+        let package: Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(package["assetBodiesIncluded"], json!(false));
+    }
+
+    /// 含素材导出：目录里有 project.json 与按 relativePath 布局的素材文件。
+    #[test]
+    fn export_with_assets_writes_bundle_directory() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let state = seeded_state(data_dir.path());
+        write_source_asset(data_dir.path(), "assets/ab/ab12.png", b"png-bytes");
+
+        let bundle = out_dir.path().join("导出包");
+        let summary = export_project(&state, "p1", &bundle, true).unwrap();
+
+        assert!(summary.asset_bodies_included, "含素材导出必须声称带了素材");
+        assert_eq!(
+            PathBuf::from(summary.bundle_path.clone().unwrap()).canonicalize().unwrap(),
+            bundle.canonicalize().unwrap(),
+            "导出目录要回传给前端"
+        );
+
+        let manifest = bundle.join("project.json");
+        assert!(manifest.is_file(), "目录里必须有 project.json");
+        let copied = bundle.join("assets/ab/ab12.png");
+        assert!(copied.is_file(), "素材文件必须按 relativePath 布局落盘");
+        assert_eq!(
+            std::fs::read(&copied).unwrap(),
+            b"png-bytes".to_vec(),
+            "复制出来的素材内容必须与源文件一致"
+        );
+
+        let package: Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+        assert_eq!(package["assetBodiesIncluded"], json!(true));
+        assert_eq!(
+            package["assets"][0]["relativePath"],
+            json!("assets/ab/ab12.png")
+        );
+        assert!(
+            package["assets"][0].get("bodyMissing").is_none(),
+            "素材都在，不能记成缺失"
+        );
+
+        // 重复导出：旧的 project.json 与 assets/ 要先清掉，不能残留上一次的素材。
+        let stale = bundle.join("assets/stale/old.png");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, b"old").unwrap();
+        export_project(&state, "p1", &bundle, true).unwrap();
+        assert!(!stale.exists(), "重复导出必须清掉上一次的过期素材");
+        assert!(copied.is_file(), "重复导出后素材仍在");
+    }
+
+    /// 素材文件在磁盘上找不到时，导出不能整体失败，要在清单里记一笔。
+    #[test]
+    fn export_with_assets_marks_missing_bodies() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let state = seeded_state(data_dir.path());
+        // 故意不写素材本体。
+
+        let bundle = out_dir.path().join("导出包");
+        let summary = export_project(&state, "p1", &bundle, true).unwrap();
+        assert!(summary.asset_bodies_included);
+
+        let package: Value = serde_json::from_str(
+            &std::fs::read_to_string(bundle.join("project.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(package["assetBodiesIncluded"], json!(true));
+        assert_eq!(package["assets"][0]["bodyMissing"], json!(true));
+        assert!(
+            !bundle.join("assets/ab/ab12.png").exists(),
+            "缺失的素材不能凭空造一个出来"
+        );
+    }
+
+    /// 含素材导出的目录校验：路径穿越与应用数据目录内都要被拒绝。
+    #[test]
+    fn asset_bundle_destination_rejects_escape_and_data_dir() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+
+        let ok = validate_asset_bundle_destination(&out_dir.path().join("包"), data_dir.path())
+            .unwrap();
+        assert!(ok.to_string_lossy().ends_with("包"));
+
+        assert!(
+            validate_asset_bundle_destination(Path::new("../evil"), data_dir.path()).is_err(),
+            "路径穿越必须被拒绝"
+        );
+        assert!(
+            validate_asset_bundle_destination(&data_dir.path().join("inside"), data_dir.path())
+                .is_err(),
+            "不能导出到应用数据目录内"
+        );
+        assert!(
+            validate_asset_bundle_destination(&out_dir.path().join("nope/inside"), data_dir.path())
+                .is_err(),
+            "父目录不存在必须被拒绝"
+        );
+        // 目标已存在但是普通文件：不是目录，拒绝。
+        std::fs::write(out_dir.path().join("file.txt"), b"x").unwrap();
+        assert!(
+            validate_asset_bundle_destination(&out_dir.path().join("file.txt"), data_dir.path())
+                .is_err()
+        );
+        // 目标已存在且是目录：允许（重复导出）。
+        std::fs::create_dir_all(out_dir.path().join("dir")).unwrap();
+        assert!(
+            validate_asset_bundle_destination(&out_dir.path().join("dir"), data_dir.path()).is_ok()
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/tmp", &out_dir.path().join("link")).unwrap();
+            assert!(
+                validate_asset_bundle_destination(&out_dir.path().join("link"), data_dir.path())
+                    .is_err(),
+                "软链接目标必须被拒绝"
+            );
+        }
+    }
+
+    /// 含素材导出时，落到应用数据目录内的目标要被拒绝。
+    #[test]
+    fn export_with_assets_rejects_data_dir() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let state = seeded_state(data_dir.path());
+        let error = export_project(&state, "p1", &data_dir.path().join("导出包"), true)
+            .expect_err("不能导出到应用数据目录内");
+        assert!(error.contains("应用数据目录"), "实际错误：{error}");
+    }
+
+    /// 素材表里的路径带 `..` 时不能顺着它写到导出目录外面去。
+    #[test]
+    fn export_with_assets_refuses_traversing_asset_paths() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let state = seeded_state(data_dir.path());
+        {
+            let connection = crate::db::open(&data_dir.path().join("db.sqlite3")).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO assets (id, kind, path, mime, bytes, width, height, duration, payload, created_at)
+                     VALUES ('a2', 'image', '../../evil.png', 'image/png', 10, NULL, NULL, NULL, '{}', '2026-10-31T00:00:00Z')",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO project_assets (project_id,asset_id,display_name,added_at,provenance)
+                     VALUES ('p1','a2','a2','2026-10-31T00:00:00Z','{}')",
+                    [],
+                )
+                .unwrap();
+            // 让 a2 真的被项目引用：清单里只列被引用的素材。
+            connection
+                .execute(
+                    "INSERT INTO boards (id, project_id, name, payload, created_at, updated_at)
+                     VALUES ('b2', 'p1', '第二画布', ?1, '2026-10-31T00:00:00Z', '2026-10-31T00:00:00Z')",
+                    [r#"{"id":"b2","projectId":"p1","name":"第二画布","schemaVersion":1,"nodes":{"n2":{"id":"n2","type":"image","data":{"selectedAssetId":"a2"}}},"edges":{},"viewport":{"x":0,"y":0,"zoom":1}}"#],
+                )
+                .unwrap();
+        }
+        let outside = out_dir.path().join("evil.png");
+        std::fs::write(&outside, b"untouched").unwrap();
+
+        let bundle = out_dir.path().join("导出包");
+        let summary = export_project(&state, "p1", &bundle, true).unwrap();
+        assert!(summary.asset_bodies_included);
+
+        let package: Value = serde_json::from_str(
+            &std::fs::read_to_string(bundle.join("project.json")).unwrap(),
+        )
+        .unwrap();
+        let entry = package["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == json!("a2"))
+            .unwrap();
+        assert_eq!(entry["bodyMissing"], json!(true), "越界路径必须被记成不可用");
+        assert!(
+            !bundle.join("assets/../../evil.png").exists(),
+            "不能把文件写到导出目录外面"
+        );
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            b"untouched".to_vec(),
+            "导出目录外的文件不能被改动"
+        );
     }
 }

@@ -63,11 +63,11 @@ pub fn attach_task(
     }
     if let Ok(updated) = runs::mark_running(state, &run.id) {
         let _ = app.emit(
-            "run.updated",
+            "run/updated",
             &runs::RunUpdatedEvent { run: updated, assets: Vec::new() },
         );
     }
-    let _ = app.emit("job.updated", json!({ "id": job_id, "status": "submitted", "attempts": 0 }));
+    let _ = app.emit("job/updated", json!({ "id": job_id, "status": "submitted", "attempts": 0 }));
     let app = app.clone();
     let db_path = runs::db_path(state).unwrap_or_default();
     let data_dir = state.data_dir.clone();
@@ -151,7 +151,7 @@ async fn poll_loop(
             Ok(status) => {
                 set_job_values(&db_path, &job_id, "polling", attempt);
                 let _ = app.emit(
-                    "job.updated",
+                    "job/updated",
                     json!({
                         "id": job_id,
                         "status": "polling",
@@ -167,7 +167,7 @@ async fn poll_loop(
                 // 瞬时错误要看得见：否则界面只会一直显示「轮询中」。
                 set_job_values(&db_path, &job_id, "polling", attempt);
                 let _ = app.emit(
-                    "job.updated",
+                    "job/updated",
                     json!({
                         "id": job_id,
                         "status": "polling",
@@ -216,7 +216,7 @@ fn finish_succeeded(app: &AppHandle, db_path: &PathBuf, run: &RunRecord, assets:
     finished.finished_at = Some(chrono::Utc::now().to_rfc3339());
     let _ = runs::save_run_at(db_path, &finished);
     let _ = app.emit(
-        "run.updated",
+        "run/updated",
         &runs::RunUpdatedEvent { run: finished, assets },
     );
 }
@@ -228,7 +228,7 @@ fn finish_failed(app: &AppHandle, db_path: &PathBuf, run: &RunRecord, error: gat
     finished.finished_at = Some(chrono::Utc::now().to_rfc3339());
     let _ = runs::save_run_at(db_path, &finished);
     let _ = app.emit(
-        "run.updated",
+        "run/updated",
         &runs::RunUpdatedEvent { run: finished, assets: Vec::new() },
     );
 }
@@ -239,7 +239,7 @@ fn finish_cancelled(app: &AppHandle, db_path: &PathBuf, run: &RunRecord) {
     finished.finished_at = Some(chrono::Utc::now().to_rfc3339());
     let _ = runs::save_run_at(db_path, &finished);
     let _ = app.emit(
-        "run.updated",
+        "run/updated",
         &runs::RunUpdatedEvent { run: finished, assets: Vec::new() },
     );
 }
@@ -247,7 +247,7 @@ fn finish_cancelled(app: &AppHandle, db_path: &PathBuf, run: &RunRecord) {
 pub fn cancel(app: &AppHandle, state: &AppState, run_id: &str) {
     if let Ok(run) = runs::mark_cancelled(state, run_id) {
         let _ = app.emit(
-            "run.updated",
+            "run/updated",
             &runs::RunUpdatedEvent { run, assets: Vec::new() },
         );
     }

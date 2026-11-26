@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { CacheContext } from './cacheKey';
 import { computeCacheKey, selectedAssetOf } from './cacheKey';
 import { edge, makeDoc, node } from './testFixtures';
-import type { RunRecord } from '../types';
+import type { BoardDoc, RunRecord } from '../types';
 
 function run(partial: Partial<RunRecord>): RunRecord {
   return {
@@ -49,5 +49,29 @@ describe('computeCacheKey', () => {
     // 悬空边按「缺输入」处理，不能让整块画布崩掉。
     expect(() => computeCacheKey(doc, 'b', ctx)).not.toThrow();
     expect(typeof computeCacheKey(doc, 'b', ctx)).toBe('string');
+  });
+
+  it('changes the downstream key when the script body changes', () => {
+    const doc = makeDoc(
+      [node('s', 'script', { body: '第一幕' }), node('i', 'image')],
+      [edge('e1', 's', 'i', 'script', 'prompt', 'prompt')],
+    );
+    const before = computeCacheKey(doc, 'i', ctx);
+    const edited: BoardDoc = {
+      ...doc,
+      nodes: { ...doc.nodes, s: { ...doc.nodes.s, data: { ...doc.nodes.s.data, body: '第一幕改' } } },
+    };
+    expect(computeCacheKey(edited, 'i', ctx)).not.toBe(before);
+  });
+
+  it('keeps the script node itself fresh after its body is written back', () => {
+    const doc = makeDoc([node('s', 'script', { prompt: '写一场告别戏', body: '旧正文' })], []);
+    const before = computeCacheKey(doc, 's', ctx);
+    const written: BoardDoc = {
+      ...doc,
+      nodes: { ...doc.nodes, s: { ...doc.nodes.s, data: { ...doc.nodes.s.data, body: '新正文' } } },
+    };
+    // 正文是剧本节点的输出，不是它的输入：回填之后不该被判成「结果已过期」。
+    expect(computeCacheKey(written, 's', ctx)).toBe(before);
   });
 });

@@ -3,12 +3,39 @@ import type { Issue, NodeContext } from '../nodes/types';
 import type { BoardDoc, BoardEdge, BoardNode, DataType } from '../types';
 import { topoSort } from './topo';
 
+/**
+ * 数据类型的兼容族。
+ *
+ * - 文本族：普通文本、剧本、节拍都是「一段可以直接塞进提示词的文字」，
+ *   剧本节点的正文/节拍必须能连给任何文本输入端口。
+ * - 图像族：image 与 frame 等价（frame 只是「当作首尾帧用的图」）。
+ */
 const IMAGE_LIKE = new Set<DataType>(['image', 'frame']);
+const TEXT_LIKE = new Set<DataType>(['text', 'script', 'beat']);
 
 export function compatibleTypes(source: DataType, target: DataType): boolean {
   if (source === 'any' || target === 'any' || source === target) return true;
-  return IMAGE_LIKE.has(source) && IMAGE_LIKE.has(target);
+  if (IMAGE_LIKE.has(source) && IMAGE_LIKE.has(target)) return true;
+  return TEXT_LIKE.has(source) && TEXT_LIKE.has(target);
 }
+
+/**
+ * 源端口的真实数据类型。
+ *
+ * 旧的本地素材节点输出端口声明为 any（素材种类是节点上的一个可改字段），
+ * 连线校验时按节点当前选的素材类型判定，避免把视频素材连到「参考图」
+ * 这种必然失败的连线上。新的图片 / 视频 / 音频素材节点端口类型是固定的，
+ * 走不到这个分支；这里留着只为兼容尚未迁移的旧画布。
+ */
+export function effectiveSourceType(node: BoardNode, portKey: string, declared: DataType): DataType {
+  if (declared !== 'any') return declared;
+  if (node.type !== 'media_source' || portKey !== 'output') return declared;
+  const kind = String(node.data.kind ?? '');
+  if (kind === 'image' || kind === 'video' || kind === 'audio') return kind;
+  return declared;
+}
+
+const KIND_LABEL: Record<string, string> = { image: '图片', video: '视频', audio: '音频' };
 
 export function validateBoard(doc: BoardDoc, ctx: NodeContext): Issue[] {
   const issues: Issue[] = [];
@@ -57,8 +84,12 @@ function validateEdge(doc: BoardDoc, item: BoardEdge): Issue[] {
     issues.push({ code: 'GRAPH_PORT_HIDDEN', message: '当前节点模式不接受这个端口，请切换模式或改用其他端口', severity: 'error', nodeId: target.id, portKey: item.targetPort });
     return issues;
   }
-  if (!compatibleTypes(sourcePort.dataType, targetPort.dataType)) {
-    issues.push({ code: 'GRAPH_TYPE_MISMATCH', message: `${sourcePort.label} 不能连接到 ${targetPort.label}`, severity: 'error', nodeId: target.id, portKey: targetPort.key });
+  const sourceType = effectiveSourceType(source, item.sourcePort, sourcePort.dataType);
+  if (!compatibleTypes(sourceType, targetPort.dataType)) {
+    const sourceLabel = sourceType === sourcePort.dataType
+      ? sourcePort.label
+      : `${sourcePort.label}（${KIND_LABEL[sourceType] ?? sourceType}）`;
+    issues.push({ code: 'GRAPH_TYPE_MISMATCH', message: `${sourceLabel} 不能连接到 ${targetPort.label}`, severity: 'error', nodeId: target.id, portKey: targetPort.key });
   }
   if (targetPort.role && item.role !== targetPort.role) {
     issues.push({ code: 'GRAPH_ROLE_MISMATCH', message: `连线角色应为 ${targetPort.role}`, severity: 'error', nodeId: target.id, portKey: targetPort.key });

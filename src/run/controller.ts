@@ -25,26 +25,53 @@ interface RunControllerState {
   busy: Record<string, boolean>;
   pending?: PendingRun;
   requestRun(nodeId: string, association?: { entityId: string; action: string }): Promise<void>;
+  /** 批量运行：按顺序请求运行多个节点。 */
+  requestRunBatch(nodeIds: string[]): Promise<void>;
   confirmRun(): Promise<void>;
   dismissRun(): void;
   cancelRun(nodeId: string): Promise<void>;
 }
 
-const textCache = new Map<string, string>();
+/**
+ * 上游文本缓存。
+ *
+ * 文本资产本身不可变（内容寻址），所以按资产 id 缓存是安全的。
+ * 但缓存没有失效入口：项目切换后旧的文本还留在内存里。
+ * 这里按项目分桶，切项目自然隔离。
+ */
+const textCache = new Map<string, Map<string, string>>();
+
+function cacheOf(projectId: string): Map<string, string> {
+  const existing = textCache.get(projectId);
+  if (existing) return existing;
+  const created = new Map<string, string>();
+  textCache.set(projectId, created);
+  return created;
+}
+
+/** 丢弃某个项目的文本缓存。 */
+export function invalidateTextCache(projectId?: string): void {
+  if (projectId) {
+    textCache.delete(projectId);
+    return;
+  }
+  textCache.clear();
+}
 
 async function readTexts(assetIds: string[]): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
+  const projectId = useStudioStore.getState().currentProjectId;
+  if (!projectId) return out;
+  const cache = cacheOf(projectId);
   await Promise.all(assetIds.map(async (assetId) => {
-    const hit = textCache.get(assetId);
+    const hit = cache.get(assetId);
     if (hit !== undefined) {
       out[assetId] = hit;
       return;
     }
     try {
-      const projectId = useStudioStore.getState().currentProjectId;
-      if (!projectId) throw new Error('当前项目不存在');
       const value = await readAssetText(projectId, assetId);
-      textCache.set(assetId, value);
+      cache.set(assetId, value);
       out[assetId] = value;
     } catch (error) {
       // 读取失败与「内容本来为空」要能区分：留一条日志，运行前由 domain 拦截。
@@ -144,6 +171,20 @@ export const useRunController = create<RunControllerState>((set, get) => ({
       notify(messageOf(error));
     } finally {
       set((state) => ({ busy: { ...state.busy, [nodeId]: false } }));
+    }
+  },
+
+  async requestRunBatch(nodeIds) {
+    // 批量运行必须逐个走确认流程：一次性全部预检会同时弹出多个确认框，
+    // 费用也说不清。这里串行执行，用户确认一个、跑一个。
+    for (const nodeId of nodeIds) {
+      if (get().pending) {
+        notify('还有运行待确认，已停止批量运行');
+        return;
+      }
+      await get().requestRun(nodeId);
+      // requestRun 会设置 pending（等待确认）。这里不代用户确认，
+      // 下一轮循环会因 pending 存在而停下。
     }
   },
 

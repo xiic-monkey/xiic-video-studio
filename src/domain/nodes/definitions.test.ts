@@ -5,9 +5,35 @@ describe('node definitions', () => {
   it('registers the primitive nodes plus the business ones', () => {
     expect(listNodeDefinitions().map((def) => def.type).sort())
       .toEqual([
-        'audio', 'character', 'continuity', 'coverage', 'expression', 'group', 'image', 'inpaint',
-        'media_source', 'note', 'redraw', 'script', 'storyboard', 'text', 'turnaround', 'variant', 'video',
+        'audio', 'audio_source', 'character', 'continuity', 'coverage', 'expression', 'group', 'image',
+        'image_source', 'inpaint', 'note', 'redraw', 'script', 'storyboard', 'text', 'text_source',
+        'turnaround', 'variant', 'video', 'video_source',
       ]);
+  });
+
+  it('文本素材节点只输出文本、不用跑模型', () => {
+    const def = getNodeDefinition('text_source')!;
+    expect(def.inputs).toEqual([]);
+    expect(def.outputs.map((port) => [port.key, port.dataType])).toEqual([['text', 'text']]);
+    expect(def.actions).toEqual([]);
+    const empty = createNode('text_source', { x: 0, y: 0 });
+    expect(def.validate(empty, { providers: [] })[0]?.code).toBe('SOURCE_EMPTY');
+    const filled = createNode('text_source', { x: 0, y: 0 }, { text: '角色设定' });
+    expect(def.validate(filled, { providers: [] })).toEqual([]);
+  });
+
+  it('素材节点分图片 / 视频 / 音频三个：只输出、端口类型各不相同', () => {
+    for (const [type, kind] of [['image_source', 'image'], ['video_source', 'video'], ['audio_source', 'audio']] as const) {
+      const def = getNodeDefinition(type)!;
+      expect(def.inputs).toEqual([]);
+      expect(def.outputs.map((port) => [port.key, port.dataType])).toEqual([[kind, kind]]);
+      expect(def.actions).toEqual([]);
+      // 没选素材时要报错：这个节点不产出东西，下游会缺输入。
+      const empty = createNode(type, { x: 0, y: 0 });
+      expect(def.validate(empty, { providers: [] })[0]?.code).toBe('SOURCE_EMPTY');
+      const filled = createNode(type, { x: 0, y: 0 }, { assetId: 'a1' });
+      expect(def.validate(filled, { providers: [] })).toEqual([]);
+    }
   });
 
   it('gives the character sheet node a layout and background choice', () => {

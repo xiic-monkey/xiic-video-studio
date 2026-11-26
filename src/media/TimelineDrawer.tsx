@@ -2,6 +2,9 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown, ArrowUp, Captions, Film, Music2, Plus, Scissors, Trash2 } from 'lucide-react';
 import { assetUrl, commitTimelineEdit, createLocalComposeEntity, importSubtitleDocument, listAssets, listMediaTasks, listProductionEntityPage, pickExportTarget, pickSubtitleFile, prepareMediaExport, replaceTimelineClip, startMediaExport, type MediaTask } from '../services/tauri';
 import { applyTimelineEdit, formatSrt, parseSrt, previewClipReplacement, removeAudioTrack, TICKS_PER_SECOND, updateAudioTrack, type TimelineAudioTrack, type TimelineData, type TimelineEdit } from '../domain/media/timeline';
+import { describeSaveError as describeSaveErrorText } from '../domain/saveError';
+import { ActionSelect } from '../ui/ActionSelect';
+import { confirmAction } from '../ui/confirmStore';
 import { createLocalCompose } from './timelineController';
 import { buildProbedAssets, formatTimelineSeconds, resolveTimelineNumberDraft, timelineNumberDraftKey, validateTimelineForSave } from './timelineEditing';
 import type { AssetRef } from '../domain/types';
@@ -12,8 +15,7 @@ function seconds(ticks: number): string {
 
 function describeSaveError(reason: unknown): string {
   const message = reason instanceof Error ? reason.message : String(reason);
-  if (message.includes('PRODUCTION_REVISION_CONFLICT')) return '保存失败：时间线已被其他操作修改（修订冲突），当前编辑未保存，请刷新后重试。';
-  return `保存失败：${message}`;
+  return `保存失败：${describeSaveErrorText(message, '时间线', '请刷新后重试。')}`;
 }
 
 export function TimelineDrawer({ projectId, boardId }: { projectId?: string; boardId?: string }) {
@@ -84,8 +86,18 @@ export function TimelineDrawer({ projectId, boardId }: { projectId?: string; boa
       if (active) setExportTasks(tasks.filter((task) => task.kind === 'export').slice(0, 5));
     }).catch(() => undefined);
     refreshTasks();
-    const timer = window.setInterval(refreshTasks, 2500);
-    return () => { active = false; window.clearInterval(timer); };
+    // 窗口在后台时停止轮询：看不见的时候没必要持续请求。
+    const timer = window.setInterval(() => {
+      if (document.hidden) return;
+      refreshTasks();
+    }, 2500);
+    const onVisibility = () => { if (!document.hidden) refreshTasks(); };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
   }, [projectId]);
 
   const videoAssets = useMemo(() => assets.filter((asset) => asset.kind === 'video'), [assets]);
@@ -157,6 +169,26 @@ export function TimelineDrawer({ projectId, boardId }: { projectId?: string; boa
     });
   }
 
+  /** 用指定素材替换片段：新素材短于原片段时要先确认裁切。 */
+  async function replaceClipWithAsset(clip: TimelineData['clips'][number], assetId: string) {
+    const replacement = assets.find((item) => item.id === assetId);
+    if (!replacement) return;
+    const durationTicks = Math.round((replacement.duration ?? 0) * TICKS_PER_SECOND);
+    const preview = previewClipReplacement(clip, durationTicks);
+    if (!preview.hasValidRange) { setError('新素材短于当前入点，无法保留有效片段'); return; }
+    if (preview.requiresConfirmation) {
+      const confirmed = await confirmAction({
+        title: '替换片段素材',
+        message: `新素材会少 ${seconds(preview.lostTicks)} 秒。`,
+        detail: '替换后会自动裁切到原片段长度，无法恢复。',
+        tone: 'danger',
+        confirmText: '替换并裁切',
+      });
+      if (!confirmed) return;
+    }
+    await replaceClip(clip.id, replacement.id, preview.sourceInTicks, preview.sourceOutTicks, preview.requiresConfirmation);
+  }
+
   async function createCompose() {
     if (!projectId || !boardId || !selected.length) return;
     setBusy(true); setError('');
@@ -208,7 +240,13 @@ export function TimelineDrawer({ projectId, boardId }: { projectId?: string; boa
       const warningNote = warnings.length
         ? `\n\n需要明确确认的提示：\n${warnings.map((warning) => `· ${warning}`).join('\n')}\n\n确认后继续导出？`
         : '';
-      if (!window.confirm(`导出 ${seconds(preview.totalTicks)} 秒 MP4 到“${target.displayName}”？${warningNote}`)) return;
+      const confirmed = await confirmAction({
+        title: '导出 MP4',
+        message: `导出 ${seconds(preview.totalTicks)} 秒视频到“${target.displayName}”？`,
+        detail: warningNote,
+        confirmText: '确认导出',
+      });
+      if (!confirmed) return;
       const task = await startMediaExport(preview.previewId, warnings, crypto.randomUUID(), target.id);
       setExportTasks((items) => [task, ...items.filter((item) => item.id !== task.id)].slice(0, 5));
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
@@ -248,8 +286,11 @@ export function TimelineDrawer({ projectId, boardId }: { projectId?: string; boa
                 <article key={clip.id} className="timeline-clip">
                   <header><b>{index + 1}. {asset?.provenance.displayName ?? clip.assetId.slice(0, 10)}</b><span>{seconds(clip.sourceOutTicks - clip.sourceInTicks)} 秒</span></header>
                   <div className="timeline-clip-controls">
+                    <div className="timeline-clip-times">
                     <label>入点<input aria-label={`片段 ${index + 1} 入点`} type="number" min="0" step="0.001" value={numberDrafts[inKey] ?? seconds(clip.sourceInTicks)} onChange={(event) => setNumberDrafts((draft) => ({ ...draft, [inKey]: event.currentTarget.value }))} onBlur={(event) => void commitNumber(inKey, event.currentTarget.value, clip.sourceInTicks, (nextTicks) => apply({ type: 'trim', clipId: clip.id, sourceInTicks: nextTicks }), `片段 ${index + 1} 入点`)} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} /></label>
                     <label>出点<input aria-label={`片段 ${index + 1} 出点`} type="number" min="0" step="0.001" value={numberDrafts[outKey] ?? seconds(clip.sourceOutTicks)} onChange={(event) => setNumberDrafts((draft) => ({ ...draft, [outKey]: event.currentTarget.value }))} onBlur={(event) => void commitNumber(outKey, event.currentTarget.value, clip.sourceOutTicks, (nextTicks) => apply({ type: 'trim', clipId: clip.id, sourceOutTicks: nextTicks }), `片段 ${index + 1} 出点`)} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} /></label>
+                    </div>
+                    <div className="timeline-clip-actions">
                     <button type="button" title="向前排序" aria-label="向前排序" disabled={!index || busy} onClick={() => void apply({ type: 'reorder', clipId: clip.id, toIndex: index - 1 })}><ArrowUp size={13} /></button>
                     <button type="button" title="向后排序" aria-label="向后排序" disabled={index === timeline.clips.length - 1 || busy} onClick={() => void apply({ type: 'reorder', clipId: clip.id, toIndex: index + 1 })}><ArrowDown size={13} /></button>
                     <button type="button" title="拆分片段" aria-label="拆分片段" disabled={busy || clip.sourceOutTicks - clip.sourceInTicks < 16_000} onClick={() => {
@@ -263,32 +304,43 @@ export function TimelineDrawer({ projectId, boardId }: { projectId?: string; boa
                       });
                     }}><Scissors size={13} /></button>
                     <button type="button" title="删除片段" aria-label="删除片段" disabled={busy} onClick={() => void save((current) => ({ ...current, clips: current.clips.filter((item) => item.id !== clip.id), revision: current.revision + 1 }))}><Trash2 size={13} /></button>
-                    <label>替换素材<select aria-label={`替换片段 ${index + 1} 素材`} value="" disabled={busy} onChange={(event) => {
-                      const replacement = videoAssets.find((item) => item.id === event.currentTarget.value);
-                      if (!replacement) return;
-                      const durationTicks = Math.round((replacement.duration ?? 0) * TICKS_PER_SECOND);
-                      const preview = previewClipReplacement(clip, durationTicks);
-                      if (!preview.hasValidRange) { setError('新素材短于当前入点，无法保留有效片段'); return; }
-                      if (preview.requiresConfirmation && !window.confirm(`新素材会少 ${seconds(preview.lostTicks)} 秒，确认替换并裁切吗？`)) return;
-                      void replaceClip(clip.id, replacement.id, preview.sourceInTicks, preview.sourceOutTicks, preview.requiresConfirmation);
-                    }}><option value="" disabled>选择视频</option>{videoAssets.filter((item) => item.id !== clip.assetId).map((item) => <option key={item.id} value={item.id}>{item.provenance.displayName ?? item.id}</option>)}</select></label>
+                    <label>替换素材<ActionSelect
+                      label={`替换片段 ${index + 1} 素材`}
+                      placeholder="选择视频"
+                      disabled={busy}
+                      options={videoAssets.filter((item) => item.id !== clip.assetId).map((item) => ({ value: item.id, label: item.provenance.displayName ?? item.id }))}
+                      onPick={(value) => { void replaceClipWithAsset(clip, value); }}
+                    /></label>
                     {asset && <button type="button" onClick={() => void preview(asset.id)}>预览</button>}
+                    </div>
                   </div>
                 </article>
               );
             })}
-            <label className="timeline-add-clip"><Plus size={14} /> 添加视频<select aria-label="添加视频片段" value="" disabled={busy} onChange={(event) => {
-              const asset = assets.find((item) => item.id === event.currentTarget.value);
-              if (!asset) return;
-              const clip = { id: `clip_${crypto.randomUUID()}`, assetId: asset.id, sourceInTicks: 0, sourceOutTicks: Math.round((asset.duration ?? 0) * TICKS_PER_SECOND) };
-              void save((current) => ({ ...current, clips: [...current.clips, clip], revision: current.revision + 1 }));
-            }}><option value="" disabled>选择视频</option>{videoAssets.map((asset) => <option key={asset.id} value={asset.id}>{asset.provenance.displayName ?? asset.id}</option>)}</select></label>
-            <label className="timeline-add-clip"><Music2 size={14} /> 添加音轨<select aria-label="添加音频轨道" value="" disabled={busy} onChange={(event) => {
-              const asset = assets.find((item) => item.id === event.currentTarget.value);
-              if (!asset) return;
-              const audioTrack = { id: `audio_${crypto.randomUUID()}`, assetId: asset.id, sourceInTicks: 0, sourceOutTicks: Math.round((asset.duration ?? 0) * TICKS_PER_SECOND), timelineInTicks: 0, gain: 1 };
-              void save((current) => ({ ...current, audioTracks: [...(current.audioTracks ?? []), audioTrack], revision: current.revision + 1 }));
-            }}><option value="" disabled>选择音频</option>{assets.filter((asset) => asset.kind === 'audio').map((asset) => <option key={asset.id} value={asset.id}>{asset.provenance.displayName ?? asset.id}</option>)}</select></label>
+            <label className="timeline-add-clip"><Plus size={14} /> 添加视频<ActionSelect
+              label="添加视频片段"
+              placeholder="选择视频"
+              disabled={busy}
+              options={videoAssets.map((asset) => ({ value: asset.id, label: asset.provenance.displayName ?? asset.id }))}
+              onPick={(assetId) => {
+                const asset = assets.find((item) => item.id === assetId);
+                if (!asset) return;
+                const clip = { id: `clip_${crypto.randomUUID()}`, assetId: asset.id, sourceInTicks: 0, sourceOutTicks: Math.round((asset.duration ?? 0) * TICKS_PER_SECOND) };
+                void save((current) => ({ ...current, clips: [...current.clips, clip], revision: current.revision + 1 }));
+              }}
+            /></label>
+            <label className="timeline-add-clip"><Music2 size={14} /> 添加音轨<ActionSelect
+              label="添加音频轨道"
+              placeholder="选择音频"
+              disabled={busy}
+              options={assets.filter((asset) => asset.kind === 'audio').map((asset) => ({ value: asset.id, label: asset.provenance.displayName ?? asset.id }))}
+              onPick={(assetId) => {
+                const asset = assets.find((item) => item.id === assetId);
+                if (!asset) return;
+                const audioTrack = { id: `audio_${crypto.randomUUID()}`, assetId: asset.id, sourceInTicks: 0, sourceOutTicks: Math.round((asset.duration ?? 0) * TICKS_PER_SECOND), timelineInTicks: 0, gain: 1 };
+                void save((current) => ({ ...current, audioTracks: [...(current.audioTracks ?? []), audioTrack], revision: current.revision + 1 }));
+              }}
+            /></label>
           </div>
           {(timeline.audioTracks ?? []).map((track, index) => {
             const asset = assets.find((item) => item.id === track.assetId);

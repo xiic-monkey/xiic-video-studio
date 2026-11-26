@@ -1,8 +1,18 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Plus, Trash2 } from 'lucide-react';
-import { CATALOG, capabilityProtocols, protocolLabel } from '../domain/providers/catalog';
-import type { ModelConfig, ProtocolId, ProviderProfile } from '../domain/types';
+import { CATALOG, catalogModel, protocolLabel } from '../domain/providers/catalog';
+import {
+  CUSTOM_CAPABILITIES,
+  customCapabilityOption,
+  customModelBinding,
+  protocolOptionsFor,
+} from '../domain/providers/customModels';
+import { isCustomProvider, isProviderConnected, templateForProfile } from '../domain/providers/providerCatalog';
+import type { CatalogModel, ModelConfig, ProtocolId, ProviderProfile } from '../domain/types';
 import { normalizedKeys, useProviderStore } from '../stores/providerStore';
+import { confirmAction } from '../ui/confirmStore';
+import { keyStatusLabel } from '../domain/production/labels';
+import { ActionSelect } from '../ui/ActionSelect';
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -20,6 +30,7 @@ export function ProviderForm({ profile }: { profile: ProviderProfile }) {
   const saveProfile = useProviderStore((state) => state.saveProfile);
   const saveKeyById = useProviderStore((state) => state.saveKeyById);
   const deleteKey = useProviderStore((state) => state.deleteKey);
+  const removeProvider = useProviderStore((state) => state.removeProvider);
   const addKey = useProviderStore((state) => state.addKey);
   const upsertBinding = useProviderStore((state) => state.upsertBinding);
   const removeBinding = useProviderStore((state) => state.removeBinding);
@@ -31,6 +42,9 @@ export function ProviderForm({ profile }: { profile: ProviderProfile }) {
   const [keys, setKeys] = useState(() => normalizedKeys(profile));
   const [models, setModels] = useState<ModelConfig[]>(profile.models);
   const [keyInputs, setKeyInputs] = useState<Record<string, string>>({});
+  const [customModelId, setCustomModelId] = useState('');
+  const [customCapability, setCustomCapability] = useState(CUSTOM_CAPABILITIES[0].capability);
+  const [customProtocol, setCustomProtocol] = useState<ProtocolId>(CUSTOM_CAPABILITIES[0].protocols[0]);
   const [busy, setBusy] = useState(false);
   const [testing, setTesting] = useState(false);
   const [status, setStatus] = useState<{ ok: boolean; message: string }>();
@@ -45,6 +59,46 @@ export function ProviderForm({ profile }: { profile: ProviderProfile }) {
   }, [profile]);
 
   const selectedIds = useMemo(() => new Set(models.map((model) => model.id)), [models]);
+  const connected = isProviderConnected(profile);
+  const template = useMemo(() => templateForProfile(profile), [profile]);
+  const custom = useMemo(() => isCustomProvider(profile), [profile]);
+
+  /** 自定义模型可选的协议：跟着所选能力走。 */
+  const customProtocols = useMemo(
+    () => customCapabilityOption(customCapability)?.protocols ?? [],
+    [customCapability],
+  );
+
+  /**
+   * 这家能提供的模型：目录里给它的那些，加上用户自己加的。
+   *
+   * 不再列全部内置模型：接入一家供应商不等于提供 25 个模型，
+   * 逐个勾全量目录既没意义也容易配错。
+   */
+  const offeredModels = useMemo<CatalogModel[]>(() => {
+    const list: CatalogModel[] = [];
+    const seen = new Set<string>();
+    for (const item of template?.models ?? []) {
+      const catalog = catalogModel(item.id);
+      if (!catalog || seen.has(catalog.id)) continue;
+      seen.add(catalog.id);
+      list.push(catalog);
+    }
+    for (const model of models) {
+      if (seen.has(model.id)) continue;
+      seen.add(model.id);
+      const catalog = catalogModel(model.id);
+      list.push(catalog ?? {
+        id: model.id,
+        displayName: model.displayName || model.id,
+        vendor: model.vendor ?? '自定义',
+        capabilities: model.capabilities,
+      });
+    }
+    return list;
+  }, [template, models]);
+
+  const addableModels = useMemo(() => CATALOG.filter((catalog) => !selectedIds.has(catalog.id)), [selectedIds]);
 
   function currentProfile(next: Partial<ProviderProfile> = {}): ProviderProfile {
     return {
@@ -73,6 +127,26 @@ export function ProviderForm({ profile }: { profile: ProviderProfile }) {
     setModels(next.models);
   }
 
+  /**
+   * 加一个目录里没有的模型。
+   *
+   * 自定义供应商的模型往往不在内置目录中（自建微调模型、代理网关的别名），
+   * 用户自己给模型 id、说清干什么活、用什么协议就够了。
+   */
+  function addCustomModel() {
+    const modelId = customModelId.trim();
+    if (!modelId) return;
+    if (selectedIds.has(modelId)) {
+      setStatus({ ok: false, message: `「${modelId}」已经在列表里了` });
+      return;
+    }
+    const binding = customModelBinding(modelId, customCapability, customProtocol);
+    const next = upsertBinding(currentProfile(), modelId, binding);
+    setModels(next.models);
+    setCustomModelId('');
+    setStatus({ ok: true, message: `已添加模型 ${modelId}` });
+  }
+
   function patchProtocol(modelId: string, capability: string, protocol: string) {
     const binding = models.find((model) => model.id === modelId);
     const protocols = { ...(binding?.protocols ?? {}), [capability]: protocol as ProtocolId };
@@ -83,7 +157,7 @@ export function ProviderForm({ profile }: { profile: ProviderProfile }) {
     setKeys((items) => items.map((key) => (key.id === keyId ? { ...key, label } : key)));
   }
 
-  async function save() {
+  async function save(): Promise<boolean> {
     setBusy(true);
     setStatus(undefined);
     try {
@@ -100,17 +174,28 @@ export function ProviderForm({ profile }: { profile: ProviderProfile }) {
       setKeys(nextKeys);
       setKeyInputs({});
       setStatus({ ok: true, message: '已保存' });
+      return true;
     } catch (error) {
       setStatus({ ok: false, message: messageOf(error) });
+      return false;
     } finally {
       setBusy(false);
     }
   }
 
+  /**
+   * 测试连接。
+   *
+   * 后端只能测「已保存的配置」，所以这里先把当前草稿落库再测：
+   * 否则用户改了 Base URL 或换了 Key 却没点保存时，测的是旧配置，
+   * 会得到「我明明改对了怎么还连不上」的误判。
+   */
   async function runTest() {
     setTesting(true);
     setStatus(undefined);
     try {
+      const saved = await save();
+      if (!saved) return;
       const result = await test(profile.id);
       setStatus({ ok: result.ok, message: result.message });
     } catch (error) {
@@ -121,8 +206,37 @@ export function ProviderForm({ profile }: { profile: ProviderProfile }) {
   }
 
   async function removeKeyRow(keyId: string) {
-    await deleteKey(profile.id, keyId);
-    setKeys((items) => items.filter((key) => key.id !== keyId));
+    const label = keys.find((key) => key.id === keyId)?.label || keyId;
+    const confirmed = await confirmAction({
+      title: '删除 API Key',
+      message: `确定删除「${label}」？`,
+      detail: '密钥会从系统钥匙串中移除，需要重新填写才能使用。此操作不可撤销。',
+      tone: 'danger',
+      confirmText: '删除 Key',
+    });
+    if (!confirmed) return;
+    try {
+      await deleteKey(profile.id, keyId);
+      setKeys((items) => items.filter((key) => key.id !== keyId));
+    } catch (error) {
+      setStatus({ ok: false, message: messageOf(error) });
+    }
+  }
+
+  async function removeProviderRow() {
+    const confirmed = await confirmAction({
+      title: '删除供应商',
+      message: `确定删除「${profile.name}」？`,
+      detail: '这家供应商的配置和钥匙串里的 API Key 都会一并删除，需要重新接入才能使用。',
+      tone: 'danger',
+      confirmText: '删除供应商',
+    });
+    if (!confirmed) return;
+    try {
+      await removeProvider(profile.id);
+    } catch (error) {
+      setStatus({ ok: false, message: messageOf(error) });
+    }
   }
 
   return (
@@ -131,11 +245,32 @@ export function ProviderForm({ profile }: { profile: ProviderProfile }) {
         <div>
           <b>{profile.name}</b>
           <span className="studio-badge">{profile.id}</span>
+          {custom && <span className="studio-badge">自定义</span>}
+          <span className={`studio-badge ${connected ? 'mint' : 'warn'}`}>
+            {connected ? '已连接' : '未连接'}
+          </span>
         </div>
-        <label className="settings-check">
-          <input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /> 启用
-        </label>
+        <div className="settings-provider-tools">
+          <label className="settings-check">
+            <input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /> 启用
+          </label>
+          <button
+            type="button"
+            className="settings-remove"
+            title="删除供应商"
+            aria-label={`删除供应商 ${profile.name}`}
+            onClick={() => { void removeProviderRow(); }}
+          >
+            <Trash2 size={13} />
+          </button>
+        </div>
       </header>
+
+      {!connected && (
+        <p className="inspector-warning">
+          还没有 API Key：填入并保存后，这家供应商才会被调用，它的模型也会出现在模型列表里。
+        </p>
+      )}
 
       <label className="studio-field">
         <span>名称</span>
@@ -178,7 +313,7 @@ export function ProviderForm({ profile }: { profile: ProviderProfile }) {
               placeholder="Key 名称"
             />
             <span className={`studio-badge ${key.status === 'invalid' ? 'warn' : ''}`}>
-              {key.hasSecret ? key.status : '未保存'}
+              {keyStatusLabel(key.status, Boolean(key.hasSecret))}
             </span>
             <input
               type="password"
@@ -203,10 +338,54 @@ export function ProviderForm({ profile }: { profile: ProviderProfile }) {
       <div className="settings-models">
         <div className="settings-models-head">
           <h4>提供的模型</h4>
-          <span className="inspector-note">只勾选这家供应商实际提供的模型</span>
+          <ActionSelect
+            label="添加其它模型"
+            placeholder="添加其它模型"
+            options={addableModels.map((catalog) => ({ value: catalog.id, label: catalog.displayName }))}
+            onPick={(modelId) => toggleModel(modelId)}
+          />
+        </div>
+        <div className="settings-custom-model">
+          <input
+            value={customModelId}
+            onChange={(event) => setCustomModelId(event.target.value)}
+            placeholder="模型 ID，例如 gpt-4o-mini"
+            aria-label="自定义模型 ID"
+          />
+          <select
+            value={customCapability}
+            aria-label="自定义模型能力"
+            onChange={(event) => {
+              const capability = event.target.value;
+              setCustomCapability(capability);
+              const first = customCapabilityOption(capability)?.protocols[0];
+              if (first) setCustomProtocol(first);
+            }}
+          >
+            {CUSTOM_CAPABILITIES.map((option) => (
+              <option key={option.capability} value={option.capability}>{option.label}</option>
+            ))}
+          </select>
+          <select
+            value={customProtocol}
+            aria-label="自定义模型协议"
+            onChange={(event) => setCustomProtocol(event.target.value as ProtocolId)}
+          >
+            {customProtocols.map((protocol) => (
+              <option key={protocol} value={protocol}>{protocolLabel(protocol)}</option>
+            ))}
+          </select>
+          <button
+            type="button"
+            className="studio-button secondary"
+            onClick={addCustomModel}
+            disabled={!customModelId.trim()}
+          >
+            添加
+          </button>
         </div>
         <div className="settings-capabilities">
-          {CATALOG.map((catalog) => (
+          {offeredModels.map((catalog) => (
             <label key={catalog.id}>
               <input
                 type="checkbox"
@@ -217,6 +396,9 @@ export function ProviderForm({ profile }: { profile: ProviderProfile }) {
               <span className="inspector-note"> · {catalog.vendor}</span>
             </label>
           ))}
+          {!offeredModels.length && (
+            <p className="inspector-note">这家还没有绑定模型，从右上角挑一个加进来。</p>
+          )}
         </div>
         {models.map((model) => {
           const catalog = CATALOG.find((item) => item.id === model.id);
@@ -235,7 +417,7 @@ export function ProviderForm({ profile }: { profile: ProviderProfile }) {
               </div>
               <div className="settings-capabilities">
                 {(catalog?.capabilities ?? model.capabilities).map((capability) => {
-                  const options = capabilityProtocols(model.id, capability.capability);
+                  const options = protocolOptionsFor(model, capability.capability);
                   const current = model.protocols?.[capability.capability]
                     ?? options[0]
                     ?? 'openai-chat';

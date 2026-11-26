@@ -19,3 +19,12 @@ export function safeExportName(project: { name: string; id: string }): string {
   const tail = project.id.slice(-6);
   return tail ? `${base}-${tail}.json` : `${base}.json`;
 }
+
+/**
+ * 含素材导出时的目录名：和 `safeExportName` 同一套清洗规则，只是不带 .json 后缀。
+ *
+ * 目录名带项目 id 尾段：同名项目导出到同一父目录时不会互相覆盖。
+ */
+export function safeExportDirName(project: { name: string; id: string }): string {
+  return safeExportName(project).replace(/\.json$/, '');
+}

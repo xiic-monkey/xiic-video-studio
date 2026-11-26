@@ -1,8 +1,17 @@
 import { create } from 'zustand';
 import { DEFAULT_PROVIDERS } from '../domain/providers/capabilities';
 import { catalogModel } from '../domain/providers/catalog';
-import type { ModelConfig, ProviderKey, ProviderProfile } from '../domain/types';
 import {
+  isProviderConnected,
+  normalizedKeys,
+  profileFromCustom,
+  profileFromTemplate,
+  providerTemplate,
+  type CustomProviderInput,
+} from '../domain/providers/providerCatalog';
+import type { ModelConfig, ProviderProfile } from '../domain/types';
+import {
+  deleteProviderProfile,
   listProviderProfiles,
   loadAssetHost,
   providerHasKey,
@@ -24,6 +33,8 @@ function messageOf(error: unknown): string {
 export function bindingOf(profile: ProviderProfile, modelId: string): ModelConfig | undefined {
   return profile.models.find((model) => model.id === modelId);
 }
+
+export { isProviderConnected, normalizedKeys };
 
 /**
  * 按目录补齐绑定里缺失的能力。
@@ -48,19 +59,6 @@ export function syncCatalogCapabilities(profile: ProviderProfile): {
   return { profile: changed ? { ...profile, models } : profile, changed };
 }
 
-/** 旧版 profile 只有一个 Key，这里补成一条可编辑的记录。 */
-export function normalizedKeys(profile: ProviderProfile): ProviderKey[] {
-  if (profile.keys?.length) return profile.keys;
-  return [{
-    id: 'default',
-    label: '默认 Key',
-    keyRef: profile.auth.keyRef,
-    enabled: true,
-    status: 'active',
-    hasSecret: profile.hasKey,
-  }];
-}
-
 interface ProviderState {
   loaded: boolean;
   loading: boolean;
@@ -71,6 +69,12 @@ interface ProviderState {
   settingsOpen: boolean;
   boot(): Promise<void>;
   saveProfile(profile: ProviderProfile): Promise<void>;
+  /** 按供应商目录新增一家：模型按目录建议自动挂上，等填入 Key 即接入。 */
+  addProvider(templateId: string): Promise<ProviderProfile | undefined>;
+  /** 新增一家自定义供应商：自建网关 / 中转站 / 本地推理服务。 */
+  addCustomProvider(input: CustomProviderInput): Promise<ProviderProfile | undefined>;
+  /** 删掉一家供应商（连同钥匙串里的密钥）。 */
+  removeProvider(profileId: string): Promise<void>;
   saveKey(providerId: string, apiKey: string): Promise<void>;
   saveKeyById(providerId: string, keyId: string, apiKey: string): Promise<void>;
   deleteKey(providerId: string, keyId: string): Promise<void>;
@@ -134,6 +138,40 @@ export const useProviderStore = create<ProviderState>((set, get) => ({
         : [...state.profiles, profile],
       error: undefined,
     }));
+  },
+
+  async addProvider(templateId) {
+    const template = providerTemplate(templateId);
+    if (!template) {
+      set({ error: '找不到这家供应商' });
+      return undefined;
+    }
+    const state = get();
+    const profile = profileFromTemplate(template, state.profiles.map((item) => item.id));
+    await saveProviderProfile(profile);
+    set((current) => ({ profiles: [...current.profiles, profile], error: undefined }));
+    return profile;
+  },
+
+  async addCustomProvider(input) {
+    const state = get();
+    const profile = profileFromCustom(input, state.profiles.map((item) => item.id));
+    await saveProviderProfile(profile);
+    set((current) => ({ profiles: [...current.profiles, profile], error: undefined }));
+    return profile;
+  },
+
+  async removeProvider(providerId) {
+    await deleteProviderProfile(providerId);
+    set((state) => {
+      const hasKeys = { ...state.hasKeys };
+      delete hasKeys[providerId];
+      return {
+        profiles: state.profiles.filter((item) => item.id !== providerId),
+        hasKeys,
+        error: undefined,
+      };
+    });
   },
 
   async saveKey(providerId, apiKey) {

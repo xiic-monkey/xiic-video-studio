@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
-import { save } from '@tauri-apps/plugin-dialog';
+import { open, save } from '@tauri-apps/plugin-dialog';
+import { migrateBoard } from '../domain/nodes/migrate';
 import type {
   AssetRef,
   BoardDoc,
@@ -8,7 +9,7 @@ import type {
   StudioProject,
 } from '../domain/types';
 
-const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+export const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
 export async function listStudioProjects(): Promise<StudioProject[]> {
   if (!isTauri()) return [];
@@ -27,17 +28,38 @@ export async function listBoards(projectId: string): Promise<BoardDoc[]> {
 
 export async function loadBoard(boardId: string): Promise<BoardDoc | null> {
   if (!isTauri()) return null;
-  return invoke<BoardDoc | null>('load_board', { boardId });
+  const doc = await invoke<BoardDoc | null>('load_board', { boardId });
+  // 画布结构迁移统一在这里做：所有打开画布的入口都经过 load_board，
+  // 旧工程里的节点结构在这一步升级，前端不用到处判断。
+  return doc ? migrateBoard(doc) : doc;
 }
 
-export async function saveBoard(board: BoardDoc): Promise<{ revision?: number }> {
+/**
+ * 保存画布。
+ *
+ * `expectedRevision` 是服务端那一行的 CAS 令牌，必须单独传：
+ * 画布文档里的 `revision` 会跟着撤销/重做回退，拿它做条件必然撞修订冲突。
+ */
+export async function saveBoard(board: BoardDoc, expectedRevision: number | null = board.revision ?? null): Promise<{ revision?: number }> {
   if (!isTauri()) return {};
-  return invoke<{ revision?: number }>('save_board', { board, expectedRevision: board.revision ?? null });
+  return invoke<{ revision?: number }>('save_board', { board, expectedRevision });
 }
 
 export async function deleteBoard(boardId: string): Promise<void> {
   if (!isTauri()) return;
   await invoke('delete_board', { boardId });
+}
+
+/** 删除项目及其全部画布、制作数据与资产关联。素材文件本体保留在磁盘上。 */
+export async function deleteStudioProject(projectId: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('delete_studio_project', { projectId });
+}
+
+/** 把素材从项目里移除。素材本体可能被别的项目共用，所以只解除关联。 */
+export async function deleteProjectAsset(projectId: string, assetId: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('delete_project_asset', { projectId, assetId });
 }
 
 export async function listProviderProfiles(): Promise<ProviderProfile[]> {
@@ -48,6 +70,12 @@ export async function listProviderProfiles(): Promise<ProviderProfile[]> {
 export async function saveProviderProfile(profile: ProviderProfile): Promise<void> {
   if (!isTauri()) return;
   await invoke('save_provider_profile', { profile });
+}
+
+/** 删掉一家供应商配置，连同它留在钥匙串里的密钥。 */
+export async function deleteProviderProfile(providerId: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('delete_provider_profile', { providerId });
 }
 
 /** API Key 只写入系统钥匙串，明文不会回到前端。 */
@@ -212,6 +240,46 @@ export async function listMediaTasks(projectId: string): Promise<MediaTask[]> {
   return invoke<MediaTask[]>('list_media_tasks', { projectId });
 }
 
+/** 按路径导入媒体：拖进画布的文件没有 dialog 授权，只能按路径落地。 */
+export async function importMediaPaths(
+  projectId: string,
+  paths: string[],
+): Promise<{ imported: ImportedPath[]; failed: Array<{ path: string; code: string }> }> {
+  if (!isTauri()) throw new Error('本地媒体导入仅支持桌面应用');
+  return invoke('import_media_paths', { projectId, paths });
+}
+
+/**
+ * 把一段图片字节存成项目素材（剪贴板截图用）。
+ *
+ * 剪贴板由前端读（粘贴事件 / Clipboard API），字节交给后端落盘。
+ */
+export async function importImageBytes(
+  projectId: string,
+  base64: string,
+  displayName: string,
+): Promise<ImportedPath> {
+  if (!isTauri()) throw new Error('图片粘贴仅支持桌面应用');
+  return invoke('import_image_bytes', { projectId, dataBase64: base64, displayName });
+}
+
+/**
+ * 直接从系统剪贴板读图并存成项目素材。
+ *
+ * macOS 的 Tauri 用 WKWebView，它不会把剪贴板里的图片交给前端 paste 事件，
+ * 桌面端的 Cmd+V 贴图只能走后端读系统剪贴板。
+ */
+export async function importClipboardImage(projectId: string): Promise<ImportedPath> {
+  if (!isTauri()) throw new Error('剪贴板贴图仅支持桌面应用');
+  return invoke('import_clipboard_image', { projectId });
+}
+
+export interface ImportedPath {
+  assetId: string;
+  displayName: string;
+  kind: string;
+}
+
 export async function cancelMediaTask(projectId: string, jobId: string): Promise<MediaTask> {
   if (!isTauri()) throw new Error('取消媒体任务仅支持桌面应用');
   return invoke<MediaTask>('cancel_media_task', { projectId, jobId });
@@ -220,6 +288,30 @@ export async function cancelMediaTask(projectId: string, jobId: string): Promise
 export async function applyProductionChange(projectId: string, changeId: string, expectedRevisions: Record<string, number>, operations: unknown[]): Promise<{ changeId: string; revisionMap: Record<string, number>; affectedIds: string[] }> {
   if (!isTauri()) throw new Error('制作变更只能在桌面应用中保存');
   return invoke('apply_production_change', { projectId, changeId, expectedRevisions, operations });
+}
+
+/**
+ * 删除制作实体（剧本 / 主体 / 镜头 / 集 / 场）。
+ *
+ * 走软删除：后端把实体标记为归档，列表不再返回它，历史与引用关系保留，
+ * 这样误删的镜头还能从变更记录里追溯。
+ *
+ * 需要连带删除下属实体时（删集要带走场与镜头），直接用
+ * `applyProductionChange` 传多个 `deleteEntity` 操作更合适。
+ */
+export async function deleteProductionEntity(
+  projectId: string,
+  entityId: string,
+  kind: string,
+  expectedRevision: number,
+): Promise<{ changeId: string; revisionMap: Record<string, number>; affectedIds: string[] }> {
+  if (!isTauri()) throw new Error('删除制作实体仅支持桌面应用');
+  return applyProductionChange(
+    projectId,
+    crypto.randomUUID(),
+    { [entityId]: expectedRevision },
+    [{ id: entityId, kind, op: 'deleteEntity', payload: {} }],
+  );
 }
 
 export async function saveBreakdownDraft(projectId: string, draftId: string, scriptId: string, scriptRevision: number, payload: unknown): Promise<void> {
@@ -426,16 +518,31 @@ export interface ExportSummary {
   boards: number;
   runs: number;
   assets: number;
+  /** 是否把素材文件本体一起导出了。 */
+  assetBodiesIncluded: boolean;
+  /** 含素材导出时的导出目录；仅元数据导出为 null。 */
+  bundlePath?: string | null;
 }
 
 /**
- * 导出项目元数据包。
+ * 导出项目包。
+ *
+ * `includeAssets=false` 时只写一个 JSON 元数据包；
+ * `includeAssets=true` 时写一个目录：里面是 `project.json` 与 `assets/` 素材本体。
  *
  * 打包、路径校验与文件写入都在 Rust 侧：渲染进程只给目标路径，不能决定写到哪。
  */
-export async function exportProject(projectId: string, path: string): Promise<ExportSummary> {
+export async function exportProject(
+  projectId: string,
+  path: string,
+  options?: { includeAssets?: boolean },
+): Promise<ExportSummary> {
   if (!isTauri()) throw new Error('导出只能在桌面应用中运行');
-  return invoke<ExportSummary>('export_project', { projectId, path });
+  return invoke<ExportSummary>('export_project', {
+    projectId,
+    path,
+    includeAssets: options?.includeAssets ?? false,
+  });
 }
 
 /** 弹出保存对话框。取消时返回 null。 */
@@ -445,6 +552,16 @@ export async function pickExportPath(defaultName: string): Promise<string | null
     defaultPath: defaultName,
     filters: [{ name: 'Frameforge 项目', extensions: ['json'] }],
   });
+}
+
+/**
+ * 选一个文件夹：含素材导出时目标是一个目录，而不是单个 JSON 文件。
+ *
+ * 取消时返回 null。
+ */
+export async function pickExportDirectory(): Promise<string | null> {
+  if (!isTauri()) return null;
+  return open({ directory: true, title: '选择导出目录' });
 }
 
 export type { AssetRef };

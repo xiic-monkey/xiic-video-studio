@@ -16,6 +16,10 @@ import { useRunController } from '../run/controller';
 import { useStaleNodeIds } from '../run/useStaleNodeIds';
 import { statusOf } from '../nodes/summary';
 import { CandidateList } from './CandidateList';
+import { InspectorSection } from './InspectorSection';
+import { ModelSection } from './ModelSection';
+import { nodeCategoryLabel } from '../domain/production/labels';
+import { PromptSection } from './PromptSection';
 import { FieldEditor, type FieldChangeOptions } from './FieldEditor';
 import { MaskEditor } from './MaskEditor';
 import { ReferencePicker } from './ReferencePicker';
@@ -55,16 +59,18 @@ export function Inspector() {
   );
   const latestRun = nodeRuns[0];
   const activeRun = latestRun && (latestRun.status === 'queued' || latestRun.status === 'running');
+  // 校验要看到真实供应商配置：否则将来加入「模型未配置 / Key 失效」类检查时，
+  // 检查面板会因为 providers 是空数组而漏报。
+  const profiles = useProviderStore((state) => state.profiles);
   const issues = useMemo(
-    () => (board && node ? nodeIssues(board, node.id, { providers: [], styleGuide: project?.styleGuide }) : []),
-    [board, node, project],
+    () => (board && node ? nodeIssues(board, node.id, { providers: profiles, styleGuide: project?.styleGuide }) : []),
+    [board, node, project, profiles],
   );
-  const promptable = node ? ['text', 'image', 'video', 'audio'].includes(node.type) : false;
+  const promptable = node ? ['text', 'script', 'image', 'video', 'audio'].includes(node.type) : false;
   const preview = useMemo(
     () => (node && promptable ? promptPreview(node, project?.styleGuide) : undefined),
     [node, promptable, project],
   );
-  const profiles = useProviderStore((state) => state.profiles);
   const hasKeys = useProviderStore((state) => state.hasKeys);
   const openSettings = useProviderStore((state) => state.openSettings);
   const capability = board && node ? capabilityForNode(board, node) : undefined;
@@ -76,6 +82,18 @@ export function Inspector() {
     () => choices.find((choice) => choice.modelId === String(node?.data.model ?? '')),
     [choices, node?.data.model],
   );
+
+  /**
+   * 这个节点收不收参考图。
+   *
+   * 按节点有没有图片输入端口来判断，而不是按 capability：
+   * capability 依赖「已经选了模型」，用户还没选模型时参考图入口就不该消失——
+   * 恰恰是这时候他最需要知道参考图从哪来。
+   */
+  const takesReferences = useMemo(() => {
+    if (!def) return false;
+    return def.inputs.some((port) => port.dataType === 'image' || port.dataType === 'frame');
+  }, [def]);
 
   // 参数表跟着所选模型走：目录里定义了什么就渲染什么，没选模型时用节点自带字段。
   const fields = useMemo(() => {
@@ -93,12 +111,47 @@ export function Inspector() {
     setBusy(false);
   }, [nodeId]);
 
+  const splitSource = latestRun ? selectedAssetOf(latestRun) : undefined;
+  const splitLayout = node ? splitLayoutFor(node) : undefined;
+  // viewsOf 每次都返回新数组：不 memo 的话下面取缩略图的 effect 每次渲染都会重跑。
+  const views = useMemo(() => (node ? viewsOf(node) : []), [node]);
+  const referenceIds = useMemo(() => (node ? referenceIdsOf(node) : []), [node]);
+  const maskNode = Boolean(node && isMaskNode(node));
+  const maskSourceId = board && nodeId ? sourceAssetIdOf(board, nodeId, Object.values(runs)) : undefined;
+  const maskAssetId = node ? maskAssetIdOf(node) : undefined;
+
+  useEffect(() => {
+    let alive = true;
+    if (!maskAssetId) {
+      setMaskUrl('');
+      return;
+    }
+    void assetThumbUrl(project?.id ?? '', maskAssetId).then((url) => {
+      if (alive) setMaskUrl(url);
+    }).catch(() => undefined);
+    return () => { alive = false; };
+  }, [maskAssetId]);
+
+  useEffect(() => {
+    let alive = true;
+    const missing = views.filter((view) => !viewThumbs[view.assetId]);
+    if (!missing.length) return;
+    void Promise.all(missing.map(async (view) => {
+      const url = await assetThumbUrl(project?.id ?? '', view.assetId);
+      return [view.assetId, url] as const;
+    })).then((entries) => {
+      if (alive) setViewThumbs((items) => ({ ...items, ...Object.fromEntries(entries) }));
+    }).catch(() => undefined);
+    return () => { alive = false; };
+  }, [views, viewThumbs]);
+
+  // 注意：所有 hooks 必须在下面的早退之前调用，否则切换选中时 hooks 数量变化会让 React 崩溃（白屏）。
   if (!node || !def) {
     return (
       <aside className="studio-inspector">
         <header className="inspector-head">
           <div>
-            <span className="studio-eyebrow">INSPECTOR</span>
+            <span className="studio-eyebrow">节点属性</span>
             <h2>节点属性</h2>
           </div>
         </header>
@@ -145,40 +198,6 @@ export function Inspector() {
     });
   }
 
-  const splitSource = latestRun ? selectedAssetOf(latestRun) : undefined;
-  const splitLayout = node ? splitLayoutFor(node) : undefined;
-  // viewsOf 每次都返回新数组：不 memo 的话下面取缩略图的 effect 每次渲染都会重跑。
-  const views = useMemo(() => (node ? viewsOf(node) : []), [node]);
-  const referenceIds = useMemo(() => (node ? referenceIdsOf(node) : []), [node]);
-  const maskNode = Boolean(node && isMaskNode(node));
-  const maskSourceId = board && nodeId ? sourceAssetIdOf(board, nodeId, Object.values(runs)) : undefined;
-  const maskAssetId = node ? maskAssetIdOf(node) : undefined;
-
-  useEffect(() => {
-    let alive = true;
-    if (!maskAssetId) {
-      setMaskUrl('');
-      return;
-    }
-    void assetThumbUrl(project?.id ?? '', maskAssetId).then((url) => {
-      if (alive) setMaskUrl(url);
-    }).catch(() => undefined);
-    return () => { alive = false; };
-  }, [maskAssetId]);
-
-  useEffect(() => {
-    let alive = true;
-    const missing = views.filter((view) => !viewThumbs[view.assetId]);
-    if (!missing.length) return;
-    void Promise.all(missing.map(async (view) => {
-      const url = await assetThumbUrl(project?.id ?? '', view.assetId);
-      return [view.assetId, url] as const;
-    })).then((entries) => {
-      if (alive) setViewThumbs((items) => ({ ...items, ...Object.fromEntries(entries) }));
-    }).catch(() => undefined);
-    return () => { alive = false; };
-  }, [views, viewThumbs]);
-
   async function runSplit() {
     if (!node || !splitSource || !splitLayout) return;
     setSplitting(true);
@@ -194,7 +213,7 @@ export function Inspector() {
         nodeId: node.id,
         patch: { views: result },
       });
-      useBoardStore.getState().notify(`已拆出 ${result.length} 个视角`);
+      useBoardStore.getState().notify(`已拆出 ${result.length} 个视角`, 'success');
     } catch (error) {
       useBoardStore.getState().notify(error instanceof Error ? error.message : String(error));
     } finally {
@@ -221,7 +240,7 @@ export function Inspector() {
       nodeId,
       patch: { maskAssetId: assetId },
     });
-    useBoardStore.getState().notify('蒙版已保存');
+    useBoardStore.getState().notify('蒙版已保存', 'success');
     setMaskEditorOpen(false);
   }
 
@@ -242,7 +261,7 @@ export function Inspector() {
     <aside className="studio-inspector">
       <header className="inspector-head">
         <div>
-          <span className="studio-eyebrow">{def.category}</span>
+          <span className="studio-eyebrow">{nodeCategoryLabel(def.category)}</span>
           <h2>{def.title}</h2>
         </div>
         <div className="inspector-actions">
@@ -251,102 +270,46 @@ export function Inspector() {
         </div>
       </header>
 
-      <section className="inspector-section">
-        <h3>字段</h3>
+      <InspectorSection title="字段" defaultOpen>
         {fields.map((field) => (
           <FieldEditor key={field.key} field={field} value={node.data[field.key]} onChange={updateField} />
         ))}
         {!fields.length && <p className="inspector-note">该节点没有可编辑字段。</p>}
-      </section>
+      </InspectorSection>
 
       {capability && (
-        <section className="inspector-section">
-          <h3>模型</h3>
-          <div className="inspector-field">
-            <span>模型</span>
-            <select
-              value={String(node.data.model ?? '')}
-              onChange={(event) => {
-                const modelId = event.target.value;
-                const providerId = String(node.data.providerId ?? '');
-                const stillValid = choices.some((choice) => choice.modelId === modelId
-                  && choice.providers.some((provider) => provider.providerId === providerId));
-                useBoardStore.getState().apply({
-                  type: 'setNodeData',
-                  nodeId: node.id,
-                  patch: { model: modelId, providerId: stillValid ? providerId : '' },
-                });
-              }}
-            >
-              <option value="">请选择模型</option>
-              {choices.map((choice) => (
-                <option key={choice.modelId} value={choice.modelId}>{choice.modelName}</option>
-              ))}
-            </select>
-          </div>
-          <div className="inspector-field">
-            <span>供应商</span>
-            <select
-              value={String(node.data.providerId ?? '')}
-              disabled={!selectedChoice}
-              onChange={(event) => {
-                useBoardStore.getState().apply({
-                  type: 'setNodeData',
-                  nodeId: node.id,
-                  patch: { providerId: event.target.value },
-                });
-              }}
-            >
-              <option value="">自动（按顺序回退）</option>
-              {selectedChoice?.providers.map((provider) => (
-                <option key={provider.providerId} value={provider.providerId}>{provider.providerName}</option>
-              ))}
-            </select>
-          </div>
-          <div className="inspector-section-head">
-            <span className="inspector-note">能力：{capabilityLabel(capability)}</span>
-            <button type="button" className="inspector-link" onClick={openSettings}>打开设置</button>
-          </div>
-          {!choices.length && <p className="inspector-warning">没有可用模型，请先在设置中添加模型并保存 Key。</p>}
-          {selectedChoice && (
-            <p className="inspector-note">
-              候选顺序：{selectedChoice.providers.map((provider) => provider.providerName).join(' → ')}
-            </p>
-          )}
-          {String(node.data.providerId ?? '') && hasKeys[String(node.data.providerId)] === false && (
-            <p className="inspector-warning">所选 Provider 尚未保存 API Key。</p>
-          )}
-        </section>
+        <ModelSection
+          node={node}
+          choices={choices}
+          hasKeys={hasKeys}
+          capabilityLabel={capabilityLabel(capability)}
+          onOpenSettings={openSettings}
+        />
       )}
 
       {preview && (
-        <section className="inspector-section">
-          <div className="inspector-section-head">
-            <h3>提示词预览</h3>
-            <button type="button" className="inspector-link" onClick={togglePromptLock}>
-              {node.data.promptLocked ? <><Unlock size={11} /> 解锁</> : <><Lock size={11} /> 锁定</>}
-            </button>
-          </div>
-          <p className="prompt-preview">{preview.text || '（空）'}</p>
-          {preview.negative && <p className="inspector-note">负向：{preview.negative}</p>}
-          {!!preview.segments.length && (
-            <div className="prompt-segments">
-              {preview.segments.map((segment, index) => (
-                <span key={`${segment.key}-${index}`} title={segment.text}>{segment.label}</span>
-              ))}
-            </div>
-          )}
-          {!!preview.missingVariables?.length && (
-            <p className="inspector-warning">缺少变量：{preview.missingVariables.join('、')}</p>
-          )}
-        </section>
+        <PromptSection node={node} preview={preview} onToggleLock={togglePromptLock} />
       )}
 
-      <section className="inspector-section">
-        <div className="inspector-section-head">
-          <h3>运行</h3>
-          <span className="studio-badge">{latestRun ? statusOf(latestRun).label : '未运行'}</span>
-        </div>
+      {/*
+        参考图单独成段并默认展开。
+        以前它塞在「运行」折叠段里，等于藏起来：用户问「参考图从哪来」，
+        根本看不到这个入口。
+      */}
+      {takesReferences && (
+        <InspectorSection title="参考图" defaultOpen>
+          <ReferencePicker
+            projectId={project?.id}
+            selected={referenceIds}
+            onToggle={toggleReference}
+          />
+        </InspectorSection>
+      )}
+
+      <InspectorSection
+        title="运行"
+        aside={<span className="studio-badge">{latestRun ? statusOf(latestRun).label : '未运行'}</span>}
+      >
         {isStale && <p className="inspector-warning">上游已更新，当前结果已过期；确认后再运行，不会自动重跑。</p>}
         <div className="inspector-run">
           <button
@@ -414,13 +377,6 @@ export function Inspector() {
             )}
           </>
         )}
-        {capability && (
-          <ReferencePicker
-            projectId={project?.id}
-            selected={referenceIds}
-            onToggle={toggleReference}
-          />
-        )}
         <RunHistory runs={nodeRuns} />
         {latestRun && (
           <CandidateList
@@ -441,12 +397,12 @@ export function Inspector() {
             ))}
           </div>
         ) : null}
-      </section>
+      </InspectorSection>
 
       {maskNode && (
-        <section className="inspector-section">
-          <div className="inspector-section-head">
-            <h3>蒙版</h3>
+        <InspectorSection
+          title="蒙版"
+          aside={(
             <button
               type="button"
               className="inspector-link"
@@ -455,16 +411,16 @@ export function Inspector() {
             >
               <Brush size={11} /> {maskAssetId ? '重新绘制' : '绘制蒙版'}
             </button>
-          </div>
+          )}
+        >
           {maskAssetId && maskUrl
             ? <img className="mask-thumb" src={maskUrl} alt="当前蒙版" />
             : <p className="inspector-note">绘制后只重画白色区域，其余像素保持原样。</p>}
           {!maskSourceId && <p className="inspector-warning">先把源图连到「源图」端口并运行上游节点。</p>}
-        </section>
+        </InspectorSection>
       )}
 
-      <section className="inspector-section">
-        <h3>检查</h3>
+      <InspectorSection title="检查" aside={issues.length ? <span className="studio-badge">{issues.length} 项</span> : undefined}>
         <ul className="issue-list">
           {issues.length
             ? issues.map((issue, index) => (
@@ -472,7 +428,7 @@ export function Inspector() {
             ))
             : <li className="ok">当前节点没有发现问题</li>}
         </ul>
-      </section>
+      </InspectorSection>
 
       {maskEditorOpen && maskSourceId && nodeId && (
         <MaskEditor

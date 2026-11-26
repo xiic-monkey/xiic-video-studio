@@ -387,6 +387,117 @@ fn delete_board(board_id: String, state: State<'_, AppState>) -> Result<(), Stri
     Ok(())
 }
 
+/// 删掉项目及其所有关联数据。
+///
+/// 素材本体（assets 行与磁盘文件）保留：素材是内容寻址的，可能被别的项目共用。
+/// 项目不存在时返回 Ok，删除是幂等的。
+fn delete_studio_project_data(connection: &mut Connection, project_id: &str) -> Result<(), String> {
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    // 先删依赖实体的子表：它们的关联键存在 project_entities 里。
+    transaction
+        .execute(
+            "DELETE FROM shot_adoptions WHERE shot_id IN (SELECT id FROM project_entities WHERE project_id=?1 AND kind='shot')",
+            [project_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM script_revisions WHERE script_id IN (SELECT id FROM project_entities WHERE project_id=?1 AND kind='script')",
+            [project_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM subject_versions WHERE subject_id IN (SELECT id FROM project_entities WHERE project_id=?1 AND kind='subject')",
+            [project_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM jobs WHERE run_id IN (SELECT id FROM runs WHERE project_id=?1)",
+            [project_id],
+        )
+        .map_err(|error| error.to_string())?;
+    for statement in [
+        "DELETE FROM runs WHERE project_id=?1",
+        "DELETE FROM boards WHERE project_id=?1",
+        "DELETE FROM run_previews WHERE project_id=?1",
+        "DELETE FROM media_tasks WHERE project_id=?1",
+        "DELETE FROM media_exports WHERE project_id=?1",
+        "DELETE FROM production_changes WHERE project_id=?1",
+        "DELETE FROM breakdown_drafts WHERE project_id=?1",
+        "DELETE FROM production_reviews WHERE project_id=?1",
+        "DELETE FROM asset_origins WHERE project_id=?1",
+        "DELETE FROM project_assets WHERE project_id=?1",
+        "DELETE FROM project_entities WHERE project_id=?1",
+        "DELETE FROM studio_projects WHERE id=?1",
+    ] {
+        transaction
+            .execute(statement, [project_id])
+            .map_err(|error| error.to_string())?;
+    }
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// 删除项目：连同画板、实体、运行记录、素材关联一起清掉。
+#[tauri::command]
+fn delete_studio_project(project_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let path = state
+        .db_path
+        .lock()
+        .map_err(|_| "db lock".to_string())?
+        .clone();
+    let mut connection = db::open(&path)?;
+    delete_studio_project_data(&mut connection, &project_id)
+}
+
+/// 只解除素材与项目的关联。
+///
+/// assets 行与磁盘文件保留：素材是内容寻址的，可能被别的项目共用。
+/// 关联本来就不存在时返回 Ok，删除是幂等的。
+fn delete_project_asset_data(
+    connection: &mut Connection,
+    project_id: &str,
+    asset_id: &str,
+) -> Result<(), String> {
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM project_assets WHERE project_id=?1 AND asset_id=?2",
+            params![project_id, asset_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "DELETE FROM asset_origins WHERE project_id=?1 AND asset_id=?2",
+            params![project_id, asset_id],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// 从项目里移除一个素材（不删除素材本体）。
+#[tauri::command]
+fn delete_project_asset(
+    project_id: String,
+    asset_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let path = state
+        .db_path
+        .lock()
+        .map_err(|_| "db lock".to_string())?
+        .clone();
+    let mut connection = db::open(&path)?;
+    delete_project_asset_data(&mut connection, &project_id, &asset_id)
+}
+
 #[tauri::command]
 fn list_provider_profiles(state: State<'_, AppState>) -> Result<Vec<Value>, String> {
     let path = state
@@ -581,6 +692,75 @@ fn save_provider_profile(mut profile: Value, state: State<'_, AppState>) -> Resu
             params![id, adapter, base_url, enabled, serde_json::to_string(&profile).map_err(|error| error.to_string())?, Utc::now().to_rfc3339()],
         )
         .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// 删掉供应商的配置行（钥匙串另算）。
+///
+/// 拆成独立函数是为了能直接测：钥匙串在测试环境里碰不到，
+/// 但「配置行确实没了」这条必须保证。
+fn delete_provider_profile_data(connection: &Connection, provider_id: &str) -> Result<(), String> {
+    connection
+        .execute("DELETE FROM provider_profiles WHERE id=?1", [provider_id])
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// 删掉一个供应商配置，连同它在钥匙串里的密钥。
+///
+/// 密钥必须一起清：只删数据库行的话，密钥会留在钥匙串里没人能删，
+/// 也可能让「按 key_ref 找密钥」的路径捡到孤儿条目。
+#[tauri::command]
+fn delete_provider_profile(provider_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    if provider_id.trim().is_empty() {
+        return Err("Provider id cannot be empty".to_string());
+    }
+    let path = state
+        .db_path
+        .lock()
+        .map_err(|_| "db lock".to_string())?
+        .clone();
+    let connection = db::open(&path)?;
+    // 先读配置：要知道这家供应商用了哪些 key_ref，才能把钥匙串条目清干净。
+    let payload: Option<String> = connection
+        .query_row(
+            "SELECT payload FROM provider_profiles WHERE id=?1",
+            [&provider_id],
+            |row| row.get(0),
+        )
+        .ok();
+    if let Some(payload) = payload {
+        let profile: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
+        let mut refs: Vec<String> = Vec::new();
+        if let Some(keys) = profile.get("keys").and_then(Value::as_array) {
+            for key in keys {
+                if let Some(reference) = key.get("keyRef").and_then(Value::as_str) {
+                    refs.push(reference.to_string());
+                }
+            }
+        }
+        // 旧版单 Key：账户名就是 provider/{id}。
+        if let Some(reference) = profile
+            .get("auth")
+            .and_then(|auth| auth.get("keyRef"))
+            .and_then(Value::as_str)
+        {
+            refs.push(reference.to_string());
+        }
+        refs.push(format!("{CREDENTIAL_ACCOUNT_PREFIX}{provider_id}"));
+        for reference in refs {
+            if let Ok(entry) = Entry::new(KEYCHAIN_SERVICE, &reference) {
+                match entry.delete_credential() {
+                    Ok(()) => {}
+                    Err(keyring::Error::NoEntry) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        }
+    }
+    delete_provider_profile_data(&connection, &provider_id)?;
+    // Key 的失效 / 冷却状态也要清掉，否则同一个 id 重新接入时会被跳过。
+    let _ = runs::reset_key_status(&state, &provider_id, "default");
     Ok(())
 }
 
@@ -1209,6 +1389,150 @@ fn import_media(
     )
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedPath {
+    pub asset_id: String,
+    pub display_name: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FailedPath {
+    pub path: String,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedPaths {
+    pub imported: Vec<ImportedPath>,
+    pub failed: Vec<FailedPath>,
+}
+
+/// 按裸文件路径导入素材：前端拖拽文件拿到的是路径，没有 grant 可用。
+#[tauri::command]
+fn import_media_paths(
+    project_id: String,
+    paths: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<ImportedPaths, String> {
+    if paths.is_empty() || paths.len() > 20 {
+        return Err("MEDIA_BATCH_LIMIT".into());
+    }
+    let mut imported = Vec::new();
+    let mut failed = Vec::new();
+    for path in paths {
+        match media::ingest::ingest_path(&state, &project_id, std::path::Path::new(&path)) {
+            Ok(asset) => imported.push(ImportedPath {
+                asset_id: asset.asset_id,
+                display_name: asset.display_name,
+                kind: asset.kind,
+            }),
+            Err(error) => failed.push(FailedPath {
+                path,
+                code: error.code(),
+            }),
+        }
+    }
+    Ok(ImportedPaths { imported, failed })
+}
+
+/// 把一段图片字节存成项目素材（截图粘贴用）。
+///
+/// 剪贴板图片是前端读出来的字节，这里只负责落盘 + 登记归属。
+/// 之所以要后端：素材必须落到项目目录里，模型运行时才读得到。
+#[tauri::command]
+fn import_image_bytes(
+    project_id: String,
+    data_base64: String,
+    display_name: String,
+    state: State<'_, AppState>,
+) -> Result<ImportedPath, String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_base64.as_bytes())
+        .map_err(|_| "MEDIA_FORMAT_INVALID".to_string())?;
+    if bytes.is_empty() {
+        return Err("MEDIA_FORMAT_INVALID".into());
+    }
+    let decoded = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .map_err(|_| "MEDIA_FORMAT_INVALID".to_string())?
+        .decode()
+        .map_err(|_| "MEDIA_FORMAT_INVALID".to_string())?;
+    let mime = match decoded.color() {
+        image::ColorType::Rgb8 => "image/jpeg",
+        _ => "image/png",
+    };
+    let name = if display_name.trim().is_empty() {
+        "剪贴板截图".to_string()
+    } else {
+        display_name.trim().to_string()
+    };
+    store_imported_image(&state, &project_id, &bytes, mime, decoded.width(), decoded.height(), &name)
+}
+
+/// 把一段图片字节存成项目素材（截图粘贴用）。
+///
+/// 素材必须落到项目目录里，模型运行时才读得到，所以落盘统一走这里。
+fn store_imported_image(
+    state: &AppState,
+    project_id: &str,
+    bytes: &[u8],
+    mime: &str,
+    width: u32,
+    height: u32,
+    name: &str,
+) -> Result<ImportedPath, String> {
+    let mut asset = assets::store_bytes(
+        &state.data_dir,
+        bytes,
+        "image",
+        mime,
+        serde_json::json!({"projectId":project_id,"displayName":name,"kind":"import"}),
+    )?;
+    asset.width = Some(width);
+    asset.height = Some(height);
+    media::ingest::register_asset(state, project_id, &asset, name)?;
+    Ok(ImportedPath {
+        asset_id: asset.id,
+        display_name: name.to_string(),
+        kind: "image".into(),
+    })
+}
+
+/// 直接从系统剪贴板读图并存成项目素材。
+///
+/// macOS 上 Tauri 用的是 WKWebView，它不会把剪贴板里的图片放进前端
+/// `paste` 事件的 clipboardData（WebKit 明确不支持粘贴文件），
+/// 所以 Cmd+V 贴图只能由后端读系统剪贴板。
+#[tauri::command]
+fn import_clipboard_image(
+    app: tauri::AppHandle,
+    project_id: String,
+    state: State<'_, AppState>,
+) -> Result<ImportedPath, String> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    let clipboard = app.clipboard().read_image().map_err(|_| "CLIPBOARD_NO_IMAGE".to_string())?;
+    let buffer = image::RgbaImage::from_raw(clipboard.width(), clipboard.height(), clipboard.rgba().to_vec())
+        .ok_or("MEDIA_FORMAT_INVALID".to_string())?;
+    let mut png = Vec::new();
+    buffer
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|_| "MEDIA_FORMAT_INVALID".to_string())?;
+    store_imported_image(
+        &state,
+        &project_id,
+        &png,
+        "image/png",
+        buffer.width(),
+        buffer.height(),
+        "剪贴板截图",
+    )
+}
+
 #[tauri::command]
 fn list_media_tasks(
     project_id: String,
@@ -1632,16 +1956,25 @@ async fn import_legacy_project(
         .map_err(|error| error.message)
 }
 
-/// 导出项目元数据包（不含素材二进制、不含密钥、不含绝对路径）。
+/// 导出项目包。
+///
+/// `include_assets=false`（默认）时只写一个 JSON 元数据包；
+/// `include_assets=true` 时写一个目录：里面是 `project.json` 与 `assets/` 素材本体。
 ///
 /// 路径校验与文件写入都在 Rust 侧完成：渲染进程只能给一个目标路径，不能决定写到哪。
 #[tauri::command]
 fn export_project(
     project_id: String,
     path: String,
+    include_assets: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<export::ExportSummary, String> {
-    export::export_project(&state, &project_id, std::path::Path::new(&path))
+    export::export_project(
+        &state,
+        &project_id,
+        std::path::Path::new(&path),
+        include_assets.unwrap_or(false),
+    )
 }
 
 pub fn run() {
@@ -1662,6 +1995,7 @@ pub fn run() {
         )
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             let app_data = app.path().app_data_dir()?;
             fs::create_dir_all(&app_data)?;
@@ -1697,12 +2031,14 @@ pub fn run() {
             delete_provider_key,
             list_studio_projects,
             save_studio_project,
+            delete_studio_project,
             list_boards,
             load_board,
             save_board,
             delete_board,
             list_provider_profiles,
             save_provider_profile,
+            delete_provider_profile,
             provider_has_key,
             test_provider_profile,
             save_asset_host,
@@ -1716,6 +2052,7 @@ pub fn run() {
             open_project_media,
             read_project_asset_text,
             list_project_assets,
+            delete_project_asset,
             pick_media_files,
             pick_script_file,
             import_script_document,
@@ -1723,6 +2060,9 @@ pub fn run() {
             import_subtitle_document,
             pick_export_target,
             import_media,
+            import_media_paths,
+            import_image_bytes,
+            import_clipboard_image,
             list_media_tasks,
             cancel_media_task,
             extract_media_frame,
@@ -1749,6 +2089,28 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 前端直接消费导入结果，字段名必须稳定在 camelCase。
+    #[test]
+    fn imported_paths_serialize_with_camel_case_fields() {
+        let payload = ImportedPaths {
+            imported: vec![ImportedPath {
+                asset_id: "abc".into(),
+                display_name: "shot.png".into(),
+                kind: "image".into(),
+            }],
+            failed: vec![FailedPath {
+                path: "/tmp/broken.txt".into(),
+                code: "MEDIA_FORMAT_INVALID".into(),
+            }],
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["imported"][0]["assetId"], "abc");
+        assert_eq!(json["imported"][0]["displayName"], "shot.png");
+        assert_eq!(json["imported"][0]["kind"], "image");
+        assert_eq!(json["failed"][0]["path"], "/tmp/broken.txt");
+        assert_eq!(json["failed"][0]["code"], "MEDIA_FORMAT_INVALID");
+    }
 
     /// 测试连接必须按新约定读 Key：keys 里的 keyRef 优先，旧单 Key 账户兜底。
     /// 只查旧账户会让「用新约定保存 Key」的供应商永远报「尚未保存 API Key」。
@@ -1931,5 +2293,131 @@ mod tests {
         // 相对路径同样拿不到「所在目录」白名单。
         let roots = import_allowed_roots(&data_dir, std::path::Path::new("project.json"));
         assert_eq!(roots[1], data_dir);
+    }
+
+    /// 造一个带完整关联数据的项目：画板、实体、素材、运行记录都在里面。
+    fn seed_project(connection: &Connection, project_id: &str) {
+        connection.execute("INSERT INTO studio_projects (id,name,payload,created_at,updated_at) VALUES (?1,'P','{}','now','now')", [project_id]).unwrap();
+        connection.execute("INSERT INTO boards (id,project_id,name,payload,created_at,updated_at) VALUES (?1,?2,'B','{}','now','now')", params![format!("board-{project_id}"), project_id]).unwrap();
+        connection.execute("INSERT INTO assets (id,kind,path,mime,bytes,payload,created_at) VALUES (?1,'video','cas/video.mp4','video/mp4',1,'{}','now')", [format!("asset-{project_id}")]).unwrap();
+        connection.execute("INSERT INTO project_assets (project_id,asset_id,added_at,provenance) VALUES (?1,?2,'now','{}')", params![project_id, format!("asset-{project_id}")]).unwrap();
+        connection.execute("INSERT INTO asset_origins (id,project_id,asset_id,origin_kind,origin_ref,payload,created_at) VALUES (?1,?2,?3,'import',NULL,'{}','now')", params![format!("origin-{project_id}"), project_id, format!("asset-{project_id}")]).unwrap();
+        for (id, kind) in [("script", "script"), ("shot", "shot"), ("subject", "subject")] {
+            connection.execute("INSERT INTO project_entities (id,project_id,kind,schema_version,revision,payload,updated_at) VALUES (?1,?2,?3,1,1,'{}','now')", params![format!("{id}-{project_id}"), project_id, kind]).unwrap();
+        }
+        connection.execute("INSERT INTO script_revisions (script_id,revision,payload,created_at) VALUES (?1,1,'{}','now')", [format!("script-{project_id}")]).unwrap();
+        connection.execute("INSERT INTO shot_adoptions (adoption_id,shot_id,slot,payload,adopted_at) VALUES (?1,?2,'video','{}','now')", params![format!("adoption-{project_id}"), format!("shot-{project_id}")]).unwrap();
+        connection.execute("INSERT INTO subject_versions (subject_id,ordinal,payload,created_at) VALUES (?1,1,'{}','now')", [format!("subject-{project_id}")]).unwrap();
+        connection.execute("INSERT INTO runs (id,project_id,board_id,node_id,status,cache_key,payload,created_at,updated_at) VALUES (?1,?2,?3,'n','succeeded','c','{}','now','now')", params![format!("run-{project_id}"), project_id, format!("board-{project_id}")]).unwrap();
+        connection.execute("INSERT INTO jobs (id,run_id,provider_id,capability,status,attempts,payload,updated_at) VALUES (?1,?2,'p','image','queued',0,'{}','now')", params![format!("job-{project_id}"), format!("run-{project_id}")]).unwrap();
+        connection.execute("INSERT INTO media_tasks (id,project_id,kind,status,payload,created_at,updated_at) VALUES (?1,?2,'frame','done','{}','now','now')", params![format!("task-{project_id}"), project_id]).unwrap();
+        connection.execute("INSERT INTO media_exports (export_id,project_id,status,payload,created_at,updated_at) VALUES (?1,?2,'done','{}','now','now')", params![format!("export-{project_id}"), project_id]).unwrap();
+        connection.execute("INSERT INTO production_changes (change_id,project_id,payload,created_at) VALUES (?1,?2,'{}','now')", params![format!("change-{project_id}"), project_id]).unwrap();
+        connection.execute("INSERT INTO breakdown_drafts (draft_id,project_id,script_id,script_revision,payload,created_at) VALUES (?1,?2,?3,1,'{}','now')", params![format!("draft-{project_id}"), project_id, format!("script-{project_id}")]).unwrap();
+        connection.execute("INSERT INTO production_reviews (review_id,project_id,payload,created_at) VALUES (?1,?2,'{}','now')", params![format!("review-{project_id}"), project_id]).unwrap();
+        connection.execute("INSERT INTO run_previews (preview_id,project_id,board_id,fingerprint,payload,expires_at,created_at) VALUES (?1,?2,?3,'f','{}','now','now')", params![format!("preview-{project_id}"), project_id, format!("board-{project_id}")]).unwrap();
+    }
+
+    /// 删除项目要连带清掉所有关联行，但素材本体（assets 行）必须留着。
+    #[test]
+    fn delete_studio_project_removes_related_rows_but_keeps_assets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        let mut connection = db::open(&path).unwrap();
+        seed_project(&connection, "p1");
+        seed_project(&connection, "p2");
+
+        delete_studio_project_data(&mut connection, "p1").unwrap();
+
+        for (table, where_clause) in [
+            ("studio_projects", "id='p1'"),
+            ("boards", "project_id='p1'"),
+            ("project_entities", "project_id='p1'"),
+            ("project_assets", "project_id='p1'"),
+            ("asset_origins", "project_id='p1'"),
+            ("runs", "project_id='p1'"),
+            ("jobs", "run_id='run-p1'"),
+            ("media_tasks", "project_id='p1'"),
+            ("media_exports", "project_id='p1'"),
+            ("production_changes", "project_id='p1'"),
+            ("breakdown_drafts", "project_id='p1'"),
+            ("production_reviews", "project_id='p1'"),
+            ("script_revisions", "script_id='script-p1'"),
+            ("shot_adoptions", "shot_id='shot-p1'"),
+            ("subject_versions", "subject_id='subject-p1'"),
+            ("run_previews", "project_id='p1'"),
+        ] {
+            let left: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table} WHERE {where_clause}"), [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(left, 0, "{table} 里还残留 p1 的数据");
+        }
+        // 素材本体保留：素材是内容寻址的，可能被别的项目共用。
+        let assets: i64 = connection.query_row("SELECT COUNT(*) FROM assets WHERE id='asset-p1'", [], |row| row.get(0)).unwrap();
+        assert_eq!(assets, 1, "素材行不能被删");
+        // 另一个项目不受影响。
+        let other: i64 = connection.query_row("SELECT COUNT(*) FROM studio_projects WHERE id='p2'", [], |row| row.get(0)).unwrap();
+        assert_eq!(other, 1);
+        // 删除是幂等的：项目不存在也返回 Ok。
+        delete_studio_project_data(&mut connection, "p1").unwrap();
+        delete_studio_project_data(&mut connection, "missing").unwrap();
+        // 外键不能留下悬空引用。
+        let violations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(violations, 0, "删除项目后不能有外键悬空");
+    }
+
+    /// 移除素材只断关联，素材本体和别的项目关联都要留着。
+    #[test]
+    fn delete_project_asset_only_drops_the_project_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        let mut connection = db::open(&path).unwrap();
+        seed_project(&connection, "p1");
+        // 同一个素材被两个项目共用。
+        connection.execute("INSERT INTO project_assets (project_id,asset_id,added_at,provenance) VALUES ('p2','asset-p1','now','{}')", []).unwrap();
+        connection.execute("INSERT INTO asset_origins (id,project_id,asset_id,origin_kind,origin_ref,payload,created_at) VALUES ('origin-p2','p2','asset-p1','import',NULL,'{}','now')", []).unwrap();
+        delete_project_asset_data(&mut connection, "p1", "asset-p1").unwrap();
+
+        let memberships: i64 = connection.query_row("SELECT COUNT(*) FROM project_assets WHERE project_id='p1' AND asset_id='asset-p1'", [], |row| row.get(0)).unwrap();
+        assert_eq!(memberships, 0, "项目与素材的关联要断掉");
+        let origins: i64 = connection.query_row("SELECT COUNT(*) FROM asset_origins WHERE project_id='p1' AND asset_id='asset-p1'", [], |row| row.get(0)).unwrap();
+        assert_eq!(origins, 0);
+        // 素材本体与其它项目的关联不受影响。
+        let assets: i64 = connection.query_row("SELECT COUNT(*) FROM assets WHERE id='asset-p1'", [], |row| row.get(0)).unwrap();
+        assert_eq!(assets, 1, "素材行不能被删");
+        let shared: i64 = connection.query_row("SELECT COUNT(*) FROM project_assets WHERE project_id='p2' AND asset_id='asset-p1'", [], |row| row.get(0)).unwrap();
+        assert_eq!(shared, 1, "别的项目对同一素材的关联要留着");
+        // 幂等：关联本来就不存在也返回 Ok。
+        delete_project_asset_data(&mut connection, "p1", "asset-p1").unwrap();
+        delete_project_asset_data(&mut connection, "p1", "missing").unwrap();
+    }
+
+    /// 删掉供应商配置行：只删自己那家，别家不受影响，删两次也不报错。
+    #[test]
+    fn delete_provider_profile_only_drops_that_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        let connection = db::open(&path).unwrap();
+        for id in ["p1", "p2"] {
+            connection.execute(
+                "INSERT INTO provider_profiles (id, adapter, base_url, enabled, payload, updated_at) VALUES (?1,'openai-compatible','',1,'{}','now')",
+                [id],
+            ).unwrap();
+        }
+
+        delete_provider_profile_data(&connection, "p1").unwrap();
+        let left: i64 = connection
+            .query_row("SELECT COUNT(*) FROM provider_profiles WHERE id='p1'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "被删的供应商配置行要消失");
+        let others: i64 = connection
+            .query_row("SELECT COUNT(*) FROM provider_profiles WHERE id='p2'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(others, 1, "别的供应商不能被连坐");
+        // 幂等：删不存在的也不报错。
+        delete_provider_profile_data(&connection, "p1").unwrap();
+        delete_provider_profile_data(&connection, "missing").unwrap();
     }
 }

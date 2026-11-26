@@ -18,14 +18,16 @@ const ROLE_LABEL: Record<EdgeRole, string> = {
  * 连线角色配色。
  *
  * 白底上要用中深色调，否则细线会糊在背景里看不清角色区分。
+ * 这里只给 CSS 变量名，实际色值在 `src/ui/tokens.css` 里，改主题只改一处。
  */
 const ROLE_COLOR: Record<EdgeRole, string> = {
-  script: '#a8761a', beat: '#9a6f1c', prompt: '#5d656d', character_ref: '#1f8f74',
-  location_ref: '#3a72b0', prop_ref: '#7a5cb8', style_ref: '#a8761a',
-  first_frame: '#7d51b8', last_frame: '#6b46a0', middle_frame: '#744eb0',
-  reference_image: '#7d51b8', reference_video: '#7d51b8', reference_audio: '#17897c',
-  prev_shot: '#b3603f', source_image: '#3a72b0', storyboard: '#b3603f', video_clip: '#b3603f', audio: '#17897c',
-  timeline: '#6b737b',
+  script: 'var(--edge-script)', beat: 'var(--edge-beat)', prompt: 'var(--edge-prompt)',
+  character_ref: 'var(--edge-character-ref)',
+  location_ref: 'var(--edge-location-ref)', prop_ref: 'var(--edge-prop-ref)', style_ref: 'var(--edge-style-ref)',
+  first_frame: 'var(--edge-frame)', last_frame: 'var(--edge-frame)', middle_frame: 'var(--edge-frame)',
+  reference_image: 'var(--edge-reference-image)', reference_video: 'var(--edge-reference-video)', reference_audio: 'var(--edge-reference-audio)',
+  prev_shot: 'var(--edge-prev-shot)', source_image: 'var(--edge-source-image)', storyboard: 'var(--edge-storyboard)', video_clip: 'var(--edge-video-clip)', audio: 'var(--edge-audio)',
+  timeline: 'var(--edge-timeline)',
 };
 
 /**
@@ -180,8 +182,8 @@ export function toFlowEdges(doc: BoardDoc): Edge[] {
       sourceHandle: edge.sourcePort,
       targetHandle: edge.targetPort,
       label: ROLE_LABEL[edge.role],
-      labelStyle: { fill: '#5d656d', fontSize: 9 },
-      labelBgStyle: { fill: '#ffffff', fillOpacity: 0.92 },
+      labelStyle: { fill: 'var(--text-muted)', fontSize: 9 },
+      labelBgStyle: { fill: 'var(--panel)', fillOpacity: 0.92 },
       style: { stroke: ROLE_COLOR[edge.role], strokeWidth: 1.4 },
       data: { role: edge.role },
     }));
@@ -192,14 +194,37 @@ export function danglingEdgeCount(doc: BoardDoc): number {
 }
 
 export function edgeColor(role: string): string {
-  return ROLE_COLOR[role as EdgeRole] ?? '#6b737b';
+  return ROLE_COLOR[role as EdgeRole] ?? 'var(--edge-timeline)';
 }
 
+/**
+ * 节点类型色。
+ *
+ * 返回 CSS 变量名而不是字面色值：颜色只在 `src/ui/tokens.css` 里定义，
+ * 换主题时改一处即可，画布、小地图、节点卡片自动同步。
+ */
 export function nodeColor(type: string): string {
-  if (type === 'script') return '#a8761a';
-  if (type === 'text') return '#a8761a';
-  if (type === 'audio') return '#17897c';
-  if (type === 'image' || type === 'video') return '#7d51b8';
-  if (type === 'group') return '#8b939b';
-  return '#6b737b';
+  switch (type) {
+    case 'script': return 'var(--node-script)';
+    case 'text': return 'var(--node-text)';
+    case 'audio': return 'var(--node-audio)';
+    case 'image_source': return 'var(--node-source)';
+    case 'video_source': return 'var(--node-source)';
+    case 'audio_source': return 'var(--node-source)';
+    case 'text_source': return 'var(--node-text)';
+    case 'image': return 'var(--node-image)';
+    case 'video': return 'var(--node-video)';
+    case 'character': return 'var(--node-character)';
+    case 'storyboard': return 'var(--node-storyboard)';
+    case 'expression': return 'var(--node-expression)';
+    case 'variant': return 'var(--node-variant)';
+    case 'turnaround': return 'var(--node-turnaround)';
+    case 'coverage': return 'var(--node-coverage)';
+    case 'continuity': return 'var(--node-continuity)';
+    case 'redraw': return 'var(--node-redraw)';
+    case 'inpaint': return 'var(--node-inpaint)';
+    case 'note': return 'var(--node-note)';
+    case 'group': return 'var(--node-group)';
+    default: return 'var(--node-note)';
+  }
 }

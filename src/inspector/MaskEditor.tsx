@@ -172,7 +172,7 @@ export function MaskEditor({ sourceAssetId, nodeId, projectId, onClose, onSaved 
       <div className="mask-dialog" role="dialog" aria-label="局部重绘蒙版">
         <header className="mask-dialog-head">
           <div>
-            <span className="studio-eyebrow">INPAINT</span>
+            <span className="studio-eyebrow">局部重绘</span>
             <h2>绘制重绘蒙版</h2>
           </div>
           <button type="button" title="关闭" onClick={onClose}><X size={14} /></button>

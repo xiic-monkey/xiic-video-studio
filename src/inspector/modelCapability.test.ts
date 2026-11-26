@@ -8,18 +8,28 @@ const capability = (name: string) => ({ capability: name, inputTransport: ['data
 const profiles: ProviderProfile[] = [
   {
     id: 'oai', name: 'OpenAI 兼容', adapter: 'openai-compatible', baseUrl: 'https://example.com',
-    auth: { type: 'bearer', keyRef: 'provider/oai' }, enabled: true, schemaVersion: 1,
+    auth: { type: 'bearer', keyRef: 'provider/oai' }, enabled: true, schemaVersion: 2,
+    keys: [{ id: 'default', label: '默认 Key', keyRef: 'provider/oai/key/default', enabled: true, status: 'active', hasSecret: true }],
     models: [{ id: 'gpt', displayName: 'GPT', capabilities: [{ ...capability('text.chat'), inputTransport: ['dataUrl'] }] }],
   },
   {
+    id: 'nokey', name: '还没配 Key', adapter: 'openai-compatible', baseUrl: '',
+    auth: { type: 'bearer', keyRef: 'provider/nokey' }, enabled: true, schemaVersion: 2,
+    keys: [{ id: 'default', label: '默认 Key', keyRef: 'provider/nokey/key/default', enabled: true, status: 'active', hasSecret: false }],
+    models: [{ id: 'y', displayName: 'Y', capabilities: [{ ...capability('text.chat'), inputTransport: ['dataUrl'] }] }],
+  },
+  {
     id: 'off', name: '停用', adapter: 'openai-compatible', baseUrl: '',
-    auth: { type: 'bearer', keyRef: 'provider/off' }, enabled: false, schemaVersion: 1,
+    auth: { type: 'bearer', keyRef: 'provider/off' }, enabled: false, schemaVersion: 2,
+    keys: [{ id: 'default', label: '默认 Key', keyRef: 'provider/off/key/default', enabled: true, status: 'active', hasSecret: true }],
     models: [{ id: 'x', displayName: 'X', capabilities: [{ ...capability('text.chat'), inputTransport: ['dataUrl'] }] }],
   },
 ];
 
 describe('model capability routing', () => {
-  it('lists enabled models by capability', () => {
+  it('只列出已接入供应商的模型', () => {
+    // 停了用的（off）和没配 Key 的（nokey）都不该出现：
+    // 模型列表里摆一个跑不起来的选项，只会把问题拖到运行那一刻。
     expect(modelOptions(profiles, 'text.chat')).toEqual([
       { providerId: 'oai', providerName: 'OpenAI 兼容', modelId: 'gpt', modelName: 'GPT' },
     ]);
